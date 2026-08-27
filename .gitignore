@@ -20,3 +20,10 @@ venv/
 inbox_agent/snapshot/
 inbox_agent/store/
 *.jsonl
+
+# LangGraph checkpoints hold graph state, which includes full thread content.
+# Real email - never commit.
+inbox_agent/checkpoints.sqlite*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
