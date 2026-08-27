@@ -8,7 +8,7 @@ interrupt is durable, so a run can be resumed hours later from a different UI.
 from __future__ import annotations
 
 import uuid
-from typing import TypedDict
+from typing import TypedDict, get_args
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -17,11 +17,15 @@ from .audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_act
 from .classify import classify_batch
 from .config import Settings
 from .models import (
-    Action, Decision, ReviewItem, ReviewRequest, ReviewResponse, Thread,
+    Action, ActionKind, Decision, ReviewItem, ReviewRequest, ReviewResponse, Thread,
 )
 from .policy import Policy
 from .prefilter import prefilter
 from .store import PreferenceStore, rule_from_correction
+
+# Derived from the Literal itself, not a hand-copied list, so this can't
+# silently drift from ActionKind if it's ever extended.
+VALID_ACTION_KINDS = frozenset(get_args(ActionKind))
 
 
 class TriageState(TypedDict, total=False):
@@ -38,10 +42,23 @@ class TriageState(TypedDict, total=False):
 
 def learn_from_response(
     response: ReviewResponse, threads: list[Thread], prefs: PreferenceStore
-) -> list[str]:
-    """Turn corrections into durable rules (spec section 2, mechanism 2)."""
+) -> tuple[list[str], list[dict]]:
+    """Turn corrections into durable rules (spec section 2, mechanism 2).
+
+    Returns (learned_rule_ids, skipped). A correction is skipped rather than
+    learned when its edit names a kind outside ActionKind - reachable because
+    Action.kind is str, not the Literal, so a human can type e.g.
+    "send_message" in an edit. execute() already refuses that kind; there is
+    also no valid rule to learn from it here: it names an action the system
+    will never perform under any circumstances (spec section 2's deny-list),
+    so recording a "preference" for it would record a preference that can
+    never be honoured. Validating at this boundary - before
+    rule_from_correction, not inside it - keeps a malformed edit from
+    crashing the graph's final node after mutations have already run.
+    """
     by_id = {t.id: t for t in threads}
     learned: list[str] = []
+    skipped: list[dict] = []
 
     for thread_id, verdict in response.decisions.items():
         if verdict == "approve" or thread_id not in by_id:
@@ -49,19 +66,28 @@ def learn_from_response(
         edits = response.edits.get(thread_id, [])
         if not edits:
             continue
+
+        kind = edits[0].kind
+        if kind not in VALID_ACTION_KINDS:
+            skipped.append({
+                "thread_id": thread_id, "kind": kind, "stage": "learn",
+                "reason": f"{kind!r} is not a learnable action kind; no rule recorded",
+            })
+            continue
+
         # A "reject" that carries edits still teaches a rule from the edit's
         # action - the owner is saying "not this, but here's what I'd have
         # wanted" - even though execute() will not act on it for this thread.
         # Reject means "do not do this now"; the edit is preference signal for
         # next time. Intended: do not "fix" this into skipping reject+edits.
         rule = rule_from_correction(
-            by_id[thread_id], edits[0].kind,
-            f"corrected proposal on thread {thread_id}: owner chose {edits[0].kind}",
+            by_id[thread_id], kind,
+            f"corrected proposal on thread {thread_id}: owner chose {kind}",
         )
         prefs.add_rule(rule)
         learned.append(rule.id)
 
-    return learned
+    return learned, skipped
 
 
 def build_graph(
@@ -166,7 +192,11 @@ def build_graph(
     def learn(state: TriageState) -> dict:
         response = ReviewResponse.model_validate(state.get("response") or {})
         threads = [Thread.model_validate(d) for d in state["threads"]]
-        return {"learned": learn_from_response(response, threads, prefs)}
+        learned, learn_skips = learn_from_response(response, threads, prefs)
+        # Merge with execute()'s skips rather than overwrite: LangGraph does
+        # not auto-accumulate a plain (non-reducer) TypedDict key across
+        # nodes, and a skip recorded upstream must not vanish here.
+        return {"learned": learned, "skipped": state.get("skipped", []) + learn_skips}
 
     builder = StateGraph(TriageState)
     for name, fn in (("fetch", fetch), ("triage", triage), ("propose", propose),

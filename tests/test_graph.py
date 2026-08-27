@@ -197,3 +197,25 @@ def test_forbidden_action_is_visible_in_state(wiring):
     assert len(final["refused"]) == 1
     assert final["refused"][0]["thread_id"] == "t1"
     assert final["refused"][0]["kind"] == "archive"
+
+
+def test_edit_naming_forbidden_kind_is_refused_and_not_learned(wiring):
+    """A human edit naming a forbidden kind (send_message) is reachable because
+    Action.kind is str, not the Literal. It must be refused by execute (not
+    performed), must not crash learn (the graph's final node), and must not
+    become a rule - there is nothing to learn from an action the system will
+    never perform under any circumstances."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "run-10"}}
+    graph.invoke({"limit": 10}, config)
+    final = graph.invoke(
+        Command(resume={"decisions": {"t1": "edit"},
+                        "edits": {"t1": [{"kind": "send_message", "thread_id": "t1"}]},
+                        "instructions": []}),
+        config)
+    assert final["executed"] == []
+    assert any(r["thread_id"] == "t1" for r in final["refused"])
+    assert wiring["prefs"].rules() == []
+    assert any(s["thread_id"] == "t1" and s.get("stage") == "learn"
+               for s in final["skipped"])
