@@ -231,8 +231,21 @@ prerequisite for live daily use, not for snapshot iteration.
 **Local-model reliability.** Gemma may fail at Stage B. This is an expected finding,
 not a project risk — Stage A is designed to remain viable regardless.
 
-**Privacy.** Email content stays local. Only instructions and traces reach LangSmith.
-Snapshot, store, and audit log are gitignored.
+**Privacy.** Snapshot, store, checkpoints and audit log are gitignored and never
+leave the machine.
+
+**LangSmith tracing sends email content off the machine.** An earlier draft of this
+spec claimed "only instructions and traces reach LangSmith"; that was wrong, and the
+distinction it drew does not exist. A trace of the `classify` call captures the prompt,
+and the prompt contains the sender, the subject, and the body or snippet of the mail
+being classified. Enabling `LANGSMITH_TRACING` therefore uploads the content of every
+classified thread to LangChain's servers.
+
+That is a legitimate trade — tracing is the only practical way to compare Stage A
+against Stage B, or Gemma against a hosted model, on identical input — but it is the
+owner's decision to make knowingly, not a default. `LANGSMITH_TRACING` ships as
+`false`. Context Hub, which stores only the policy and never mail, is unaffected and
+works with tracing off.
 
 **Rule overfitting.** The rule set may overfit the 50-thread snapshot. Mitigation: a
 held-out set is available as a Stage C check if rule growth suggests it is needed.
