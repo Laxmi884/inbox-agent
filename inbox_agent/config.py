@@ -194,7 +194,12 @@ MODELS: dict[str, ModelChoice] = {
     ),
     "nemotron": ModelChoice(
         "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", "free",
-        "550B at no cost. Frontier-scale contrast against the local 12B.",
+        "550B at no cost, and NOT viable for this workload. Measured 69s for a "
+        "single classification: it spent 1138 reasoning tokens to emit ~40 "
+        "tokens of JSON. A 50-thread pass is roughly 57 minutes. It also omits "
+        "`reason`, so it does not even close the audit gap Gemma leaves. Same "
+        "failure shape as local Gemma - a reasoning model is the wrong tool for "
+        "one small structured judgment.",
     ),
     "glm": ModelChoice(
         "openrouter", "z-ai/glm-5.3-flash", "paid",
