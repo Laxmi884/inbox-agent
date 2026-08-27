@@ -72,6 +72,7 @@ class SnapshotGmailClient:
         return self.remove_label(thread_id, "INBOX") | {"action": "archive"}
 
     def trash(self, thread_id: str) -> dict[str, Any]:
+        self.remove_label(thread_id, "INBOX")
         return self.apply_label(thread_id, "TRASH") | {"action": "trash"}
 
     def create_draft(self, thread_id: str, body: str) -> dict[str, Any]:

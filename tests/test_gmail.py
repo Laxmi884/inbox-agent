@@ -59,8 +59,25 @@ def test_apply_and_remove_label_mutate_local_state(snapshot_file):
 
 def test_trash_is_recorded_and_reversible(snapshot_file):
     c = SnapshotGmailClient(snapshot_file)
+    original_labels = set(c.get_thread("t1").label_ids)
     c.trash("t1")
-    assert "TRASH" in c.get_thread("t1").label_ids
+    trashed_labels = c.get_thread("t1").label_ids
+    # (a) TRASH is present after trashing
+    assert "TRASH" in trashed_labels
+    # (b) INBOX is absent after trashing
+    assert "INBOX" not in trashed_labels
+    # (c) Reversibility: remove TRASH, re-add INBOX, assert label set matches original
+    c.remove_label("t1", "TRASH")
+    c.apply_label("t1", "INBOX")
+    restored_labels = set(c.get_thread("t1").label_ids)
+    assert restored_labels == original_labels
+
+
+def test_create_draft_returns_simulated_and_draft_length(snapshot_file):
+    c = SnapshotGmailClient(snapshot_file)
+    result = c.create_draft("t1", "This is my draft body")
+    assert result["simulated"] is True
+    assert result["draft_chars"] == 21
 
 
 def test_missing_snapshot_gives_actionable_error(tmp_path):
