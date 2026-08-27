@@ -105,35 +105,10 @@ def get_llm(backend: Optional[str] = None):
     backend = backend or resolve_backend()
 
     if backend == "ollama":
-        from langchain_ollama import ChatOllama
-
-        model = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
-        print(f"[get_llm] Ollama ({model}) at {OLLAMA_BASE_URL}")
-        return ChatOllama(
-            model=model,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-            # One thread per call keeps this well under budget; see spec section 3.
-            num_ctx=8192,
-            # gemma4 is a hybrid thinker. Left on, it reasons at length before
-            # emitting structured output and the call effectively never returns -
-            # measured >9 minutes for a single classification. Off, it answers in
-            # 1-3s. build_notebook.py:563 sets this for the same reason.
-            reasoning=False,
-        )
+        return _build_ollama(os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL))
 
     if backend == "openrouter":
-        from langchain_openai import ChatOpenAI
-
-        model = os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
-        print(f"[get_llm] OpenRouter ({model})")
-        return ChatOpenAI(
-            model=model,
-            temperature=0,
-            base_url=OPENROUTER_BASE_URL,
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            default_headers={"X-Title": "Inbox Agent"},
-        )
+        return _build_openrouter(os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL))
 
     if backend == "openai":
         from langchain_openai import ChatOpenAI
@@ -146,8 +121,132 @@ def get_llm(backend: Optional[str] = None):
     )
 
 
+def _build_ollama(model: str):
+    from langchain_ollama import ChatOllama
+
+    print(f"[get_llm] Ollama ({model}) at {OLLAMA_BASE_URL}")
+    return ChatOllama(
+            model=model,
+            base_url=OLLAMA_BASE_URL,
+            temperature=0,
+            # One thread per call keeps this well under budget; see spec section 3.
+            num_ctx=8192,
+            # gemma4 is a hybrid thinker. Left on, it reasons at length before
+            # emitting structured output and the call effectively never returns -
+            # measured >9 minutes for a single classification. Off, it answers in
+            # 1-3s. build_notebook.py:563 sets this for the same reason.
+            reasoning=False,
+        )
+
+
+def _build_openrouter(model: str):
+    from langchain_openai import ChatOpenAI
+
+    print(f"[get_llm] OpenRouter ({model})")
+    return ChatOpenAI(
+        model=model,
+        temperature=0,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        default_headers={"X-Title": "Inbox Agent"},
+    )
+
+
 def get_embeddings():
     """Local embeddings for store semantic search. nomic-embed-text is 768-dim."""
     from langchain_ollama import OllamaEmbeddings
 
     return OllamaEmbeddings(model=DEFAULT_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+
+
+# ---------------------------------------------------------------------------
+# Model registry
+#
+# Pick a model by short name instead of editing .env and restarting the kernel:
+#
+#     from inbox_agent.config import use_model, describe_models
+#     llm = use_model("nemotron")
+#
+# The registry doubles as the record of what has actually been run against the
+# real snapshot - `note` says what was measured, not what is claimed. `.env`
+# remains the default when no name is given, so nothing that exists breaks.
+#
+# `cost` is deliberately explicit. A dead or unexpectedly paid slug has already
+# cost us one wasted run (stealth/ox-alpha was retired mid-project), so a name
+# in here should tell you what it will do to your bill before you invoke it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelChoice:
+    backend: str
+    model_id: str
+    cost: str   # "local" | "free" | "paid"
+    note: str
+
+
+MODELS: dict[str, ModelChoice] = {
+    "gemma": ModelChoice(
+        "ollama", "gemma4:12b-mlx", "local",
+        "Local baseline. 3.1s/thread, 0 parse failures - but leaves `reason` "
+        "empty on 50/50 threads, so the audit trail has no model-side why. "
+        "Requires reasoning=False or a single call never returns.",
+    ),
+    "nemotron": ModelChoice(
+        "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", "free",
+        "550B at no cost. Frontier-scale contrast against the local 12B.",
+    ),
+    "glm": ModelChoice(
+        "openrouter", "z-ai/glm-5.3-flash", "paid",
+        "What the retired stealth/ox-alpha slot turned out to be.",
+    ),
+    "4o-mini": ModelChoice(
+        "openrouter", "openai/gpt-4o-mini", "paid",
+        "1.63s/thread, 0 parse failures, `reason` populated 50/50 - the "
+        "audit gap Gemma leaves open. ~$0.02 for a 50-thread run.",
+    ),
+    "sonnet": ModelChoice(
+        "openrouter", "anthropic/claude-sonnet-4.5", "paid",
+        "Frontier reference. Not yet measured on this snapshot.",
+    ),
+}
+
+
+def resolve_model_choice(name: str) -> ModelChoice:
+    """Look up a registry entry. Unknown names fail loudly, never silently."""
+    key = (name or "").strip().lower()
+    if key not in MODELS:
+        raise KeyError(
+            f"{name!r} is not in the model registry. Known names: "
+            f"{', '.join(sorted(MODELS))}. Add one to MODELS in config.py, "
+            f"or pass a raw id via .env."
+        )
+    return MODELS[key]
+
+
+def use_model(name: str):
+    """Build a chat model by short name, bypassing .env entirely.
+
+    Reads nothing from the environment except credentials, and mutates nothing -
+    so switching models inside a notebook does not leave the process in a state
+    that later cells silently inherit.
+    """
+    choice = resolve_model_choice(name)
+    if choice.backend == "ollama":
+        return _build_ollama(choice.model_id)
+    if choice.backend == "openrouter":
+        return _build_openrouter(choice.model_id)
+    if choice.backend == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=choice.model_id, temperature=0)
+    raise RuntimeError(f"registry entry {name!r} names unknown backend {choice.backend!r}")
+
+
+def describe_models() -> list[dict]:
+    """Rows for a readable table of what you can select."""
+    return [
+        {"name": n, "backend": c.backend, "model_id": c.model_id,
+         "cost": c.cost, "note": c.note}
+        for n, c in sorted(MODELS.items(), key=lambda kv: (kv[1].cost != "local", kv[0]))
+    ]
