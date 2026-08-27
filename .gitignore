@@ -1,0 +1,22 @@
+# Secrets — never commit. Commit .env.example instead.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tooling
+.code-review-graph/
+.DS_Store
+
+# Inbox agent — real email on disk, never commit
+inbox_agent/snapshot/
+inbox_agent/store/
+*.jsonl
