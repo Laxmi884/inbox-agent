@@ -1,18 +1,18 @@
 """The single chokepoint every mutation passes through (spec section 4.1).
 
 Two invariants this module exists to guarantee:
-  1. No action outside the allow-list can reach Gmail, whatever the caller believes.
+  1. No action on the deny-list can reach Gmail, whatever the caller believes.
   2. Every attempt - permitted, refused, or simulated - leaves a durable record.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import Settings
+from .config import ALWAYS_FORBIDDEN, Settings
 from .models import Action, AuditRecord, REVERSIBLE_ACTIONS
 
 
@@ -48,9 +48,16 @@ class AuditLog:
                 for line in self.path.read_text().splitlines() if line.strip()]
 
     def undo_candidates(self) -> list[AuditRecord]:
-        """Real, reversible actions, most recent first."""
+        """Real, reversible actions with something to undo, most recent first.
+
+        Note: "draft" is nominally reversible (deleting the draft would undo it),
+        but _undo_token has no draft branch, because SnapshotGmailClient.create_draft
+        does not return a draft id an undo could later target. Requiring a non-empty
+        undo_token keeps such records out of the candidate list instead of handing
+        an undo tool a candidate with nothing to act on.
+        """
         return [r for r in reversed(self.records())
-                if r.reversible and not r.dry_run and r.result == "ok"]
+                if r.reversible and not r.dry_run and r.result == "ok" and r.undo_token]
 
 
 def _undo_token(action: Action, prior_labels: list[str]) -> dict[str, Any]:
@@ -105,7 +112,14 @@ def execute_action(
         undo_token=_undo_token(action, prior_labels),
     )
 
-    if action.kind in settings.forbidden_actions:
+    # Normalise before the deny-list check, and OR in the ALWAYS_FORBIDDEN floor
+    # so this chokepoint never fully trusts a caller-supplied Settings: an empty
+    # or case/whitespace-mangled forbidden_actions must not let a deny-listed
+    # kind through. This must stay before the dry-run branch below, or a
+    # deny-list evasion in dry-run mode would be filed as ordinary "simulated"
+    # activity instead of being refused.
+    normalized_kind = action.kind.strip().lower()
+    if normalized_kind in (settings.forbidden_actions | ALWAYS_FORBIDDEN):
         log.append(AuditRecord(**base, result=f"refused: {action.kind} is on the deny-list"))
         raise ForbiddenActionError(
             f"{action.kind} is permanently forbidden (spec section 2). "

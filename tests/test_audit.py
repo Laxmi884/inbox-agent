@@ -1,4 +1,6 @@
 import json
+from dataclasses import replace
+
 import pytest
 
 from inbox_agent.audit import (
@@ -43,6 +45,49 @@ def test_send_message_is_refused_even_when_dry_run_is_off(tmp_path, snapshot_fil
         execute_action(Action(kind="send_message", thread_id="t1"),
                        client=SnapshotGmailClient(snapshot_file),
                        settings=settings, log=log, actor="agent", context=ctx)
+    # Pin the mechanism, not just the exception text: _dispatch's fallback
+    # error also happens to contain "send_message" if the kind ever reached
+    # it, so without this the test would pass even with a broken deny-list.
+    assert log.records()[0].result.startswith("refused")
+
+
+def test_send_message_case_variant_is_refused_in_dry_run(tmp_path, snapshot_file, ctx):
+    """A case-mangled kind must still be caught before the dry-run branch,
+    not filed as ordinary 'simulated' activity."""
+    settings = make_settings(tmp_path, dry_run=True)
+    log = AuditLog(settings.audit_log)
+    with pytest.raises(ForbiddenActionError):
+        execute_action(Action(kind="Send_Message", thread_id="t1"),
+                       client=SnapshotGmailClient(snapshot_file),
+                       settings=settings, log=log, actor="agent", context=ctx)
+    records = log.records()
+    assert len(records) == 1
+    assert records[0].result.startswith("refused")
+    assert records[0].result != "simulated"
+
+
+def test_send_message_whitespace_variant_is_refused(tmp_path, snapshot_file, ctx):
+    """A whitespace-padded kind must still hit the deny-list."""
+    settings = make_settings(tmp_path, dry_run=False)
+    log = AuditLog(settings.audit_log)
+    with pytest.raises(ForbiddenActionError):
+        execute_action(Action(kind=" send_message", thread_id="t1"),
+                       client=SnapshotGmailClient(snapshot_file),
+                       settings=settings, log=log, actor="agent", context=ctx)
+    assert log.records()[0].result.startswith("refused")
+
+
+def test_send_message_refused_even_with_empty_forbidden_actions(tmp_path, snapshot_file, ctx):
+    """ALWAYS_FORBIDDEN is a floor the chokepoint carries itself; it must hold
+    even if the caller-supplied Settings.forbidden_actions is empty."""
+    settings = make_settings(tmp_path, dry_run=False)
+    settings = replace(settings, forbidden_actions=frozenset())
+    log = AuditLog(settings.audit_log)
+    with pytest.raises(ForbiddenActionError):
+        execute_action(Action(kind="send_message", thread_id="t1"),
+                       client=SnapshotGmailClient(snapshot_file),
+                       settings=settings, log=log, actor="agent", context=ctx)
+    assert log.records()[0].result.startswith("refused")
 
 
 def test_refused_action_is_still_written_to_the_audit_log(tmp_path, snapshot_file, ctx):
