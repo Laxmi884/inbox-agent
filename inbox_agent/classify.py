@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from .models import Action, ActionKind, Decision, Thread
@@ -21,19 +21,21 @@ MAX_BODY_CHARS = 4000
 class ThreadJudgment(BaseModel):
     """Structured output schema. Kept flat - nested schemas degrade on small models."""
     category: str = Field(description="one of the categories named in the policy")
-    action: ActionKind = Field(description="label, archive, trash, draft, or none")
+    action: ActionKind = Field(description="label, unlabel, archive, trash, draft, or none")
     label: Optional[str] = Field(default=None, description="label name if action is label")
     reason: str = Field(description="one short sentence of justification")
     confidence: float = Field(default=0.5, description="0.0 to 1.0", ge=0.0, le=1.0)
 
 
 def _fence(body: str) -> str:
-    """Truncate, and neutralise any attempt to close the fence from inside it."""
+    """Truncate, and neutralise any attempt to open OR close the fence from inside it."""
     clipped = body[:MAX_BODY_CHARS]
-    return clipped.replace("</email_body>", "&lt;/email_body&gt;")
+    clipped = clipped.replace("<email_body>", "&lt;email_body&gt;")
+    clipped = clipped.replace("</email_body>", "&lt;/email_body&gt;")
+    return clipped
 
 
-def build_prompt(thread: Thread, policy: Policy) -> list:
+def build_prompt(thread: Thread, policy: Policy) -> list[BaseMessage]:
     system = SystemMessage(content=policy.text)
     human = HumanMessage(content=(
         "Classify this email thread.\n\n"
@@ -51,7 +53,7 @@ def build_prompt(thread: Thread, policy: Policy) -> list:
 def _to_actions(judgment: ThreadJudgment, thread_id: str) -> list[Action]:
     if judgment.action == "label":
         return [Action(kind="label", thread_id=thread_id,
-                       params={"label": judgment.label or "Triaged"})]
+                       params={"label": judgment.label or judgment.category})]
     return [Action(kind=judgment.action, thread_id=thread_id)]
 
 
