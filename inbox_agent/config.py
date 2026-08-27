@@ -201,6 +201,25 @@ MODELS: dict[str, ModelChoice] = {
         "failure shape as local Gemma - a reasoning model is the wrong tool for "
         "one small structured judgment.",
     ),
+    "gemma3": ModelChoice(
+        "openrouter", "google/gemma-3-12b-it", "paid",
+        "BEST MEASURED. 1.29s/thread, 0/10 parse failures, `reason` 10/10, mean "
+        "confidence 0.845, ~$0.003 per 50-thread run - faster AND a third the price "
+        "of 4o-mini. Same 12B size as the local model but NOT a reasoning model: "
+        "this is the control proving the local failure was reasoning, not size and "
+        "not the Gemma family.",
+    ),
+    "qwen3": ModelChoice(
+        "openrouter", "qwen/qwen3-30b-a3b-instruct-2507", "paid",
+        "3.07s/thread, 0/10 failures, `reason` 10/10, confidence 0.80, ~$0.003. "
+        "Non-reasoning 30B - the direct counterpart to muse-glimmer-30b with "
+        "reasoning as the only variable changed, and it works.",
+    ),
+    "nemo": ModelChoice(
+        "openrouter", "mistralai/mistral-nemo", "paid",
+        "Cheapest at ~$0.001 per 50-thread run, but 11.2s/thread and 2/10 parse "
+        "failures. The cheap floor has a real cost in reliability.",
+    ),
     "muse": ModelChoice(
         "openrouter", "meta/muse-glimmer-30b", "paid",
         "Reasoning model. 7.1s/thread and 2/10 parse failures - it answers in "
@@ -208,7 +227,10 @@ MODELS: dict[str, ModelChoice] = {
         "rescues 8 of 10. Populates `reason` well, but mean confidence 0.578 vs "
         "0.834 for 4o-mini, and it defaults to archive over labelling. "
         "~$0.06 per 50-thread run: reasoning tokens bill as completion tokens, "
-        "so it costs 3x what the headline per-token price suggests.",
+        "so it costs 3x what the headline per-token price suggests. Reasoning "
+        "cannot be disabled here - OpenRouter returns HTTP 400 'Reasoning is "
+        "mandatory for this endpoint'. The Ollama reasoning=False escape hatch "
+        "that rescued the local model has no equivalent on this endpoint.",
     ),
     "glm": ModelChoice(
         "openrouter", "z-ai/glm-5.3-flash", "paid",
