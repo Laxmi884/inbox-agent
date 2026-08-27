@@ -27,7 +27,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 # this set; it may not remove from it. See spec section 2.
 ALWAYS_FORBIDDEN = frozenset({"send_message", "delete_forever"})
 
-_FALSEY = {"false", "0", "no", "off", ""}
+_FALSEY = {"false", "0", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ class Settings:
     snapshot_dir: Path
     snapshot_size: int
     audit_log: Path
-    forbidden_actions: frozenset
+    forbidden_actions: frozenset[str]
     context_hub_skill: str
     context_hub_tag: str
 
@@ -95,6 +95,8 @@ def mask(value: Optional[str]) -> str:
     """Show enough of a key to confirm it loaded, never enough to leak it."""
     if not value:
         return "not set"
+    if len(value) <= 11:
+        return f"<redacted>  ({len(value)} chars)"
     return f"{value[:7]}...{value[-4:]}  ({len(value)} chars)"
 
 

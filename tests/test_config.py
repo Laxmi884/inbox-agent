@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from inbox_agent.config import load_settings, resolve_backend
+from inbox_agent.config import load_settings, resolve_backend, mask
 
 
 def test_settings_read_from_environment(monkeypatch):
@@ -47,3 +47,18 @@ def test_resolve_backend_falls_back_to_offline_when_ollama_pinned_but_dead(monke
     monkeypatch.setenv("INBOX_LLM_BACKEND", "ollama")
     monkeypatch.setattr("inbox_agent.config.ollama_available", lambda timeout=1.5: False)
     assert resolve_backend() == "offline"
+
+
+def test_dry_run_defaults_to_true_when_empty_string(monkeypatch):
+    """Empty INBOX_DRY_RUN should not disable dry-run (no signal = stay safe)."""
+    monkeypatch.setenv("INBOX_DRY_RUN", "")
+    assert load_settings().dry_run is True
+
+
+def test_mask_does_not_reveal_short_secrets(monkeypatch):
+    """Secrets of 11 chars or fewer should be completely redacted."""
+    short_secret = "abcdefgh"  # 8 chars
+    result = mask(short_secret)
+    assert short_secret not in result
+    assert "8 chars" in result
+    assert "<redacted>" in result
