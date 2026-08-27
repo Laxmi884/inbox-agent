@@ -13,6 +13,12 @@ from .models import Action, ReviewRequest, ReviewResponse
 
 LOW_CONFIDENCE = 0.5
 
+# gemma4:12b-mlx reliably omits ThreadJudgment.reason (measured empty on 50 of
+# 50 real threads), so an empty reason is the common case, not an anomaly. An
+# empty "why" cell is indistinguishable from a rendering bug; this marker
+# makes "the model gave no explanation" visible instead of silent.
+NO_REASON = "(no reason given)"
+
 
 def review_table(request: ReviewRequest) -> list[dict]:
     """Rows for pandas.DataFrame, or any other tabular renderer."""
@@ -22,6 +28,7 @@ def review_table(request: ReviewRequest) -> list[dict]:
             f"{a.kind}({a.params.get('label')})" if a.params.get("label") else a.kind
             for a in item.proposed)
         flag = " !" if item.confidence < LOW_CONFIDENCE else ""
+        why = item.reason[:60] if item.reason.strip() else NO_REASON
         rows.append({
             "thread_id": item.thread_id,
             "sender": item.sender[:34],
@@ -29,7 +36,7 @@ def review_table(request: ReviewRequest) -> list[dict]:
             "proposed": actions,
             "confidence": f"{item.confidence:.2f}{flag}",
             "src": item.source,
-            "why": item.reason[:60],
+            "why": why,
         })
     return rows
 

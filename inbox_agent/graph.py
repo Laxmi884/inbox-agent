@@ -10,8 +10,10 @@ from __future__ import annotations
 import uuid
 from typing import TypedDict, get_args
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
+from langsmith.run_helpers import get_current_run_tree
 
 from .audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from .classify import classify_batch
@@ -100,12 +102,6 @@ def build_graph(
     log: AuditLog,
     checkpointer=None,
 ):
-    context = ExecutionContext(
-        model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
-        backend=settings.backend,
-        policy_version=policy.version,
-    )
-
     def fetch(state: TriageState) -> dict:
         threads = client.list_threads(limit=state.get("limit", settings.snapshot_size))
         return {"threads": [t.model_dump() for t in threads]}
@@ -139,7 +135,40 @@ def build_graph(
         answer = interrupt(state["review"])
         return {"response": answer}
 
-    def execute(state: TriageState) -> dict:
+    def execute(state: TriageState, config: RunnableConfig) -> dict:
+        # ExecutionContext is built here, per invocation, rather than once in
+        # build_graph: checkpoint_id/langsmith_run_id are run-scoped, not
+        # graph-scoped, and only exist once a run is actually underway.
+        #
+        # checkpoint_id: verified against a real config dict at runtime
+        # (langgraph 1.2.11) - config["configurable"]["checkpoint_id"] exists
+        # as a key but is None on both the initial and the resumed invocation
+        # of a node; it is not populated by ordinary forward execution in
+        # this version. thread_id IS reliably present on every invocation, so
+        # that is what gets recorded here (field left named checkpoint_id per
+        # the audit schema; see the fix report for the runtime evidence).
+        configurable = config.get("configurable", {}) if config else {}
+        checkpoint_id = configurable.get("thread_id")
+
+        # langsmith_run_id: only present when tracing is actually active.
+        # Tracing is OFF by default locally, so this must never raise or add
+        # latency when LangSmith isn't configured.
+        langsmith_run_id = None
+        try:
+            run_tree = get_current_run_tree()
+            if run_tree is not None:
+                langsmith_run_id = str(run_tree.id)
+        except Exception:
+            langsmith_run_id = None
+
+        context = ExecutionContext(
+            model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
+            backend=settings.backend,
+            policy_version=policy.version,
+            checkpoint_id=checkpoint_id,
+            langsmith_run_id=langsmith_run_id,
+        )
+
         response = ReviewResponse.model_validate(state.get("response") or {})
         decisions = {d["thread_id"]: Decision.model_validate(d)
                      for d in state["decisions"]}

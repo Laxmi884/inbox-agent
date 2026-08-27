@@ -1,6 +1,8 @@
 # tests/test_render.py
 from inbox_agent.models import Action, ReviewItem, ReviewRequest
-from inbox_agent.render import approve_all, render_review, respond, review_table
+from inbox_agent.render import (
+    NO_REASON, approve_all, render_review, respond, review_table,
+)
 
 
 def request() -> ReviewRequest:
@@ -54,3 +56,27 @@ def test_respond_records_edits_as_edit_verdicts():
 def test_respond_carries_free_text_instructions():
     resp = respond(request(), instructions=["always keep mail from my boss"])
     assert resp.instructions == ["always keep mail from my boss"]
+
+
+def test_empty_reason_renders_a_visible_marker():
+    """gemma4:12b-mlx reliably omits reason; an empty why-cell must not read
+    as a rendering bug."""
+    req = ReviewRequest(
+        run_id="r1", policy_version="local:test",
+        items=[ReviewItem(thread_id="t1", subject="Sale", sender="deals@shop.com",
+                           snippet="50% off", proposed=[Action(kind="archive", thread_id="t1")],
+                           reason="", confidence=0.9, source="model", rule_id=None)])
+    assert review_table(req)[0]["why"] == NO_REASON
+
+
+def test_whitespace_only_reason_renders_the_marker_too():
+    req = ReviewRequest(
+        run_id="r1", policy_version="local:test",
+        items=[ReviewItem(thread_id="t1", subject="Sale", sender="deals@shop.com",
+                           snippet="50% off", proposed=[Action(kind="archive", thread_id="t1")],
+                           reason="   ", confidence=0.9, source="model", rule_id=None)])
+    assert review_table(req)[0]["why"] == NO_REASON
+
+
+def test_real_reason_renders_unchanged():
+    assert review_table(request())[0]["why"] == "promotional"

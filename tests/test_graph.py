@@ -77,6 +77,25 @@ def test_approving_executes_the_action(wiring):
     assert wiring["log"].records()[0].action == "archive"
 
 
+def test_executed_action_carries_a_traceable_checkpoint_identifier(wiring):
+    """An AuditRecord must be joinable back to the run that produced it
+    (spec's audit-worthiness pillar). langgraph 1.2.11 does not populate
+    config["configurable"]["checkpoint_id"] inside a node on either the
+    initial or the resumed invocation (verified at runtime), so thread_id -
+    which IS always present - is what gets recorded in that field."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "run-checkpoint"}}
+    graph.invoke({"limit": 10}, config)
+    final = graph.invoke(
+        Command(resume={"decisions": {"t1": "approve"}, "edits": {}, "instructions": []}),
+        config)
+    assert len(final["executed"]) == 1
+    record = wiring["log"].records()[0]
+    assert record.checkpoint_id is not None
+    assert record.checkpoint_id == "run-checkpoint"
+
+
 def test_rejecting_executes_nothing(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
