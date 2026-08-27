@@ -23,7 +23,10 @@ class ThreadJudgment(BaseModel):
     category: str = Field(description="one of the categories named in the policy")
     action: ActionKind = Field(description="label, unlabel, archive, trash, draft, or none")
     label: Optional[str] = Field(default=None, description="label name if action is label")
-    reason: str = Field(description="one short sentence of justification")
+    # gemma4:12b-mlx reliably returns category/action/confidence but frequently
+    # omits reason. Required, it threw away otherwise-correct judgments; a
+    # default keeps the classification and leaves the gap visible to the human.
+    reason: str = Field(default="", description="one short sentence of justification")
     confidence: float = Field(default=0.5, description="0.0 to 1.0", ge=0.0, le=1.0)
 
 

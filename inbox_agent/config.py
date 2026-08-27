@@ -115,6 +115,11 @@ def get_llm(backend: Optional[str] = None):
             temperature=0,
             # One thread per call keeps this well under budget; see spec section 3.
             num_ctx=8192,
+            # gemma4 is a hybrid thinker. Left on, it reasons at length before
+            # emitting structured output and the call effectively never returns -
+            # measured >9 minutes for a single classification. Off, it answers in
+            # 1-3s. build_notebook.py:563 sets this for the same reason.
+            reasoning=False,
         )
 
     if backend == "openrouter":
