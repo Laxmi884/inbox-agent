@@ -57,11 +57,7 @@ class PreferenceStore:
         self._store = store
 
     def add_rule(self, rule: Rule) -> Rule:
-        self._store.put(
-            RULES_NS, rule.id,
-            {"rule": rule.model_dump(mode="json"),
-             "text": f"{rule.scope} {rule.pattern} -> {rule.action}. {rule.provenance}"},
-        )
+        self._put(rule)
         return rule
 
     def rules(self) -> list[Rule]:
@@ -129,6 +125,7 @@ class PreferenceStore:
         return [
             {"id": r.id, "scope": r.scope, "pattern": r.pattern, "action": r.action,
              "hit_count": r.hit_count, "overridden": r.overridden,
-             "provenance": r.provenance}
+             "provenance": r.provenance,
+             "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")}
             for r in sorted(self.rules(), key=lambda r: r.created_at)
         ]

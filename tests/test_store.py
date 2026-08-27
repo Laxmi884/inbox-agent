@@ -77,10 +77,20 @@ def test_delete_rule_removes_it():
 def test_as_table_is_human_readable():
     """The owner must always be able to read what the agent thinks it knows."""
     s = store()
-    s.add_rule(rule_from_correction(thread(), "archive", "note"))
+    r = rule_from_correction(thread(), "archive", "note")
+    s.add_rule(r)
+    s.record_hit(r.id)
     row = s.as_table()[0]
     for col in ("id", "scope", "pattern", "action", "hit_count", "provenance"):
         assert col in row
+    assert row["id"] == r.id
+    assert row["scope"] == "sender"
+    assert row["pattern"] == "deals@shop.com"
+    assert row["action"] == "archive"
+    assert row["hit_count"] == 1
+    assert row["provenance"] == "note"
+    assert row["overridden"] is False
+    assert row.get("created_at")
 
 
 def test_rules_returns_all_rules_beyond_the_default_search_limit():
