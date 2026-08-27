@@ -201,6 +201,15 @@ MODELS: dict[str, ModelChoice] = {
         "failure shape as local Gemma - a reasoning model is the wrong tool for "
         "one small structured judgment.",
     ),
+    "muse": ModelChoice(
+        "openrouter", "meta/muse-glimmer-30b", "paid",
+        "Reasoning model. 7.1s/thread and 2/10 parse failures - it answers in "
+        "markdown prose rather than JSON, and only LangChain's coercion "
+        "rescues 8 of 10. Populates `reason` well, but mean confidence 0.578 vs "
+        "0.834 for 4o-mini, and it defaults to archive over labelling. "
+        "~$0.06 per 50-thread run: reasoning tokens bill as completion tokens, "
+        "so it costs 3x what the headline per-token price suggests.",
+    ),
     "glm": ModelChoice(
         "openrouter", "z-ai/glm-5.3-flash", "paid",
         "What the retired stealth/ox-alpha slot turned out to be.",
