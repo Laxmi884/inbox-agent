@@ -135,3 +135,65 @@ def test_rule_matched_threads_skip_the_model(wiring):
     graph = build_graph(**{**wiring, "llm": ExplodingLLM()}, checkpointer=InMemorySaver())
     result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-6"}})
     assert result["__interrupt__"][0].value["items"][0]["source"] == "rule"
+
+
+def test_approve_unknown_thread_id_does_not_crash(wiring):
+    """A ghost thread id on the approve path must be skipped, not KeyError'd."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "run-7"}}
+    graph.invoke({"limit": 10}, config)
+    final = graph.invoke(
+        Command(resume={"decisions": {"ghost-thread": "approve"},
+                        "edits": {}, "instructions": []}),
+        config)
+    assert final["executed"] == []
+    assert any(s["thread_id"] == "ghost-thread" for s in final["skipped"])
+    assert wiring["log"].records() == []
+
+
+def test_edit_unknown_thread_id_executes_nothing(wiring):
+    """A forged/never-proposed thread id on the edit path must not fail open."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "run-8"}}
+    graph.invoke({"limit": 10}, config)
+    final = graph.invoke(
+        Command(resume={"decisions": {"ghost-thread-2": "edit"},
+                        "edits": {"ghost-thread-2": [
+                            {"kind": "trash", "thread_id": "ghost-thread-2"}]},
+                        "instructions": []}),
+        config)
+    assert final["executed"] == []
+    assert any(s["thread_id"] == "ghost-thread-2" for s in final["skipped"])
+    assert wiring["log"].records() == []
+
+
+def test_forbidden_action_is_visible_in_state(wiring):
+    """A refusal must surface in TriageState, not just in print()/the JSONL file.
+
+    Uses a caller-configured forbidden kind ("archive") rather than an
+    ALWAYS_FORBIDDEN one ("send_message"/"delete_forever"): those aren't valid
+    Rule.action literals, and routing one through the edit path would also hit
+    learn_from_response's rule-creation step - a separate, pre-existing gap
+    (rule_from_correction assumes edits[0].kind is a valid ActionKind) that is
+    out of scope for this fix round and is called out in the report instead.
+    """
+    from dataclasses import replace
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    settings = replace(wiring["settings"],
+                        forbidden_actions=wiring["settings"].forbidden_actions
+                        | frozenset({"archive"}))
+    graph = build_graph(**{**wiring, "settings": settings}, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "run-9"}}
+    graph.invoke({"limit": 10}, config)
+    final = graph.invoke(
+        Command(resume={"decisions": {"t1": "edit"},
+                        "edits": {"t1": [{"kind": "archive", "thread_id": "t1"}]},
+                        "instructions": []}),
+        config)
+    assert final["executed"] == []
+    assert len(final["refused"]) == 1
+    assert final["refused"][0]["thread_id"] == "t1"
+    assert final["refused"][0]["kind"] == "archive"

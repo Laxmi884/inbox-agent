@@ -8,7 +8,7 @@ interrupt is durable, so a run can be resumed hours later from a different UI.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Any, Optional, TypedDict
+from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -31,6 +31,8 @@ class TriageState(TypedDict, total=False):
     review: dict
     response: dict
     executed: list[dict]
+    refused: list[dict]
+    skipped: list[dict]
     learned: list[str]
 
 
@@ -47,6 +49,11 @@ def learn_from_response(
         edits = response.edits.get(thread_id, [])
         if not edits:
             continue
+        # A "reject" that carries edits still teaches a rule from the edit's
+        # action - the owner is saying "not this, but here's what I'd have
+        # wanted" - even though execute() will not act on it for this thread.
+        # Reject means "do not do this now"; the edit is preference signal for
+        # next time. Intended: do not "fix" this into skipping reject+edits.
         rule = rule_from_correction(
             by_id[thread_id], edits[0].kind,
             f"corrected proposal on thread {thread_id}: owner chose {edits[0].kind}",
@@ -111,13 +118,27 @@ def build_graph(
         decisions = {d["thread_id"]: Decision.model_validate(d)
                      for d in state["decisions"]}
         executed = []
+        refused = []
+        skipped = []
 
         for thread_id, verdict in response.decisions.items():
             if verdict == "reject":
                 continue
-            actions = (response.edits.get(thread_id)
-                       if verdict == "edit" else decisions[thread_id].actions) or []
+
+            # The interrupt's whole purpose is a trust boundary: the executed
+            # set must be a subset of what the human was actually shown. A
+            # resume payload naming a thread that never appeared in this
+            # batch - stale, replayed, or forged - must be skipped before any
+            # indexing happens, on every verdict branch (approve AND edit),
+            # not just guarded where a crash would otherwise be obvious.
             decision = decisions.get(thread_id)
+            if decision is None:
+                skipped.append({"thread_id": thread_id, "verdict": verdict,
+                                 "reason": "not part of the reviewed batch"})
+                continue
+
+            actions = (response.edits.get(thread_id)
+                       if verdict == "edit" else decision.actions) or []
             for action in actions:
                 if action.kind == "none":
                     continue
@@ -125,16 +146,22 @@ def build_graph(
                     rec = execute_action(
                         action, client=client, settings=settings, log=log,
                         actor="human" if verdict == "edit" else (
-                            f"rule:{decision.rule_id}" if decision and decision.rule_id
+                            f"rule:{decision.rule_id}" if decision.rule_id
                             else "agent"),
                         context=context,
-                        rule_provenance=decision.reason if decision else None,
+                        rule_provenance=decision.reason if decision.rule_id else None,
                     )
                     executed.append(rec.model_dump(mode="json"))
                 except ForbiddenActionError as exc:
-                    print(f"[execute] refused: {exc}")
+                    # execute_action already wrote the durable refusal record;
+                    # this makes the refusal visible to whatever UI is holding
+                    # the state too (a notebook, a future Telegram bot), since
+                    # print() reaches neither and the JSONL file is not
+                    # something either renders by default.
+                    refused.append({"thread_id": thread_id, "kind": action.kind,
+                                     "error": str(exc)})
 
-        return {"executed": executed}
+        return {"executed": executed, "refused": refused, "skipped": skipped}
 
     def learn(state: TriageState) -> dict:
         response = ReviewResponse.model_validate(state.get("response") or {})
