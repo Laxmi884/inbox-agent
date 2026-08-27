@@ -28,8 +28,20 @@ def test_local_policy_version_is_content_addressed(tmp_path):
 
 def test_policy_names_the_forbidden_actions(tmp_path):
     """Belt and braces: the deny-list is enforced in code, and stated in the prompt."""
+    text = load_policy(make_settings(tmp_path), allow_remote=False).text.lower()
+    assert "send" in text
+    assert "permanent" in text and "deletion" in text
+
+
+def test_policy_lists_all_categories(tmp_path):
+    """A future edit must not silently drop a category from the prompt."""
     text = load_policy(make_settings(tmp_path), allow_remote=False).text
-    assert "send" in text.lower()
+    categories = [
+        "needs_reply", "important_fyi", "newsletter_valuable", "newsletter_noise",
+        "promotion", "receipt", "recruiter", "security_alert", "automated", "other",
+    ]
+    for category in categories:
+        assert f"`{category}`" in text
 
 
 def test_remote_failure_falls_back_to_local(tmp_path, monkeypatch):
