@@ -3,21 +3,50 @@ from datetime import datetime, timezone
 
 from inbox_agent.models import (
     Action, Thread, Decision, Rule, ReviewItem, ReviewRequest,
-    ReviewResponse, AuditRecord,
+    ReviewResponse, AuditRecord, REVERSIBLE_ACTIONS,
 )
 
 
 def test_thread_fingerprint_is_stable_and_sender_scoped():
-    t1 = Thread(id="a", subject="Hi", sender="x@y.com", to=["me@z.com"],
+    # Test (a): Digit-stripped subjects from same sender produce same fingerprint
+    t1 = Thread(id="a", subject="Invoice 8821", sender="vendor@acme.com", to=["me@z.com"],
                 date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
-    t2 = Thread(id="b", subject="Hi", sender="x@y.com", to=["me@z.com"],
+    t2 = Thread(id="b", subject="Invoice 8822", sender="vendor@acme.com", to=["me@z.com"],
                 date="2026-08-27T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
-    assert t1.fingerprint == t2.fingerprint  # same sender + subject shape
+    assert t1.fingerprint == t2.fingerprint  # digits stripped, same sender
+
+    # Test (b): Same subject from different senders produces different fingerprints
+    t3 = Thread(id="c", subject="Invoice 8821", sender="vendor@acme.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    t4 = Thread(id="d", subject="Invoice 8821", sender="vendor@other.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    assert t3.fingerprint != t4.fingerprint  # different sender
 
 
 def test_action_defaults_to_empty_params():
     a = Action(kind="archive", thread_id="t1")
     assert a.params == {}
+
+
+def test_action_accepts_unsafe_kinds_for_deny_list_testing():
+    # Finding 1: Action.kind is str (not ActionKind) to allow testing deny-list at chokepoint
+    a = Action(kind="send_message", thread_id="t1")
+    assert a.kind == "send_message"
+    assert "send_message" not in REVERSIBLE_ACTIONS
+
+
+def test_fingerprint_strips_prefixes_and_collapses_whitespace():
+    # Test Re:/Fwd:/Fw: prefix stripping
+    t1 = Thread(id="a", subject="Budget Review", sender="mgr@acme.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    t2 = Thread(id="b", subject="Re: Budget Review", sender="mgr@acme.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    t3 = Thread(id="c", subject="Re: Re: Budget Review", sender="mgr@acme.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    t4 = Thread(id="d", subject="FWD:  Budget   Review", sender="mgr@acme.com", to=["me@z.com"],
+                date="2026-08-26T00:00:00Z", snippet="s", body="b", label_ids=["INBOX"])
+    # All should have same fingerprint after normalization
+    assert t1.fingerprint == t2.fingerprint == t3.fingerprint == t4.fingerprint
 
 
 def test_review_request_round_trips_through_json():
