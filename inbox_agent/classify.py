@@ -143,10 +143,22 @@ class ThreadJudgment(BaseModel):
 # fewer tokens. `reason` is not free; it costs ~1.6s/thread on this model. That
 # is the price of an auditable decision and it is worth paying.
 #
-# One cell is still untested: GGUF + a model with NO thinking template at all
-# (all three above are gemma4 hybrids). #15260 reports gpt-oss:20b honouring
-# `format` at think=false, so enforcement plausibly survives there. Not
-# measured here - do not assume it.
+# One cell is still untested: GGUF + a model with NO thinking template at all.
+# gpt-oss:20b was the nominated candidate for it, on the strength of #15260
+# reporting it honouring `format` at think=false. It does not qualify. Ollama's
+# own template selection for it reads:
+#
+#   model=.../gpt-oss:20b selected=harmony go_template="[completion tools thinking]"
+#
+# harmony, and `thinking` advertised - the same hybrid-thinker class as the
+# gemma4 entries above, not the control we wanted. Whatever it showed in the
+# table, it was never the no-thinking cell, and that cell is still open. Do not
+# re-nominate it.
+#
+# It was pulled for the strict-required test above, gave that result, and was
+# removed as not worth pursuing further. The 10-thread throughput bench was
+# never run, so there are no speed or judgement numbers for it here and none
+# should be inferred from the schema row.
 #
 # Measured consequence: gemma4:12b-mlx returned category/action/confidence and
 # omitted `reason` on 50 of 50 threads, leaving the audit trail with no
