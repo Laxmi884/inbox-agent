@@ -116,3 +116,33 @@ def test_classify_batch_returns_one_decision_per_thread():
     decisions = classify_batch(
         [thread(), thread(id="t2", sender="other@x.com")], FakeLLM(), policy())
     assert [d.thread_id for d in decisions] == ["t1", "t2"]
+
+
+def test_output_contract_names_every_schema_field():
+    """The runner silently ignores our JSON schema (ollama/ollama#16776), so the
+    prompt is the only thing asking for these fields. If a field is added to
+    ThreadJudgment and not to the contract, the model will simply never send it -
+    exactly how `reason` went missing on 50 of 50 threads."""
+    from inbox_agent.classify import OUTPUT_CONTRACT, ThreadJudgment
+
+    for field in ThreadJudgment.model_fields:
+        assert f'"{field}"' in OUTPUT_CONTRACT, f"{field} missing from OUTPUT_CONTRACT"
+
+
+def test_output_contract_marks_reason_as_required():
+    from inbox_agent.classify import OUTPUT_CONTRACT
+
+    assert "REQUIRED" in OUTPUT_CONTRACT
+    assert "reason" in OUTPUT_CONTRACT
+
+
+def test_prompt_carries_both_policy_and_contract():
+    from inbox_agent.classify import OUTPUT_CONTRACT, build_prompt
+    from inbox_agent.models import Thread
+    from inbox_agent.policy import Policy
+
+    t = Thread(id="t1", subject="S", sender="a@b.com", to=[], date="d",
+               snippet="s", body="b", label_ids=[])
+    prompt = str(build_prompt(t, Policy(text="TEST POLICY", version="v", source="local")))
+    assert "TEST POLICY" in prompt
+    assert "confidence" in prompt

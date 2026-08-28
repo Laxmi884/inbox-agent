@@ -30,6 +30,41 @@ class ThreadJudgment(BaseModel):
     confidence: float = Field(default=0.5, description="0.0 to 1.0", ge=0.0, le=1.0)
 
 
+# ---------------------------------------------------------------------------
+# Output contract
+#
+# `with_structured_output` attaches a JSON schema, but Ollama's MLX runner
+# SILENTLY IGNORES it: the request succeeds and the model free-forms instead.
+# Upstream: ollama/ollama#16776, #17013, and #15260 - the last of which reports
+# that `think=false` specifically breaks `format` for gemma4. Our reasoning=False
+# is required for speed, so on this runner we are always unconstrained.
+#
+# Measured consequence: gemma4:12b-mlx returned category/action/confidence and
+# omitted `reason` on 50 of 50 threads, leaving the audit trail with no
+# model-side "why". Stating the contract in the prompt recovers it - 0/6 to 6/6
+# in a controlled A/B on the same threads - and, as a side effect, stops the
+# model returning a null label and fixes an over-trigger on account-adjacent
+# product mail.
+#
+# The contract lives here, next to the schema it describes, rather than in the
+# policy file: the policy is a versioned statement about JUDGEMENT, this is a
+# statement about FORMAT, and format must change in lockstep with
+# ThreadJudgment. A test asserts every schema field is named here.
+# ---------------------------------------------------------------------------
+
+OUTPUT_CONTRACT = """
+
+Return a single JSON object and nothing else, with EXACTLY these five keys:
+  "category"   - one of the category names listed above, copied verbatim
+  "action"     - one of: label, unlabel, archive, trash, draft, none
+  "label"      - if action is "label", the category name again, verbatim;
+                 otherwise null
+  "reason"     - REQUIRED. One short sentence saying why you decided this.
+                 Never omit this key and never leave it empty: it is the only
+                 record of your judgement the owner will ever see.
+  "confidence" - a number from 0.0 to 1.0
+"""
+
 def _fence(body: str) -> str:
     """Truncate, and neutralise any attempt to open OR close the fence from inside it."""
     clipped = body[:MAX_BODY_CHARS]
@@ -39,7 +74,9 @@ def _fence(body: str) -> str:
 
 
 def build_prompt(thread: Thread, policy: Policy) -> list[BaseMessage]:
-    system = SystemMessage(content=policy.text)
+    # Policy states the judgement; OUTPUT_CONTRACT states the format the runner
+    # will not enforce for us. See the note above OUTPUT_CONTRACT.
+    system = SystemMessage(content=policy.text + OUTPUT_CONTRACT)
     human = HumanMessage(content=(
         "Classify this email thread.\n\n"
         f"From: {thread.sender}\n"
