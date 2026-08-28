@@ -146,3 +146,37 @@ def test_prompt_carries_both_policy_and_contract():
     prompt = str(build_prompt(t, Policy(text="TEST POLICY", version="v", source="local")))
     assert "TEST POLICY" in prompt
     assert "confidence" in prompt
+
+
+def test_wire_schema_marks_every_field_required():
+    """A grammar-constrained runner will never emit an OPTIONAL field.
+
+    Pydantic drops any field carrying a default out of `required`, which is why
+    `reason` came back empty on 50/50 threads even while Ollama was enforcing
+    the schema correctly. `_require_every_field` widens the wire schema so
+    enforcement can guarantee the field. Adding a defaulted field without this
+    would silently reintroduce the bug.
+    """
+    from inbox_agent.classify import ThreadJudgment
+
+    schema = ThreadJudgment.model_json_schema()
+    assert set(schema["required"]) == set(schema["properties"]), (
+        "every property must be required on the wire; "
+        f"missing: {sorted(set(schema['properties']) - set(schema['required']))}"
+    )
+
+
+def test_parsing_stays_lenient_when_a_runner_does_not_enforce():
+    """Strict on the wire, lenient on the parse - ruling R43 must stay fixed.
+
+    A runner that ignores `format` (Ollama MLX before 0.33.1, and any hosted
+    model without constrained decoding) can still omit `reason`. That must
+    degrade to an empty string, not raise, or a correct classification is
+    thrown away.
+    """
+    from inbox_agent.classify import ThreadJudgment
+
+    judgment = ThreadJudgment.model_validate({"category": "promotion", "action": "archive"})
+    assert judgment.reason == ""
+    assert judgment.confidence == 0.5
+    assert judgment.label is None
