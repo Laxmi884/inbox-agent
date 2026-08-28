@@ -33,11 +33,23 @@ class ThreadJudgment(BaseModel):
 # ---------------------------------------------------------------------------
 # Output contract
 #
-# `with_structured_output` attaches a JSON schema, but Ollama's MLX runner
-# SILENTLY IGNORES it: the request succeeds and the model free-forms instead.
-# Upstream: ollama/ollama#16776, #17013, and #15260 - the last of which reports
-# that `think=false` specifically breaks `format` for gemma4. Our reasoning=False
-# is required for speed, so on this runner we are always unconstrained.
+# `with_structured_output` attaches a JSON schema, but Ollama SILENTLY IGNORES
+# it here: the request succeeds and the model free-forms instead.
+# Upstream: ollama/ollama#16776, #17013 (MLX runner ignores `format`, GGUF
+# reportedly does not) and #15260 (`think=false` breaks `format` for gemma4).
+#
+# We pulled the 7.6 GB GGUF build and tested it. It does NOT help us:
+#
+#   runner  reasoning   `reason` present   time
+#   GGUF    False       0/6                40s     <- still unconstrained
+#   MLX     False       0/6                24s     <- known broken
+#   GGUF    True        unmeasurable       >240s timeout
+#   MLX     True        unmeasurable       >240s timeout
+#
+# So the runner bug is real but is not the one biting us. #15260 is: at
+# think=false the schema is ignored on BOTH runners, and think=true never
+# returns, so there is no configuration in which enforcement is available to us.
+# Switching to GGUF buys nothing and is slower on this hardware.
 #
 # Measured consequence: gemma4:12b-mlx returned category/action/confidence and
 # omitted `reason` on 50 of 50 threads, leaving the audit trail with no
