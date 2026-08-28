@@ -188,9 +188,32 @@ class ModelChoice:
 MODELS: dict[str, ModelChoice] = {
     "gemma": ModelChoice(
         "ollama", "gemma4:12b-mlx", "local",
-        "Local baseline. 3.1s/thread, 0 parse failures - but leaves `reason` "
-        "empty on 50/50 threads, so the audit trail has no model-side why. "
-        "Requires reasoning=False or a single call never returns.",
+        "Local baseline, and the only local model still standing. Full "
+        "50-thread snapshot on ollama 0.33.1: 4.53s/thread warm, 0 parse "
+        "failures, `reason` 50/50, mean confidence 0.97, all 9 policy "
+        "categories used. WITHOUT the prompt contract the same 50 threads give "
+        "`reason` 0/50 - unchanged from 0.32.15, even though 0.33.1 shipped the "
+        "MLX structured-output fix (#16563 / PR #17929). ollama#15260 is the "
+        "one that bites: reasoning=False silently voids schema enforcement, and "
+        "reasoning=False is mandatory here or a single call never returns. "
+        "Timing note: earlier 10-thread runs measured 3.16s/thread; the "
+        "10-vs-50 gap spans both a different thread set and an Ollama upgrade, "
+        "so it is not attributable to either alone.",
+    ),
+    "e4b": ModelChoice(
+        "ollama", "gemma4:e4b-mlx", "local",
+        "REJECTED on judgement, not on speed. The FASTEST thing measured "
+        "anywhere in this project: 1.09s/thread warm, beating even the best "
+        "hosted option (gemma-3-12b-it at 1.29s), and with the contract it "
+        "parses 10/10 and fills `reason` 10/10. But its action head collapses. "
+        "On a 10-thread diff against gemma4:12b-mlx it agreed on category 9/10 "
+        "and on ACTION only 4/10, returning `label` for all ten threads where "
+        "12b split 6 archive / 4 label. A triage agent that labels everything "
+        "and archives nothing never clears the inbox - archive-vs-label IS the "
+        "decision. Mean confidence 0.88 vs 0.97. Caveat: measured on 10 threads; "
+        "the 50-thread confirmation was started and not finished. Also 9.5 GB "
+        "on disk, LARGER than 12b-mlx despite the 'efficient' name. Not "
+        "currently pulled.",
     ),
     "nemotron": ModelChoice(
         "openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free", "free",
