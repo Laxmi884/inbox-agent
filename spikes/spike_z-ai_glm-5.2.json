@@ -1,0 +1,194 @@
+[
+  {
+    "thread_id": "1a040d7d5d69e611",
+    "subject": "Why P is buzzing: story sees a positiv",
+    "turns": 1,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 4.02,
+    "error": null
+  },
+  {
+    "thread_id": "1a04078bfa2d5a69",
+    "subject": "I want to connect",
+    "turns": 2,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 3.79,
+    "error": null
+  },
+  {
+    "thread_id": "1a04060f4e337fed",
+    "subject": "Data Scientist, Fraud at Stripe",
+    "turns": 2,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 4.25,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d76a8d76c9",
+    "subject": "Quartz or Mechanical?",
+    "turns": 1,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 4.28,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d5a2274dcd",
+    "subject": "Your missing heart rate data",
+    "turns": 1,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 4.96,
+    "error": null
+  },
+  {
+    "thread_id": "1a0402044464794a",
+    "subject": "You are Invited! Senior Data Analyst -",
+    "turns": 2,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 7.35,
+    "error": null
+  },
+  {
+    "thread_id": "1a04016665513d51",
+    "subject": "Why random forest needs to be this ran",
+    "turns": 1,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 4.45,
+    "error": null
+  },
+  {
+    "thread_id": "1a0400ae922a424b",
+    "subject": "Senior Business Application Analyst(Op",
+    "turns": 2,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 5.41,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe5c983f0433",
+    "subject": "[Hands-on] Turn Scientific Figures Int",
+    "turns": 2,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 6.97,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe41c177909a",
+    "subject": "Laxmikant, thinking of getting away? M",
+    "turns": 1,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "archive",
+    "n_mutations": 1,
+    "sequence": [
+      "archive",
+      "done"
+    ],
+    "labels": [],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 3.09,
+    "error": null
+  }
+]
