@@ -159,3 +159,117 @@ Two things to carry forward:
 - **`muse-spark-1.2` remains unmeasured** pending the 18+ confirmation on the
   OpenRouter account. Re-run with
   `python spikes/stage_b_tool_loop_probe.py or:meta/muse-spark-1.2 10`.
+
+---
+
+# Addendum: spike #2 — can it *investigate*, then act?
+
+**Date:** 2026-08-31 · **Probe:** `spikes/stage_b_investigate_probe.py`
+
+## Why a second spike
+
+Spike #1 bound only *mutating* tools. It measured "can it act" and never asked
+"can it find out first" — which is the actual Stage B thesis. That gap was
+recorded in spike #1's recommendation and is now closed.
+
+## Design
+
+The prompt **withholds the email body.** It gives sender, subject and current
+labels only. The body is reachable solely by calling `read_body`; related mail
+only via `search_by_sender` / `count_from_sender`.
+
+That creates a genuine information gap. A model that mutates without first
+calling a read tool is acting blind on a subject line — which is precisely what
+this measures (`acted_blind`).
+
+Two arms were planned: **silent** (nothing tells the model to investigate) and
+**nudged** (one line instructing it to). Silent tests whether investigation
+happens *spontaneously*; nudged tests whether it is *possible at all*. **The
+nudged arm was never needed** — silent succeeded outright.
+
+## Results — silent arm, 10 threads
+
+| model | investigated | acted blind | reads/thread | s/thread |
+|---|---|---|---|---|
+| `gemma4:12b-mlx` *(local)* | **10/10** | **0/10** | 1.4 | 12.89 |
+| `z-ai/glm-5.2` | **10/10** | **0/10** | 1.3 | 7.46 |
+
+`read_body` was the **first call on every single thread, for both models**, with
+no instruction to do so. Neither ever mutated before reading.
+
+The optional tools were used *selectively*, not sprayed: `gemma4` reached for
+`count_from_sender` / `search_by_sender` on 4 of 10 threads, `glm-5.2` on 3.
+
+Investigation was close to free for the local model — 12.89 s/thread with reads
+versus 13.41 s/thread without, in spike #1. For `glm-5.2` it cost ~53%
+(4.86 → 7.46 s).
+
+## Finding: yes, and it is spontaneous
+
+Both models recognised that information was missing and went and got it, without
+being told the tools existed for that purpose. This is a real capability that
+Stage A structurally does not have and cannot be given by a schema change:
+Stage A sees exactly what `build_prompt` hands it, once.
+
+The deepest investigation observed, `gemma4` on thread 1:
+
+```
+read_body → count_from_sender → search_by_sender → apply_label(newsletter_valuable) → done
+```
+
+Three reads before deciding — it read the mail, checked how much else that
+sender had sent, then looked at what those other subjects were, and only then
+classified.
+
+## The caveat that matters more than the finding
+
+**This does not show investigation produces *better* decisions.** There is still
+no ground truth. Thread 1 is the cautionary example — the same thread, three
+architectures:
+
+| | verdict on thread 1 |
+|---|---|
+| Stage A (body given) | `newsletter_noise` → archive |
+| `gemma4` + investigation | `newsletter_valuable` → label, **keep in inbox** |
+| `glm-5.2` + investigation | **trash** |
+
+Keep it as valuable, file it as noise, or bin it. Investigation moved `gemma4`
+from "noise" to "valuable" — but nothing here says that move was *correct*. More
+information changed the answer; it did not demonstrably improve it.
+
+Thread 10 shows the same models cleanly inverted against Stage A: Stage A
+trashed it, `glm-5.2` archived it, while on thread 1 Stage A archived and
+`glm-5.2` trashed.
+
+## The R24 bug survives investigation too
+
+Thread 5, the Strava nudge, `gemma4` **with the body read in full**: still
+`security_alert`. Reading the body did not fix it, because the fix
+(`OUTPUT_CONTRACT`, commit `357c106`) is attached to `ThreadJudgment` and the
+tool path never touches it. Finding 5 of spike #1 is confirmed under stronger
+conditions: more information does not substitute for a fix that did not travel.
+
+## What is still untested
+
+The information gap here was *obvious* — the body was plainly absent. A harder
+question remains: given the body already, will a model investigate **cross-thread
+context** it was never told it lacked ("is this the third chaser from this
+person?"). The 4-of-10 and 3-of-10 spontaneous `count_from_sender` calls are
+partial evidence that it might, but that was not the experiment.
+
+## Revised recommendation
+
+Spike #1 said Stage B is feasible. Spike #2 says its distinguishing capability
+is **real and spontaneous**, not merely available.
+
+Both spikes together say the same thing about method, though: every quality
+question — is `newsletter_valuable` better than `newsletter_noise`, is
+investigating worth 53% more latency — is unanswerable without labels. The
+productionisation milestone (Telegram → live Gmail → real use) is what produces
+them, and it remains the right next step.
+
+One thing changed on the Stage A side as a result of spike #1: `ThreadJudgment`
+now carries `also_archive`, so Stage A emits label-then-archive sequences too
+(`feat/stage-a-action-sequences`). That closes the expressiveness gap without
+adopting the tool loop, and keeps taxonomy enforcement and the R24 fix — neither
+of which the tool path has.
