@@ -40,6 +40,12 @@ class Settings:
     forbidden_actions: frozenset[str]
     context_hub_skill: str
     context_hub_tag: str
+    # Telegram review UI. Defaults keep every existing construction of Settings
+    # (tests, the notebook) working unchanged; the bot refuses to start without
+    # a token and a chat id, rather than running open to anyone who finds it.
+    tg_token: str = ""
+    tg_chat_id: str = ""
+    tg_mode: str = "digest"
 
 
 def load_settings() -> Settings:
@@ -59,6 +65,9 @@ def load_settings() -> Settings:
         forbidden_actions=ALWAYS_FORBIDDEN | frozenset(configured),
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
+        tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
+        tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
+        tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),
     )
 
 
