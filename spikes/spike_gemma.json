@@ -1,0 +1,210 @@
+[
+  {
+    "thread_id": "1a040d7d5d69e611",
+    "subject": "Why P is buzzing: story sees a positiv",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "newsletter_noise"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 28.16,
+    "error": null
+  },
+  {
+    "thread_id": "1a04078bfa2d5a69",
+    "subject": "I want to connect",
+    "turns": 2,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 1,
+    "sequence": [
+      "apply_label",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 7.85,
+    "error": null
+  },
+  {
+    "thread_id": "1a04060f4e337fed",
+    "subject": "Data Scientist, Fraud at Stripe",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 14.9,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d76a8d76c9",
+    "subject": "Quartz or Mechanical?",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "newsletter_noise"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 9.11,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d5a2274dcd",
+    "subject": "Your missing heart rate data",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "security_alert"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 13.06,
+    "error": null
+  },
+  {
+    "thread_id": "1a0402044464794a",
+    "subject": "You are Invited! Senior Data Analyst -",
+    "turns": 2,
+    "tool_calls": 2,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 1,
+    "sequence": [
+      "apply_label",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 7.46,
+    "error": null
+  },
+  {
+    "thread_id": "1a04016665513d51",
+    "subject": "Why random forest needs to be this ran",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 12.69,
+    "error": null
+  },
+  {
+    "thread_id": "1a0400ae922a424b",
+    "subject": "Senior Business Application Analyst(Op",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "recruiter"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 13.04,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe5c983f0433",
+    "subject": "[Hands-on] Turn Scientific Figures Int",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 16.2,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe41c177909a",
+    "subject": "Laxmikant, thinking of getting away? M",
+    "turns": 3,
+    "tool_calls": 3,
+    "called_a_tool": true,
+    "action": "apply_label",
+    "n_mutations": 2,
+    "sequence": [
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "labels": [
+      "promotion"
+    ],
+    "hallucinated": [],
+    "hit_turn_cap": false,
+    "seconds": 11.61,
+    "error": null
+  }
+]

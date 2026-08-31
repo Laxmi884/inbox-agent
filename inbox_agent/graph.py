@@ -7,8 +7,9 @@ interrupt is durable, so a run can be resumed hours later from a different UI.
 """
 from __future__ import annotations
 
+import operator
 import uuid
-from typing import TypedDict, get_args
+from typing import Annotated, TypedDict, get_args
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -32,13 +33,24 @@ VALID_ACTION_KINDS = frozenset(get_args(ActionKind))
 
 class TriageState(TypedDict, total=False):
     limit: int
-    threads: list[dict]
+    # Identifiers, not payloads. LangGraph persists the FULL state after every
+    # node, so whatever lives here is duplicated once per checkpoint - measured
+    # at 11-16 checkpoints for a single run. Bodies stayed invisible only
+    # because the frozen snapshot has none (0 of 50 populated); live threads
+    # measure up to 204 KB, which would be written ~11 times per run. The client
+    # is the source of truth and is already injected into every node.
+    thread_ids: list[str]
     decisions: list[dict]
     review: dict
     response: dict
     executed: list[dict]
     refused: list[dict]
-    skipped: list[dict]
+    # execute() and learn() both write here. Without a reducer the second
+    # silently discards the first, and this is where refusals are recorded -
+    # a forged thread id rejected in execute() would vanish. The manual
+    # `state.get(...) + new` merge that used to do this failed in exactly the
+    # direction that loses data, so the framework enforces it now.
+    skipped: Annotated[list[dict], operator.add]
     learned: list[str]
 
 
@@ -102,13 +114,17 @@ def build_graph(
     log: AuditLog,
     checkpointer=None,
 ):
+    def _threads(state: TriageState) -> list[Thread]:
+        """Re-read from the client. State carries ids only (see TriageState)."""
+        return [client.get_thread(i) for i in state["thread_ids"]]
+
     def fetch(state: TriageState) -> dict:
         threads = client.list_threads(limit=state.get("limit", settings.snapshot_size))
-        return {"threads": [t.model_dump() for t in threads]}
+        return {"thread_ids": [t.id for t in threads]}
 
     def triage(state: TriageState) -> dict:
         """Prefilter first, model only on what is left."""
-        threads = [Thread.model_validate(d) for d in state["threads"]]
+        threads = _threads(state)
         decided, undecided = prefilter(threads, prefs)
         decided += classify_batch(undecided, llm, policy)
         order = {t.id: i for i, t in enumerate(threads)}
@@ -116,7 +132,7 @@ def build_graph(
         return {"decisions": [d.model_dump() for d in decided]}
 
     def propose(state: TriageState) -> dict:
-        threads = {d["id"]: Thread.model_validate(d) for d in state["threads"]}
+        threads = {t.id: t for t in _threads(state)}
         items = []
         for raw in state["decisions"]:
             d = Decision.model_validate(raw)
@@ -220,12 +236,12 @@ def build_graph(
 
     def learn(state: TriageState) -> dict:
         response = ReviewResponse.model_validate(state.get("response") or {})
-        threads = [Thread.model_validate(d) for d in state["threads"]]
+        threads = _threads(state)
         learned, learn_skips = learn_from_response(response, threads, prefs)
-        # Merge with execute()'s skips rather than overwrite: LangGraph does
-        # not auto-accumulate a plain (non-reducer) TypedDict key across
-        # nodes, and a skip recorded upstream must not vanish here.
-        return {"learned": learned, "skipped": state.get("skipped", []) + learn_skips}
+        # `skipped` carries an operator.add reducer, so returning only this
+        # node's skips appends rather than overwrites. The manual merge this
+        # replaces was correct but easy to lose in a refactor.
+        return {"learned": learned, "skipped": learn_skips}
 
     builder = StateGraph(TriageState)
     for name, fn in (("fetch", fetch), ("triage", triage), ("propose", propose),

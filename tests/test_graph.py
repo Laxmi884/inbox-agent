@@ -238,3 +238,49 @@ def test_edit_naming_forbidden_kind_is_refused_and_not_learned(wiring):
     assert wiring["prefs"].rules() == []
     assert any(s["thread_id"] == "t1" and s.get("stage") == "learn"
                for s in final["skipped"])
+
+
+# --- bounded state ----------------------------------------------------------
+# LangGraph persists the FULL state after every node, so anything held in state
+# is duplicated once per checkpoint - measured at 11-16 checkpoints for a single
+# run. The snapshot's bodies are empty (max 0 chars), which hid this: with real
+# Gmail bodies (live threads measured up to 204 KB) a 50-thread run would write
+# the same bodies ~11 times over. State holds identifiers; the client is the
+# source of truth and is already injected.
+
+
+def test_state_does_not_carry_email_bodies(wiring):
+    """Bodies must not be duplicated into every checkpoint."""
+    graph = build_graph(**wiring)
+    cfg = {"configurable": {"thread_id": "bounded-1"}}
+    result = graph.invoke({"limit": 5}, cfg)
+
+    blob = json.dumps({k: v for k, v in result.items() if k != "__interrupt__"})
+    assert '"body"' not in blob, "state is carrying email bodies"
+    assert "thread_ids" in result, "state should carry ids"
+    assert result["thread_ids"] == ["t1"]
+
+
+def test_skipped_accumulates_across_nodes_via_reducer(wiring):
+    """execute() and learn() both write `skipped`. Without a reducer the second
+    silently discards the first - and `skipped` is where refusals are recorded."""
+    from inbox_agent.graph import TriageState
+    import typing
+
+    hints = typing.get_type_hints(TriageState, include_extras=True)
+    meta = getattr(hints["skipped"], "__metadata__", ())
+    assert meta, "skipped needs a reducer so upstream skips cannot be overwritten"
+
+
+def test_execute_skip_survives_the_learn_node(wiring):
+    """End-to-end: a ghost id skipped in execute must still be in final state
+    after learn has also written to `skipped`."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "bounded-2"}}
+    graph.invoke({"limit": 5}, cfg)
+    final = graph.invoke(Command(resume={
+        "decisions": {"t1": "approve", "ghost": "approve"},
+        "edits": {}, "instructions": [],
+    }), cfg)
+    assert any(s["thread_id"] == "ghost" for s in final["skipped"])

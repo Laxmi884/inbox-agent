@@ -48,6 +48,18 @@ class ThreadJudgment(BaseModel):
     # default keeps the classification and leaves the gap visible to the human.
     reason: str = Field(default="", description="one short sentence of justification")
     confidence: float = Field(default=0.5, description="0.0 to 1.0", ge=0.0, le=1.0)
+    # Stage A emitted exactly one action per thread, though Decision.actions was
+    # always a list and every consumer downstream already iterated it. The Stage
+    # B spike showed this same model choosing label-THEN-archive on 8 of 10
+    # threads once a tool loop let it - categorise, then clear the inbox - which
+    # is what you actually want for a recruiter mail you will not answer.
+    # A flat bool rather than `actions: list[...]` on purpose: nested schemas
+    # degrade on small models (see this class's docstring), and this captures
+    # the only sequence the spike actually observed.
+    also_archive: bool = Field(
+        default=False,
+        description="true to archive the thread after labelling it; only meaningful when action is label",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,15 +188,21 @@ class ThreadJudgment(BaseModel):
 
 OUTPUT_CONTRACT = """
 
-Return a single JSON object and nothing else, with EXACTLY these five keys:
-  "category"   - one of the category names listed above, copied verbatim
-  "action"     - one of: label, unlabel, archive, trash, draft, none
-  "label"      - if action is "label", the category name again, verbatim;
-                 otherwise null
-  "reason"     - REQUIRED. One short sentence saying why you decided this.
-                 Never omit this key and never leave it empty: it is the only
-                 record of your judgement the owner will ever see.
-  "confidence" - a number from 0.0 to 1.0
+Return a single JSON object and nothing else, with EXACTLY these six keys:
+  "category"     - one of the category names listed above, copied verbatim
+  "action"       - one of: label, unlabel, archive, trash, draft, none
+  "label"        - if action is "label", the category name again, verbatim;
+                   otherwise null
+  "also_archive" - true or false. When action is "label", set this true if the
+                   thread should ALSO leave the inbox once labelled - the usual
+                   case for mail worth filing but not worth reading now, such as
+                   a job alert or a receipt. Set it false only when the thread
+                   should stay in the inbox because it still needs attention.
+                   Ignored unless action is "label".
+  "reason"       - REQUIRED. One short sentence saying why you decided this.
+                   Never omit this key and never leave it empty: it is the only
+                   record of your judgement the owner will ever see.
+  "confidence"   - a number from 0.0 to 1.0
 """
 
 def _fence(body: str) -> str:
@@ -214,8 +232,15 @@ def build_prompt(thread: Thread, policy: Policy) -> list[BaseMessage]:
 
 def _to_actions(judgment: ThreadJudgment, thread_id: str) -> list[Action]:
     if judgment.action == "label":
-        return [Action(kind="label", thread_id=thread_id,
-                       params={"label": judgment.label or judgment.category})]
+        actions = [Action(kind="label", thread_id=thread_id,
+                          params={"label": judgment.label or judgment.category})]
+        # Label first, then archive. The other order would file the thread away
+        # before the label lands, and would read backwards in the audit trail.
+        # `also_archive` is only honoured here, on the label branch: an archive
+        # or trash judgment must never be doubled or turned into a sequence.
+        if judgment.also_archive:
+            actions.append(Action(kind="archive", thread_id=thread_id))
+        return actions
     return [Action(kind=judgment.action, thread_id=thread_id)]
 
 
