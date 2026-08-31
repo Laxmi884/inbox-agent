@@ -1,0 +1,221 @@
+[
+  {
+    "thread_id": "1a040d7d5d69e611",
+    "subject": "Why P is buzzing: story sees a posit",
+    "turns": 5,
+    "sequence": [
+      "read_body",
+      "count_from_sender",
+      "search_by_sender",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 3,
+    "read_tools_used": [
+      "count_from_sender",
+      "read_body",
+      "search_by_sender"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "seconds": 22.61,
+    "error": null
+  },
+  {
+    "thread_id": "1a04078bfa2d5a69",
+    "subject": "I want to connect",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "recruiter"
+    ],
+    "seconds": 11.87,
+    "error": null
+  },
+  {
+    "thread_id": "1a04060f4e337fed",
+    "subject": "Data Scientist, Fraud at Stripe",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "recruiter"
+    ],
+    "seconds": 11.87,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d76a8d76c9",
+    "subject": "Quartz or Mechanical?",
+    "turns": 5,
+    "sequence": [
+      "read_body",
+      "count_from_sender",
+      "apply_label",
+      "archive",
+      "done"
+    ],
+    "n_reads": 2,
+    "read_tools_used": [
+      "count_from_sender",
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "newsletter_noise"
+    ],
+    "seconds": 16.53,
+    "error": null
+  },
+  {
+    "thread_id": "1a0404d5a2274dcd",
+    "subject": "Your missing heart rate data",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "security_alert"
+    ],
+    "seconds": 9.28,
+    "error": null
+  },
+  {
+    "thread_id": "1a0402044464794a",
+    "subject": "You are Invited! Senior Data Analyst",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "recruiter"
+    ],
+    "seconds": 9.72,
+    "error": null
+  },
+  {
+    "thread_id": "1a04016665513d51",
+    "subject": "Why random forest needs to be this r",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "seconds": 10.89,
+    "error": null
+  },
+  {
+    "thread_id": "1a0400ae922a424b",
+    "subject": "Senior Business Application Analyst(",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "recruiter"
+    ],
+    "seconds": 10.19,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe5c983f0433",
+    "subject": "[Hands-on] Turn Scientific Figures I",
+    "turns": 4,
+    "sequence": [
+      "read_body",
+      "search_by_sender",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 2,
+    "read_tools_used": [
+      "read_body",
+      "search_by_sender"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "newsletter_valuable"
+    ],
+    "seconds": 13.64,
+    "error": null
+  },
+  {
+    "thread_id": "1a03fe41c177909a",
+    "subject": "Laxmikant, thinking of getting away?",
+    "turns": 3,
+    "sequence": [
+      "read_body",
+      "apply_label",
+      "done"
+    ],
+    "n_reads": 1,
+    "read_tools_used": [
+      "read_body"
+    ],
+    "acted_blind": false,
+    "action": "apply_label",
+    "labels": [
+      "promotion"
+    ],
+    "seconds": 12.31,
+    "error": null
+  }
+]
