@@ -273,3 +273,108 @@ now carries `also_archive`, so Stage A emits label-then-archive sequences too
 (`feat/stage-a-action-sequences`). That closes the expressiveness gap without
 adopting the tool loop, and keeps taxonomy enforcement and the R24 fix — neither
 of which the tool path has.
+
+---
+
+# Addendum 2: spike #3 — investigation is prompted, not spontaneous
+
+**Date:** 2026-08-31 · **Probe:** `spikes/stage_b_history_probe.py`
+
+**This overturns spike #2's headline.** Read both.
+
+## Why a third spike
+
+Spike #2 concluded that models investigate "spontaneously". That conclusion was
+an artifact of its own design: it *withheld the email body*, making the gap so
+obvious that "call `read_body`" is barely a decision. Spike #2 flagged the real
+question and did not answer it — *given the body already, will it investigate
+context it was never told it lacked?*
+
+## Design
+
+A **live** read-only Gmail corpus (11 current inbox threads, plus sent-mail and
+archive context). No mail content is recorded here; the project constraint is
+that real email never enters git, and the corpus stayed in scratch.
+
+The live mailbox supplies something the frozen snapshot structurally cannot: a
+real reply history. In it, the owner consistently replies to *individual* human
+recruiters and has never once replied to an automated job-alert address. A naive
+classifier labels both `recruiter`. An investigating agent could tell them apart.
+
+This time **the body is given.** Everything needed for a naive decision is in the
+prompt. Three research tools are bound — `have_i_replied_to`, `search_mailbox`
+(spans inbox + sent + archive), `count_from_sender` — and nothing points at them.
+
+Two arms: **silent**, and **nudged** with one line: *"Before deciding, consider
+whether the owner has any prior relationship with this sender — you have tools to
+check that."*
+
+## Results
+
+| model | arm | researched | research calls/thread | s/thread |
+|---|---|---|---|---|
+| `gemma4:12b-mlx` | silent | **0/11** | 0.00 | 9.01 |
+| `gemma4:12b-mlx` | nudged | **9/11** | 1.27 | 12.19 |
+| `z-ai/glm-5.2` | silent | **0/11** | 0.00 | 5.59 |
+| `z-ai/glm-5.2` | nudged | **10/11** | 1.91 | 8.44 |
+
+## Finding 1: zero spontaneous investigation
+
+With nothing obviously missing, **neither model called a research tool once
+across 22 thread-runs.** They went straight from prompt to mutation.
+
+Spike #2's "spontaneous" result does not survive removing the artificial hole.
+What it actually measured was gap-filling: told less than it needed, the model
+asks for the rest. That is useful and real — but it is not the Stage B thesis.
+
+## Finding 2: the capability is fully present — it is a prompting problem
+
+One sentence flips it from 0/11 to 9/11 and 10/11. Both models then used the
+tools sensibly and in combination, most often `count_from_sender` together with
+`have_i_replied_to`, occasionally a `search_mailbox` on top.
+
+So this is **not** a model limitation, and not an argument against a small model.
+It is an instruction-design problem, and it belongs in the same category as the
+`OUTPUT_CONTRACT` fix: the model will do the right thing when the prompt asks for
+it, and silently will not when it does not.
+
+## Finding 3: investigation did not change the answers
+
+The finding that should temper any enthusiasm.
+
+On the automated job-alert threads — the case built specifically to be
+discriminating, where the reply history says the owner has *never* engaged —
+`gemma4` researched, learned there was no reply history, and labelled them
+`recruiter` anyway: identical to its unresearched output. `glm-5.2` changed
+exactly one of four.
+
+The cost was 35% more latency for `gemma4` (9.01 → 12.19 s) and 51% for
+`glm-5.2` (5.59 → 8.44 s).
+
+Both spikes now agree on the same uncomfortable point: **more information
+reliably changes what the model does, and has not once been shown to improve
+it.** Spike #2 saw the answer move (`newsletter_noise` → `newsletter_valuable` →
+`trash` across three architectures); spike #3 saw the answer not move at all.
+Neither had ground truth to say which was right.
+
+## Minor: an out-of-order sequence
+
+`glm-5.2` nudged produced `done → archive` on one thread — calling `done` and
+then mutating. A Stage B loop that stops at `done` would drop that action
+silently. Add to the parallel-tool-calls note in spike #1 finding 7: do not
+assume the model respects the protocol you described.
+
+## Revised recommendation
+
+Spike #1: the loop holds together. Spike #2: it fills obvious gaps. **Spike #3:
+it does not go looking unless told to, and when told, the extra work did not pay
+off on this sample.**
+
+Stage B's distinguishing capability is real but must be *engineered* — the
+research step needs to be instructed, and probably scoped (research only
+low-confidence threads, or only unknown senders) so the latency is spent where
+it might matter.
+
+None of which can be evaluated without labels. Three spikes have now each ended
+at the same wall, which is itself the finding: **the productionisation milestone
+is not a detour before the interesting work, it is the prerequisite for it.**
