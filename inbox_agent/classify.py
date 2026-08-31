@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import Action, ActionKind, Decision, Thread
 from .policy import Policy
@@ -18,8 +18,28 @@ from .policy import Policy
 MAX_BODY_CHARS = 4000
 
 
+def _require_every_field(schema: dict) -> None:
+    """Mark every property required in the JSON Schema handed to the runner.
+
+    Pydantic drops a field from `required` as soon as it has a default, and a
+    grammar-constrained decoder will never emit an OPTIONAL field. That is why
+    `reason` came back empty on 50/50 threads even after Ollama 0.33.1 fixed
+    MLX schema enforcement: the runner was correctly honouring a schema whose
+    required set was only ['category', 'action'].
+
+    This widens the WIRE schema only. The Python-side defaults below are
+    untouched, so a runner that does not enforce still parses into a usable
+    judgment instead of raising (ruling R43). Strict on the wire, lenient on
+    the parse.
+    """
+    schema["required"] = list(schema["properties"])
+
+
 class ThreadJudgment(BaseModel):
     """Structured output schema. Kept flat - nested schemas degrade on small models."""
+
+    model_config = ConfigDict(json_schema_extra=_require_every_field)
+
     category: str = Field(description="one of the categories named in the policy")
     action: ActionKind = Field(description="label, unlabel, archive, trash, draft, or none")
     label: Optional[str] = Field(default=None, description="label name if action is label")
@@ -35,8 +55,10 @@ class ThreadJudgment(BaseModel):
 #
 # `with_structured_output` attaches a JSON schema, but Ollama SILENTLY IGNORES
 # it here: the request succeeds and the model free-forms instead.
-# Upstream: ollama/ollama#16776, #17013 (MLX runner ignores `format`, GGUF
-# reportedly does not) and #15260 (`think=false` breaks `format` for gemma4).
+# Upstream: ollama/ollama#16776, #17013 (MLX runner ignores `format`; the GGUF
+# runner of the SAME model enforces it) and #15260 (`think=false` breaks
+# `format` for gemma4 -- the end-of-thinking token that would apply the
+# constraint never fires).
 #
 # We pulled the 7.6 GB GGUF build and tested it. It does NOT help us:
 #
@@ -48,13 +70,101 @@ class ThreadJudgment(BaseModel):
 #
 # So the runner bug is real but is not the one biting us. #15260 is: at
 # think=false the schema is ignored on BOTH runners, and think=true never
-# returns, so there is no configuration in which enforcement is available to us.
-# Switching to GGUF buys nothing and is slower on this hardware.
+# returns. Switching to GGUF buys nothing and is slower on this hardware.
+#
+# We then tested whether a DIFFERENT MLX model restores enforcement. It does
+# not. Three separate weights, 10 threads each, schema attached to every call,
+# and nothing in the prompt asking for `reason`:
+#
+#   model                                    `reason`   parse failures
+#   gemma4:12b-mlx (stock)                     0/10       0
+#   cyborgxx101/..opus-finetuned-mlx:4bit      0/10       0
+#   gemma4:e4b-mlx                             0/10      10/10
+#
+# e4b is the clearest evidence. It did not merely omit a field, it answered in
+# YAML ("label: recruiter" / "confidence: 0.9") and failed EVERY parse. If
+# `format` had any effect whatsoever that output would be impossible.
+# Enforcement is a property of the RUNNER, not of the model or its finetune,
+# so no amount of model-swapping on MLX recovers it. The contract is not a
+# stopgap pending a better local model; it is the mechanism.
+#
+# UPSTREAM FIX SHIPPED AND WORKS - AND `reason` WAS OUR OWN BUG.
+# #16563 was fixed by PR #17929 ("mlxrunner: add structured output support",
+# xgrammar masking logits to grammar-allowed tokens), shipped in v0.33.1 on
+# 2026-08-26. On 0.33.1 the no-contract arm STILL read `reason` 0/50, which
+# looked like the fix had not reached us. It had. We were measuring our own
+# schema.
+#
+# `reason` carries a default (see the field comment below), so pydantic omits
+# it from JSON-Schema `required`, which is only ['category', 'action']. A
+# grammar cannot compel an OPTIONAL field. Enforcement was working perfectly
+# and was correctly permitting the omission.
+#
+# Raw /api/chat, no prompt contract, `required` as the only variable:
+#
+#   model                    schema                keys returned          reason
+#   gpt-oss:20b (llama.cpp)  default               category,action,conf   no
+#   gpt-oss:20b (llama.cpp)  required=all 5        all five               YES
+#   gemma4:12b-mlx (MLX)     default               category,action        no
+#   gemma4:12b-mlx (MLX)     required=all 5        all five               YES
+#
+# gemma4 returning EXACTLY {category, action} under the default schema is the
+# tell: that is precisely the required set. Both runners now enforce.
+#
+# Historical note, so the earlier entries above are not read as wrong: under
+# 0.32.15 MLX genuinely did ignore `format` - gemma4:e4b-mlx answered in YAML,
+# which no grammar would permit. Both causes were real, at different times.
+# The runner bug is fixed; the optional-field bug is ours and is still here.
+#
+# FIXED, AND MEASURED. `_require_every_field` below widens the wire schema so
+# every property is required. Full 2x2 on gemma4:12b-mlx, 10 threads, ollama
+# 0.33.1 - JSON-Schema `required` crossed with the prompt contract:
+#
+#   schema   contract   reason   warm    conf   reason len   categories
+#   lenient  off         0/10    2.70s   0.95     0 chars    6   <- the old bug
+#   lenient  on         10/10    4.63s   0.97    88 chars    5   <- what shipped
+#   strict   off        10/10    5.04s   0.95   144 chars    6
+#   strict   on         10/10    4.34s   0.97    88 chars    5   <- now shipping
+#
+# Either mechanism alone recovers `reason` 10/10, so they are redundant for
+# PRESENCE. We keep both, because they do different jobs:
+#
+#   - the schema guarantees the field EXISTS, on any runner that enforces, with
+#     no tokens spent asking. It is also the only one of the two that a model
+#     cannot ignore.
+#   - the contract governs what goes IN it. Dropping it costs real judgement:
+#     without it the Strava product nudge reverts to `security_alert` (the R24
+#     over-trigger that 357c106 fixed), and `reason` inflates from 88 to 144
+#     characters against a policy asking for one short sentence. Neither arm
+#     ever emitted an off-taxonomy category, so the contract is not earning its
+#     place on format - it is earning it on judgement.
+#
+# Note the baseline is the FASTEST arm at 2.70s, precisely because it emits
+# fewer tokens. `reason` is not free; it costs ~1.6s/thread on this model. That
+# is the price of an auditable decision and it is worth paying.
+#
+# One cell is still untested: GGUF + a model with NO thinking template at all.
+# gpt-oss:20b was the nominated candidate for it, on the strength of #15260
+# reporting it honouring `format` at think=false. It does not qualify. Ollama's
+# own template selection for it reads:
+#
+#   model=.../gpt-oss:20b selected=harmony go_template="[completion tools thinking]"
+#
+# harmony, and `thinking` advertised - the same hybrid-thinker class as the
+# gemma4 entries above, not the control we wanted. Whatever it showed in the
+# table, it was never the no-thinking cell, and that cell is still open. Do not
+# re-nominate it.
+#
+# It was pulled for the strict-required test above, gave that result, and was
+# removed as not worth pursuing further. The 10-thread throughput bench was
+# never run, so there are no speed or judgement numbers for it here and none
+# should be inferred from the schema row.
 #
 # Measured consequence: gemma4:12b-mlx returned category/action/confidence and
 # omitted `reason` on 50 of 50 threads, leaving the audit trail with no
-# model-side "why". Stating the contract in the prompt recovers it - 0/6 to 6/6
-# in a controlled A/B on the same threads - and, as a side effect, stops the
+# model-side "why". Stating the contract in the prompt recovers it - 0/50 to
+# 50/50 on the full snapshot under 0.33.1, and 0/6 to 6/6 in the original
+# controlled A/B on the same six threads - and, as a side effect, stops the
 # model returning a null label and fixes an over-trigger on account-adjacent
 # product mail.
 #
