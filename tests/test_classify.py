@@ -180,3 +180,42 @@ def test_parsing_stays_lenient_when_a_runner_does_not_enforce():
     assert judgment.reason == ""
     assert judgment.confidence == 0.5
     assert judgment.label is None
+
+
+# --- action sequences -------------------------------------------------------
+# Stage A always emitted exactly one action per thread, though every consumer
+# downstream (Decision.actions, ReviewItem.proposed, the execute loop, the
+# renderer) already handled a list. The Stage B spike showed the same model
+# choosing label-THEN-archive on 8 of 10 threads when a tool loop let it:
+# categorise, then clear the inbox. That is a better outcome and the pipeline
+# could always carry it - only the judgment schema could not express it.
+# See spikes/FINDINGS-stage-b-tool-loop.md finding 2.
+
+
+def test_label_plus_archive_produces_both_actions_in_order():
+    """Order matters: label first, then archive. Archiving first would file it
+    away before the label lands, and the audit trail would read backwards."""
+    llm = FakeLLM(ThreadJudgment(category="recruiter", action="label",
+                                 label="recruiter", also_archive=True,
+                                 reason="a job alert, filed not read", confidence=0.9))
+    d = classify_thread(thread(), llm, policy())
+    assert [a.kind for a in d.actions] == ["label", "archive"]
+    assert d.actions[0].params["label"] == "recruiter"
+    assert d.actions[1].thread_id == "t1"
+
+
+def test_also_archive_defaults_off_so_existing_behaviour_is_unchanged():
+    llm = FakeLLM(ThreadJudgment(category="receipt", action="label", label="Receipts",
+                                 reason="an order confirmation", confidence=0.8))
+    d = classify_thread(thread(), llm, policy())
+    assert [a.kind for a in d.actions] == ["label"]
+
+
+def test_also_archive_never_doubles_a_non_label_action():
+    """`archive` + also_archive must not emit archive twice, and must not turn
+    a trash into an archive-then-trash."""
+    for kind in ("archive", "trash", "none"):
+        llm = FakeLLM(ThreadJudgment(category="promotion", action=kind,
+                                     also_archive=True, reason="r", confidence=0.5))
+        d = classify_thread(thread(), llm, policy())
+        assert [a.kind for a in d.actions] == [kind], f"{kind} was doubled"
