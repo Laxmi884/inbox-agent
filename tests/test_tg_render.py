@@ -1,11 +1,19 @@
-"""Both renderers. Pure functions over ReviewRequest, like render.py."""
-import pytest
+"""Both renderers. Pure functions over their view object, like render.py.
 
-from inbox_agent.models import Action, ReviewItem, ReviewRequest
+The digest renders a DigestView - this run's counts plus the queue that outlives
+runs. `paged` still renders a ReviewRequest: it is the single-item view the
+interrupt path uses, and Plan 3's /backlog is what brings it back into the bot.
+"""
+from datetime import datetime, timedelta, timezone
+
+from inbox_agent.models import Action, HeldItem, ReviewItem, ReviewRequest
 from inbox_agent.telegram.callbacks import decode
 from inbox_agent.telegram.render_tg import (
-    TG_MAX_TEXT, digest, header, paged, rule_decided_count,
+    DigestView, HELD_PAGE_SIZE, TG_MAX_TEXT, digest, header, paged,
+    rule_decided_count,
 )
+
+NOW = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
 
 
 def item(i, source="model", conf=0.9, kind="archive", label=None):
@@ -20,6 +28,23 @@ def item(i, source="model", conf=0.9, kind="archive", label=None):
 def request(n=5, n_rule=0):
     items = [item(i, source="rule" if i < n_rule else "model") for i in range(n)]
     return ReviewRequest(run_id="run1", policy_version="local:test", items=items)
+
+
+def held(tid, reason, *, conf=0.9, subject=None, held_at=NOW, reason_text="because"):
+    return HeldItem(
+        thread_id=tid, run_id="r1", first_held_at=held_at, hold_reason=reason,
+        item=ReviewItem(
+            thread_id=tid, category="promotion", subject=subject or f"Subject {tid}",
+            sender=f"{tid}@example.com", snippet="s",
+            proposed=[Action(kind="trash", thread_id=tid)],
+            reason=reason_text, confidence=conf, source="model"))
+
+
+def view(held_items=(), *, total=22, done=None, rule_decided=12):
+    return DigestView(
+        run_at=NOW, total=total,
+        done_by_kind=done if done is not None else {"archive": 9, "label": 6, "draft": 3},
+        rule_decided=rule_decided, held=list(held_items), digest_id="7f2a")
 
 
 # --- the learning-visibility header -----------------------------------------
@@ -49,38 +74,140 @@ def test_header_omits_the_rule_clause_when_nothing_was_rule_decided():
 
 # --- digest -----------------------------------------------------------------
 
-def test_digest_lists_every_item_when_it_fits():
-    text, kb = digest(request(5))
-    for i in range(5):
-        assert f"Subject number {i}"[:20] in text
+def test_the_stat_line_reports_what_was_done_and_what_waits():
+    text, _ = digest(view([held("t1", "trash")]))
+    assert "22" in text
+    assert "9" in text and "6" in text and "3" in text
+    assert "1 waiting" in text
 
 
-def test_digest_never_exceeds_the_telegram_message_cap():
-    """4096 chars is a hard protocol limit. 50 threads is right at the edge,
-    so this must page rather than truncate silently."""
-    text, kb = digest(request(50))
+def test_held_items_are_grouped_under_their_reason():
+    text, _ = digest(view([held("t1", "trash"), held("t2", "needs_reply"),
+                           held("t3", "security_alert"), held("t4", "low_confidence")]))
+    assert "TRASH" in text
+    assert "NEEDS REPLY" in text
+    assert "SECURITY" in text
+    assert "NOT SURE" in text
+
+
+def test_an_empty_section_is_omitted_entirely():
+    text, _ = digest(view([held("t1", "trash")]))
+    assert "NEEDS REPLY" not in text
+    assert "SECURITY" not in text
+
+
+def test_each_held_item_shows_subject_sender_and_the_agents_reason():
+    text, _ = digest(view([held("t1", "trash", subject="Quartz or Mechanical?",
+                                reason_text="Marketing mail, no order reference.")]))
+    assert "Quartz or Mechanical?" in text
+    assert "t1@example.com" in text
+    assert "Marketing mail, no order reference." in text
+
+
+def test_low_confidence_is_shown_numerically():
+    text, _ = digest(view([held("t1", "low_confidence", conf=0.41)]))
+    assert "0.41" in text
+
+
+def test_a_carried_over_item_shows_how_long_it_has_waited():
+    old = held("t1", "trash", held_at=NOW - timedelta(hours=10))
+    text, _ = digest(view([old]))
+    assert "waiting since" in text.lower()
+
+
+def test_an_item_held_in_this_run_shows_no_waiting_since():
+    text, _ = digest(view([held("t1", "trash", held_at=NOW)]))
+    assert "waiting since" not in text.lower()
+
+
+def test_carried_items_sort_above_fresh_ones_within_a_section():
+    fresh = held("fresh", "trash", held_at=NOW)
+    old = held("old", "trash", held_at=NOW - timedelta(hours=10))
+    text, _ = digest(view([fresh, old]))
+    assert text.index("Subject old") < text.index("Subject fresh")
+
+
+def test_done_items_are_counts_not_a_list():
+    text, _ = digest(view([held("t1", "trash")]))
+    assert "DONE" in text
+    assert "18" in text
+    assert "12" in text and "taught" in text.lower()
+
+
+def test_the_rule_clause_is_omitted_when_nothing_was_rule_decided():
+    text, _ = digest(view([held("t1", "trash")], rule_decided=0))
+    assert "taught" not in text.lower()
+
+
+def test_never_pads_columns():
+    """Telegram wraps proportional text; padding produces a wall, not a table.
+    Verified on a real phone once already - do not reintroduce it."""
+    text, _ = digest(view([held(f"t{i}", "trash") for i in range(4)]))
+    assert "   " not in text
+
+
+def test_a_button_per_held_item_on_this_page():
+    _, kb = digest(view([held(f"t{i}", "trash") for i in range(4)]))
+    flat = [label for row in kb for (label, _) in row]
+    assert [l for l in flat if l in {"1", "2", "3", "4"}] == ["1", "2", "3", "4"]
+
+
+def test_the_one_tap_button_names_the_attention_tier_only():
+    _, kb = digest(view([held("t1", "trash"), held("t2", "needs_reply")]))
+    labels = [label for row in kb for (label, _) in row]
+    assert any("Approve" in l for l in labels)
+
+
+def test_there_is_no_one_tap_button_when_nothing_is_held_for_attention():
+    """A blanket approve must never be able to reach trash or a guess."""
+    _, kb = digest(view([held("t1", "trash"), held("t2", "low_confidence")]))
+    labels = [label for row in kb for (label, _) in row]
+    assert not any("Approve" in l for l in labels)
+
+
+def test_held_items_page_at_the_limit():
+    items = [held(f"t{i:02d}", "trash") for i in range(HELD_PAGE_SIZE + 3)]
+    text, kb = digest(view(items), page=0)
+    assert "Subject t00" in text
+    assert f"Subject t{HELD_PAGE_SIZE:02d}" not in text
+    labels = [label for row in kb for (label, _) in row]
+    assert any("Next" in l for l in labels)
+
+
+def test_page_two_shows_the_remainder_and_keeps_absolute_numbering():
+    items = [held(f"t{i:02d}", "trash") for i in range(HELD_PAGE_SIZE + 3)]
+    text, _ = digest(view(items), page=1)
+    assert f"Subject t{HELD_PAGE_SIZE:02d}" in text
+    assert f"{HELD_PAGE_SIZE + 1}." in text
+
+
+def test_an_out_of_range_page_clamps_rather_than_raising():
+    """Reached from a callback. A stale one must land somewhere sane."""
+    text, _ = digest(view([held("t1", "trash")]), page=99)
+    assert "Subject t1" in text
+
+
+def test_an_empty_queue_still_renders_the_report():
+    text, kb = digest(view([]))
+    assert "DONE" in text
+    assert "0 waiting" in text or "waiting" not in text
+
+
+def test_never_exceeds_the_telegram_cap():
+    items = [held(f"t{i:02d}", "trash", subject="x" * 200, reason_text="y" * 400)
+             for i in range(HELD_PAGE_SIZE)]
+    text, _ = digest(view(items))
     assert len(text) <= TG_MAX_TEXT
 
 
-def test_digest_offers_approve_all():
-    _, kb = digest(request(5))
-    datas = [d for row in kb for (_, d) in row]
-    assert any(decode(d).kind == "approve_all" for d in datas)
-
-
-def test_digest_paginates_and_the_next_button_advances():
-    text0, kb0 = digest(request(60), page=0)
-    datas = [d for row in kb0 for (_, d) in row]
-    assert any(decode(d).kind == "next" for d in datas), "no way to reach page 2"
-    text1, _ = digest(request(60), page=1)
-    assert text0 != text1
-
-
-def test_digest_flags_low_confidence_items():
-    items = [item(0, conf=0.2), item(1, conf=0.95)]
-    req = ReviewRequest(run_id="r", policy_version="v", items=items)
-    text, _ = digest(req)
-    assert "!" in text
+def test_the_digest_carries_its_id_into_every_callback():
+    """A tap has to identify the list it was drawn against, or a stale one
+    lands on whatever occupies that position today."""
+    _, kb = digest(view([held(f"t{i:02d}", "needs_reply")
+                         for i in range(HELD_PAGE_SIZE + 3)]))
+    intents = [decode(data) for row in kb for (_, data) in row]
+    assert intents
+    assert all(i.digest_id == "7f2a" for i in intents), intents
 
 
 # --- paged ------------------------------------------------------------------
@@ -124,48 +251,9 @@ def test_paged_hides_prev_on_first_and_next_on_last():
 
 
 def test_every_rendered_callback_is_within_the_byte_cap():
-    for _, kb in (digest(request(60)), paged(request(60), 30,
-                                             categories=["a"] * 10)):
+    big_digest = digest(view([held(f"t{i:03d}", "needs_reply")
+                              for i in range(60)]))
+    for _, kb in (big_digest, paged(request(60), 30, categories=["a"] * 10)):
         for row in kb:
             for _, data in row:
                 assert len(data.encode()) <= 64, data
-
-
-# --- digest must be correctable and readable --------------------------------
-
-def test_digest_offers_a_button_per_item_so_it_is_not_read_only():
-    from inbox_agent.telegram.callbacks import decode as d
-    _, kb = digest(request(6))
-    opens = [d(data) for row in kb for (_, data) in row if d(data).kind == "open"]
-    assert len(opens) == 6, "no way to correct an individual item"
-    assert {o.index for o in opens} == set(range(6))
-
-
-def test_digest_offers_a_shortcut_to_the_flagged_items():
-    from inbox_agent.telegram.callbacks import decode as d
-    items = [item(0, conf=0.2), item(1, conf=0.95), item(2, conf=0.1)]
-    req = ReviewRequest(run_id="r", policy_version="v", items=items)
-    text, kb = digest(req)
-    labels = [t for row in kb for (t, _) in row]
-    assert any("2" in t and "flag" in t.lower() for t in labels), labels
-
-
-def test_digest_has_no_flagged_shortcut_when_nothing_is_flagged():
-    _, kb = digest(request(4))
-    labels = [t for row in kb for (t, _) in row]
-    assert not any("flag" in t.lower() for t in labels)
-
-
-def test_digest_does_not_fake_monospace_columns():
-    """Telegram renders proportional text and wraps it, so padded columns
-    collapse into a wall. Measured on a real phone before this test existed."""
-    text, _ = digest(request(6))
-    assert "   " not in text.replace("\n", ""), "still padding columns with spaces"
-
-
-def test_digest_per_item_buttons_are_capped_on_large_batches():
-    """A 50-item keyboard is unusable; the flagged shortcut carries those."""
-    _, kb = digest(request(50))
-    from inbox_agent.telegram.callbacks import decode as d
-    opens = [x for row in kb for (_, data) in row if (x := d(data)).kind == "open"]
-    assert len(opens) <= 10

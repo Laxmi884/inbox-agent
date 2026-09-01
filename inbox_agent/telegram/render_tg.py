@@ -1,29 +1,66 @@
-"""Telegram renderers (spec section 4.4). Pure functions over ReviewRequest.
+"""Telegram renderers (spec section 4.4). Pure functions over their view object.
 
-Two modes, deliberately both. They do different jobs: the digest clears the
-confident majority in one tap, paged handles the handful worth reading. Which
-one wins gets settled by using both for a few days rather than by argument -
-the method the model registry applies to model choice.
+Two renderers, doing different jobs. `digest` is the report the owner reads
+after a run: what the agent did, and what it held back. `paged` is the
+single-item view - it renders a ReviewRequest, and Plan 3's /backlog sweep is
+what puts it back in front of a person.
+
+They no longer share an input type, and that is the point. The digest stopped
+reporting one run the moment the queue started outliving runs, so it renders a
+DigestView instead: this run's counts alongside everything still waiting from
+any run.
 
 Nothing here knows about the graph, the transport, or LangGraph. Same contract
 as render.py, which is why the notebook renderer keeps working unchanged.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Sequence
 
-from ..models import ReviewRequest
+from ..models import HeldItem, ReviewRequest
 from ..render import LOW_CONFIDENCE, NO_REASON
 from .callbacks import encode
 
 # Telegram hard limits. Protocol, not preference.
 TG_MAX_TEXT = 4096
 
-# Leave room for the header and the "... and N more" footer so pagination
-# arithmetic never has to be exact-to-the-byte.
-_TEXT_BUDGET = TG_MAX_TEXT - 400
-DIGEST_PAGE_SIZE = 15   # two lines per item now, so fewer fit
-MAX_ITEM_BUTTONS = 10   # a phone keyboard past this is unusable
+# A phone screen, roughly. Beyond this the queue is scrolling, not scanning.
+HELD_PAGE_SIZE = 8
+
+# Section order is hold-reason precedence order, so the most consequential
+# things are nearest the top of the message where they are read first.
+SECTIONS: tuple[tuple[str, str], ...] = (
+    ("trash", "🗑 TRASH — needs your OK"),
+    ("needs_reply", "✉️ NEEDS REPLY"),
+    ("security_alert", "🔒 SECURITY"),
+    ("low_confidence", "❓ NOT SURE"),
+)
+
+# Held for attention rather than authorisation: the proposed action is harmless
+# and the thread simply wants a person. Only these are one-tap approvable.
+ATTENTION_REASONS = frozenset({"needs_reply", "security_alert"})
+
+_SUBJECT_CAP = 70
+_REASON_CAP = 160
+
+
+@dataclass
+class DigestView:
+    """Everything the digest renders, assembled by the caller.
+
+    A dataclass rather than a ReviewRequest because the digest no longer reports
+    one run: it reports what this run DID (audit records) alongside what is
+    still waiting from any run (the queue). Keeping the renderer pure over this
+    view is what kept render.py's contract worth having.
+    """
+    run_at: datetime
+    total: int
+    done_by_kind: dict[str, int]
+    rule_decided: int
+    held: list[HeldItem] = field(default_factory=list)
+    digest_id: str = ""
 
 
 def rule_decided_count(request: ReviewRequest) -> int:
@@ -60,71 +97,119 @@ def _actions(item) -> str:
         for a in item.proposed) or "none"
 
 
-def digest(request: ReviewRequest, page: int = 0,
-           categories: Sequence[str] = ()) -> tuple[str, list]:
-    """One message, all items numbered, approve-all in a tap.
+def _age(item: HeldItem, now: datetime) -> str:
+    """'waiting since Tue 8:00', or empty for something held in this run.
 
-    Pages rather than truncates: 50 rows at ~80 chars is right at Telegram's
-    4096 cap, and silently dropping the tail of a review list is exactly the
-    kind of invisible failure this project keeps trying to design out.
+    Only carried-over items say it. Printing it on everything would make the
+    phrase meaningless, and its whole job is to make an ignored queue look
+    ignored.
     """
-    items = request.items
-    pages = max(1, (len(items) + DIGEST_PAGE_SIZE - 1) // DIGEST_PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
-    start = page * DIGEST_PAGE_SIZE
-    window = items[start:start + DIGEST_PAGE_SIZE]
+    held_at = item.first_held_at
+    if held_at.tzinfo is None:
+        held_at = held_at.replace(tzinfo=timezone.utc)
+    if (now - held_at).total_seconds() < 3600:
+        return ""
+    return f" · waiting since {held_at.astimezone().strftime('%a %H:%M')}"
 
-    lines = [header(request)]
+
+def _held_line(number: int, item: HeldItem, now: datetime) -> str:
+    """Three lines: what it is, who sent it, and why the agent wants this.
+
+    `reason` is here because these are the items the agent deliberately would
+    not decide alone - it is what turns a rejection into training data rather
+    than a shrug. The one-line form that was right for a fifty-item list is
+    wrong for a list of four.
+    """
+    conf = (f" · {item.item.confidence:.2f}"
+            if item.item.confidence < LOW_CONFIDENCE else "")
+    why = (item.item.reason or NO_REASON).strip()[:_REASON_CAP]
+    return (f"{number}. {item.item.subject[:_SUBJECT_CAP]}\n"
+            f"{item.item.sender}{conf}{_age(item, now)}\n"
+            f"{why}")
+
+
+def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
+    """Counts on top, held items in full, done items behind a button.
+
+    Grouped by why an item is held rather than by what the agent proposes: the
+    sections ARE the queue, and the stat line is the report.
+    """
+    # Carried-over items first within each section: an ignored queue should read
+    # as one. all() is already oldest-first, so this is stable.
+    ordered = sorted(view.held, key=lambda h: h.first_held_at)
+    pages = max(1, (len(ordered) + HELD_PAGE_SIZE - 1) // HELD_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * HELD_PAGE_SIZE
+    window = ordered[start:start + HELD_PAGE_SIZE]
+
+    # Absolute numbering, computed once over the whole queue: item 9 is item 9
+    # on page 2, so a number the owner reads means the same thing on every page.
+    numbers = {h.thread_id: n for n, h in enumerate(ordered, start=1)}
+
+    stat = " · ".join(f"{count} {kind}"
+                      for kind, count in sorted(view.done_by_kind.items())
+                      if count)
+    lines = [f"Inbox · {view.run_at.astimezone().strftime('%H:%M')} · "
+             f"{view.total} threads"]
+    lines.append(f"{stat} · {len(ordered)} waiting" if stat
+                 else f"{len(ordered)} waiting")
     if pages > 1:
         lines[0] += f"  (page {page + 1}/{pages})"
-    lines.append("")
 
-    for offset, item in enumerate(window):
-        i = start + offset
-        # Two short lines per item, never padded columns. Telegram renders
-        # proportional text and wraps it, so `{:<24}` padding does not align
-        # anything - it just injects runs of spaces that survive the wrap and
-        # turn the message into a wall. Verified on a real phone.
-        tag = " ·rule" if item.source == "rule" else ""
-        block = (f"{i + 1}. {item.subject[:52]}\n"
-                 f"↳ {_actions(item)}{_flag(item)} — {item.sender[:30]}{tag}")
-        if sum(len(x) + 1 for x in lines) + len(block) > _TEXT_BUDGET:
-            lines.append(f"… {len(window) - offset} more on this page")
-            break
-        lines.append(block)
+    for reason, title in SECTIONS:
+        section = [h for h in window if h.hold_reason == reason]
+        if not section:
+            continue
+        lines.append("")
+        lines.append(f"{title} ({len(section)})")
+        for held_item in section:
+            lines.append(_held_line(numbers[held_item.thread_id],
+                                    held_item, view.run_at))
+
+    done_total = sum(view.done_by_kind.values())
+    lines.append("")
+    lines.append(f"✓ DONE ({done_total})")
+    if view.rule_decided:
+        # Make the learning visible. As rules accumulate this climbs and the
+        # sections above shrink. Suppressed at zero: "0 came from rules you
+        # taught me" reads as a failure rather than as a not-yet.
+        lines.append(f"{view.rule_decided} came from rules you taught me")
+
+    text = "\n".join(lines)[:TG_MAX_TEXT]
 
     keyboard: list[list[tuple[str, str]]] = []
-
-    # One button per item, so the digest is correctable without leaving it.
-    # Capped: a 50-button keyboard is unusable on a phone, and the flagged
-    # shortcut below is the route into a large batch.
-    shown = window[:MAX_ITEM_BUTTONS]
     row: list[tuple[str, str]] = []
-    for offset, _ in enumerate(shown):
-        i = start + offset
-        row.append((str(i + 1), encode("open", i)))
-        if len(row) == 5:
+    for held_item in window:
+        row.append((str(numbers[held_item.thread_id]),
+                    encode("open", numbers[held_item.thread_id] - 1,
+                           digest_id=view.digest_id)))
+        if len(row) == 4:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
 
-    flagged = [i for i, it in enumerate(items) if it.confidence < LOW_CONFIDENCE]
-    if flagged:
-        keyboard.append([(f"🔎 Review {len(flagged)} flagged",
-                          encode("open", flagged[0]))])
+    if done_total:
+        keyboard.append([(f"📋 Show the {done_total} done",
+                          encode("done", digest_id=view.digest_id))])
 
-    keyboard.append([("✅ Approve all", encode("approve_all"))])
+    attention = [h for h in ordered if h.hold_reason in ATTENTION_REASONS]
+    if attention:
+        # Attention tier only. A blanket button that could reach trash or a
+        # low-confidence guess would rubber-stamp exactly the set this design
+        # isolated to avoid rubber-stamping.
+        keyboard.append([(f"✅ Approve {len(attention)} replies & alerts",
+                          encode("approve_attention", digest_id=view.digest_id))])
 
     nav: list[tuple[str, str]] = []
     if page > 0:
-        nav.append(("◀ Prev", encode("prev")))
+        nav.append(("◀ Prev", encode("prev", digest_id=view.digest_id)))
     if page < pages - 1:
-        nav.append(("Next ▶", encode("next")))
+        nav.append(("Next ▶", encode("next", digest_id=view.digest_id)))
     if nav:
         keyboard.append(nav)
 
-    return "\n".join(lines), keyboard
+    return text, keyboard
 
 
 def paged(request: ReviewRequest, index: int,
