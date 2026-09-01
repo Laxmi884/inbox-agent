@@ -1,7 +1,7 @@
 """Stage A pipeline (spec section 4.2).
 
     fetch -> prefilter -> classify -> propose -> partition -+-> auto_execute -> enqueue_held -+
-                                                             +-> <interrupt> -> execute --------+-> mark_triaged -> learn
+                                                             +-> <interrupt> -> execute ------+-> mark_triaged -> learn
 
 partition splits the batch by the autonomy ladder (inbox_agent/partition.py).
 Confident, reversible actions act then report (auto_execute); everything else
@@ -301,7 +301,7 @@ def build_graph(
                      run_id=run_id, reason=raw["reason"])
         return {}
 
-    def mark_triaged(state: TriageState) -> dict:
+    def mark_triaged(state: TriageState, config: RunnableConfig) -> dict:
         """Label every thread this run processed, both tiers.
 
         Held items are marked too: they are in the queue and will be shown from
@@ -310,8 +310,13 @@ def build_graph(
 
         Goes through execute_action like anything else, so it is audited, and is
         refused by the deny-list and skipped by dry-run on the same terms.
+
+        Takes `config` like auto_execute and execute do, so `_context` fills in
+        the real checkpoint_id instead of None - otherwise every triaged-label
+        record in the audit log would be untraceable to the run that wrote it.
         """
-        context = _context(None)
+        context = _context(config)
+        refused_ids = []
         for thread_id in state.get("thread_ids", []):
             action = Action(kind="label", thread_id=thread_id,
                             params={"label": settings.triaged_label})
@@ -319,10 +324,26 @@ def build_graph(
                 execute_action(action, client=client, settings=settings, log=log,
                                actor="agent", context=context)
             except ForbiddenActionError:
-                # Configured out. Not fatal: the run's real work already happened.
-                log_module.getLogger(__name__).warning(
-                    "triaged label refused by the deny-list; threads will be re-triaged")
-        return {}
+                # Configured out. Not fatal: the run's real work already
+                # happened. Surfaced into `skipped`, not `refused` - `refused`
+                # has no reducer (see TriageState), so returning it here would
+                # silently overwrite whatever execute()/auto_execute() already
+                # wrote there. `skipped` DOES have one (operator.add), and
+                # this is the same reason the interrupt path's refusals are
+                # surfaced into state at all: print() reaches no notebook, no
+                # Telegram bot, and the JSONL file is not something either
+                # renders by default.
+                refused_ids.append(thread_id)
+
+        skipped = []
+        if refused_ids:
+            log_module.getLogger(__name__).warning(
+                "triaged label refused by the deny-list for %d thread(s); "
+                "they will be re-triaged", len(refused_ids))
+            skipped = [{"thread_id": tid, "stage": "mark_triaged",
+                       "reason": "triaged label refused by the deny-list"}
+                      for tid in refused_ids]
+        return {"skipped": skipped}
 
     def review(state: TriageState) -> dict:
         """Suspend for the human. Durable: resume from any UI, any time."""

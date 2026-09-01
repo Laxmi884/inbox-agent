@@ -45,6 +45,12 @@ class Settings:
     # over, short enough to matter when clearing a backlog. Defaulted so every
     # existing construction of Settings keeps working unchanged.
     stale_after_days: int = 90
+    # Telegram review UI. Defaults keep every existing construction of Settings
+    # (tests, the notebook) working unchanged; the bot refuses to start without
+    # a token and a chat id, rather than running open to anyone who finds it.
+    tg_token: str = ""
+    tg_chat_id: str = ""
+    tg_mode: str = "digest"
     # Applied to every thread the agent has processed, so it leaves the fetch
     # query. Without it, threads that were labelled but left in the inbox - and
     # everything decided `none` - stay INBOX+UNREAD forever and are re-triaged,
@@ -61,12 +67,35 @@ class Settings:
     def inbox_query(self) -> str:
         return f"in:inbox is:unread -label:{self.triaged_label}"
 
-    # Telegram review UI. Defaults keep every existing construction of Settings
-    # (tests, the notebook) working unchanged; the bot refuses to start without
-    # a token and a chat id, rather than running open to anyone who finds it.
-    tg_token: str = ""
-    tg_chat_id: str = ""
-    tg_mode: str = "digest"
+
+def _resolve_triaged_label() -> str:
+    """Empty and whitespace-containing values are both footguns, not valid
+    configuration, so neither is passed through as-is.
+
+    Empty (INBOX_TRIAGED_LABEL="") would turn inbox_query's `-label:` term into
+    a no-op that excludes nothing, so fetch silently stops narrowing by
+    triaged status, and mark_triaged would apply an empty label on top of it -
+    falling back to the default keeps the query meaningful instead of failing
+    open.
+
+    Whitespace is legal in a real Gmail label but fatal here: the snapshot
+    client's matches_query splits `query` on whitespace term-by-term
+    (inbox_agent/gmail.py), so a labelled-with-a-space value would blow up
+    fetch() with `ValueError: '...' is not a query term...` - an error that
+    never names INBOX_TRIAGED_LABEL as the actual misconfiguration. Raising
+    here, at load time, names it.
+    """
+    raw = os.getenv("INBOX_TRIAGED_LABEL", "agent/triaged").strip()
+    if not raw:
+        return "agent/triaged"
+    if any(ch.isspace() for ch in raw):
+        raise ValueError(
+            f"INBOX_TRIAGED_LABEL={raw!r} contains whitespace, which the "
+            "query parser cannot handle - it splits the fetch query on "
+            "whitespace term-by-term. Use a label with no spaces (Gmail "
+            "nested labels use '/', e.g. 'agent/triaged')."
+        )
+    return raw
 
 
 def load_settings() -> Settings:
@@ -87,7 +116,7 @@ def load_settings() -> Settings:
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
         stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
-        triaged_label=os.getenv("INBOX_TRIAGED_LABEL", "agent/triaged").strip(),
+        triaged_label=_resolve_triaged_label(),
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),

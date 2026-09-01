@@ -108,8 +108,9 @@ def test_rejecting_executes_nothing(wiring):
     assert final["executed"] == []
     # mark_triaged still runs on every processed thread (including a rejected
     # one) and writes its own "simulated" label record, so the log is no
-    # longer empty - only the archive that reject blocked must be absent.
-    assert not any(r.action == "archive" for r in wiring["log"].records())
+    # longer empty - but nothing beyond that bookkeeping may have happened,
+    # which `records() == []` used to guarantee on its own.
+    assert all(r.action == "label" for r in wiring["log"].records())
 
 
 def test_rejection_becomes_a_learned_rule(wiring):
@@ -581,13 +582,68 @@ def test_every_processed_thread_gets_the_triaged_label(tmp_path):
                         context_hub_skill="s", context_hub_tag="dev")
     snap = _snapshot(tmp_path, [_row("t1"), _row("t2")])
     client = SnapshotGmailClient(snap)
+    log = AuditLog(settings.audit_log)
     graph = build_graph(
         client=client, prefs=PreferenceStore(build_store()),
         policy=Policy(text="T", version="local:test", source="local"),
         llm=FakeLLM(ThreadJudgment(category="other", action="archive", label=None,
                                    reason="unsure", confidence=0.2)),
-        settings=settings, log=AuditLog(settings.audit_log),
+        settings=settings, log=log,
         held=HeldQueue(build_store()), checkpointer=InMemorySaver())
     graph.invoke({"limit": 2}, {"configurable": {"thread_id": "run-m"}})
     for tid in ("t1", "t2"):
         assert settings.triaged_label in client.get_thread(tid).label_ids
+    # checkpoint_id must carry the run's thread_id, matching every other
+    # action record (test_executed_action_carries_a_traceable_checkpoint_identifier) -
+    # mark_triaged used to call _context(None), leaving this field None.
+    label_records = [r for r in log.records() if r.action == "label"]
+    assert label_records and all(r.checkpoint_id == "run-m" for r in label_records)
+
+
+def test_auto_executed_thread_gets_both_the_action_and_the_triaged_label(tmp_path):
+    """The auto tier's counterpart to the held-tier test above: a confident,
+    reversible action executes immediately through auto_execute, AND the same
+    thread still comes out of mark_triaged with the label - both tiers reach
+    mark_triaged, not just the held one."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    # dry_run=False for the same reason as the held-tier test above: neither
+    # the archive nor the label lands on the client under dry-run.
+    settings = Settings(backend="offline", dry_run=False, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "audit.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev")
+    snap = _snapshot(tmp_path, [_row("t1")])
+    client = SnapshotGmailClient(snap)
+    graph = build_graph(
+        # FakeLLM()'s default judgment is archive at confidence 0.9 - "always"
+        # authority, the same one test_incremental_run_executes_the_auto_tier
+        # relies on to land in the auto tier rather than the held queue.
+        client=client, prefs=PreferenceStore(build_store()),
+        policy=Policy(text="T", version="local:test", source="local"),
+        llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
+        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+    graph.invoke({"limit": 1}, {"configurable": {"thread_id": "run-auto"}})
+    labels = client.get_thread("t1").label_ids
+    assert "INBOX" not in labels, "the auto-executed archive did not reach the client"
+    assert settings.triaged_label in labels, "mark_triaged did not reach the auto tier"
+
+
+def test_deny_listed_label_kind_is_visible_in_skipped_and_does_not_crash(wiring):
+    """A configured-out `label` kind must not make mark_triaged silently vanish
+    the refusal (the exact failure this task exists to prevent, made silent:
+    with INBOX_FORBIDDEN_ACTIONS=label, every run would re-triage the same
+    threads forever while looking like a normal successful run). The run must
+    complete and the refusal must land in `skipped`, not `refused` - `refused`
+    has no reducer and returning it here would clobber whatever execute()/
+    auto_execute() already wrote there (see TriageState)."""
+    from dataclasses import replace
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    settings = replace(wiring["settings"],
+                        forbidden_actions=wiring["settings"].forbidden_actions
+                        | frozenset({"label"}))
+    graph = build_graph(**{**wiring, "settings": settings}, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-deny-label"}})
+    assert "__interrupt__" not in result, "the run must complete, not hang"
+    assert any(s["thread_id"] == "t1" and s.get("stage") == "mark_triaged"
+               for s in result["skipped"])
