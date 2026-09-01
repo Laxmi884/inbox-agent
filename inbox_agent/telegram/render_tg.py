@@ -87,6 +87,11 @@ class DoneItem:
     # The digest's header counts these; here they are marked individually, so
     # "the rules you taught me" can be checked rather than taken on trust.
     from_rule: bool = False
+    # WHICH rule, in the rule's own terms: "sender no-reply@x.com → trash".
+    # `from_rule` alone said a rule decided it and refused to say which, and for
+    # a category rule the pattern appears nowhere else on the screen.
+    rule_note: str = ""
+    rule_id: str = ""
 
 
 @dataclass
@@ -428,8 +433,11 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
         # goes on the action line because that is the claim it qualifies.
         block = (f"{offset}. {_oneline(item.subject, _SUBJECT_CAP)}\n"
                  f"{_oneline(item.sender, _SENDER_CAP)}\n"
-                 f"→ {_done_actions(item)}"
-                 f"{'  · rule' if item.from_rule else ''}")
+                 f"→ {_done_actions(item)}")
+        if item.rule_note:
+            block += f"\n↳ your rule: {_oneline(item.rule_note, _ACTION_CAP + 40)}"
+        elif item.from_rule:
+            block += "  · rule"
         if used + len(block) + 2 > budget:
             break
         used += len(block) + 2
@@ -479,6 +487,7 @@ _WHY_CAP = 300
 
 def item_view(subject: str, sender: str, actions_text: str, why: str, *,
               digest_id: str, index: int, kind: str = "done",
+              rule_detail: str = "",
               categories: Sequence[str] = ()) -> tuple[str, list]:
     """One item, opened. The screen the numbered buttons have always implied.
 
@@ -493,11 +502,17 @@ def item_view(subject: str, sender: str, actions_text: str, why: str, *,
     lines = [f"{index + 1}. {_oneline(subject, _SUBJECT_CAP)}",
              _oneline(sender, _SENDER_CAP),
              f"→ {_oneline(actions_text, _ACTION_CAP)}"]
-    if why.strip():
+    if why.strip() and not rule_detail.strip():
         # Omitted rather than filled with a placeholder: the reason is the only
         # record of a judgement the owner ever sees, and inventing one here
-        # would be inventing evidence.
+        # would be inventing evidence. Suppressed entirely when a rule decided
+        # this, because then the reason IS the rule - prefilter writes "matched
+        # sender rule 'x' -> trash" - and the block below says it better.
         lines += ["", f"Why: {_oneline(why, _WHY_CAP)}"]
+    if rule_detail.strip():
+        # Not collapsed to one line: this is the rule, when it was taught, and
+        # how it has performed, and the owner is being asked to judge it.
+        lines += ["", rule_detail.strip()]
     text = "\n".join(lines)[:TG_MAX_TEXT]
 
     if kind == "held":

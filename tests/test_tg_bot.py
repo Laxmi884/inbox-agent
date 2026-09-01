@@ -770,3 +770,57 @@ def test_a_failed_acknowledgement_on_a_verdict_still_writes_the_rule(bot):
     b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
     b.handle_update(cb(encode("scope_wide", 0, digest_id=b._digest_id)))
     assert b.prefs.rules(), "a correction was lost because the spinner failed"
+
+
+# --- which rule decided it --------------------------------------------------
+
+def test_the_panel_names_the_rule_that_decided_a_thread(bot):
+    """The audit record has carried rule_provenance since Stage A and nothing
+    ever showed it. "· rule" told the owner a rule decided this and refused to
+    say which one."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.prefs.add_rule(Rule(id="r-1", scope="sender", pattern="deals0@shop.com",
+                          actions=[ActionTemplate(kind="trash")],
+                          provenance="owner corrected it", created_at=NOW))
+    _done_run(b, actions=(("trash", None),), actor="rule:r-1")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    assert "sender deals0@shop.com" in t.edited[-1]["text"]
+    assert "trash" in t.edited[-1]["text"]
+
+
+def test_opening_a_rule_decided_item_shows_the_rule_and_its_record(bot):
+    """The owner is being asked to judge the rule, so they get what it says,
+    when they taught it, and how it has performed."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    rule = b.prefs.add_rule(Rule(id="r-1", scope="sender", pattern="deals0@shop.com",
+                                 actions=[ActionTemplate(kind="trash")],
+                                 provenance="owner corrected it", created_at=NOW,
+                                 hit_count=3, override_count=1))
+    _done_run(b, actions=(("trash", None),), actor="rule:r-1")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    assert "sender deals0@shop.com" in text
+    assert "3 hit" in text and "1 override" in text
+
+
+def test_a_model_decided_item_shows_no_rule_line(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    assert "Rule:" not in t.edited[-1]["text"]
+
+
+def test_a_deleted_rule_does_not_break_the_item_view(bot):
+    """The rule can be gone by the time the owner opens the item - demoted,
+    replaced, or the store rebuilt. The record of what happened survives it."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("trash", None),), actor="rule:r-vanished")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    assert t.edited[-1]["text"]

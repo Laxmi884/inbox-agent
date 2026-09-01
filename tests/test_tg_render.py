@@ -610,3 +610,43 @@ def test_the_done_panel_numbers_buttons_by_absolute_position():
              if decode(d).kind == "open"]
     assert [l for l, _ in opens] == [str(DONE_PAGE_SIZE + 1), str(DONE_PAGE_SIZE + 2)]
     assert [i.index for _, i in opens] == [DONE_PAGE_SIZE, DONE_PAGE_SIZE + 1]
+
+
+def test_the_panel_names_the_rule_that_decided_a_thread():
+    """"→ trash · rule" says a rule decided it and refuses to say which - the
+    same shape of half-answer as "3 label". For a category rule the pattern
+    appears nowhere else on the screen at all."""
+    item = done("t1", actions=[("trash", None)], from_rule=True)
+    item.rule_note = "sender no-reply@p.simplywall.st → trash"
+    text, _ = done_panel(done_view([item]))
+    assert "sender no-reply@p.simplywall.st → trash" in text
+
+
+def test_the_panel_says_nothing_extra_when_no_rule_decided_it():
+    text, _ = done_panel(done_view([done("t1")]))
+    assert "your rule" not in text
+
+
+def test_the_item_view_shows_the_rule_in_full():
+    text, _ = item_view(**view_args(
+        rule_detail="Rule: sender no-reply@p.simplywall.st → trash\n"
+                    "Taught 1 Sep · 1 hit, 0 overrides"))
+    assert "sender no-reply@p.simplywall.st → trash" in text
+    assert "1 hit, 0 overrides" in text
+
+
+def test_the_rule_replaces_the_why_rather_than_repeating_it():
+    """For a rule-decided thread the reason IS the rule - prefilter writes
+    "matched sender rule 'x' -> trash" - so printing both puts the same
+    sentence on the screen twice in different words."""
+    text, _ = item_view(**view_args(
+        why="matched sender rule 'no-reply@p.simplywall.st' -> trash",
+        rule_detail="Rule: sender no-reply@p.simplywall.st → trash\n"
+                    "Taught 1 Sep · 1 hit, 0 overrides"))
+    assert "Why:" not in text
+    assert "Rule:" in text
+
+
+def test_the_item_view_omits_the_rule_line_when_the_model_decided():
+    text, _ = item_view(**view_args())
+    assert "Rule:" not in text

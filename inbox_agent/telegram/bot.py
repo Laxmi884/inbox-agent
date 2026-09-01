@@ -233,8 +233,16 @@ class Bot:
                                 sender=proposal.get("sender") or "")
                 rows[thread_id] = item
             item.actions.append((kind, label))
-            if str(record.get("actor", "")).startswith("rule:"):
+            actor = str(record.get("actor", ""))
+            if actor.startswith("rule:"):
                 item.from_rule = True
+                item.rule_id = actor.split(":", 1)[1]
+                # In the rule's own terms rather than the audit sentence: the
+                # rule may have been corrected since, and what the owner needs
+                # to judge is what it says NOW.
+                rule = self._rule(item.rule_id)
+                item.rule_note = (f"{rule.scope} {rule.pattern} → {rule.summary}"
+                                  if rule else "")
         return list(rows.values())
 
     def _show(self, *, edit: bool) -> None:
@@ -291,7 +299,8 @@ class Bot:
         actions_text = ", ".join(f"{k}({v})" if v else k for k, v in item.actions)
         return item_view(item.subject, item.sender, actions_text, why,
                          digest_id=self._digest_id, index=self._open_index,
-                         kind=kind, categories=self.categories)
+                         kind=kind, rule_detail=self._rule_detail(item),
+                         categories=self.categories)
 
     def _ask_scope(self, verdict: str, item: DoneItem, category: str) -> None:
         """Verdict first, scope second.
@@ -452,6 +461,29 @@ class Bot:
                 return raw.get("category") or "other"
         held = self.held.get(thread_id)
         return (held.item.category if held else "other") or "other"
+
+    def _rule(self, rule_id: str):
+        """One rule by id, or None. Absent is not an error: a rule can be
+        demoted, replaced or lost between acting and being asked about, and the
+        record of what happened has to survive its own rule."""
+        return {r.id: r for r in self.prefs.rules()}.get(rule_id)
+
+    def _rule_detail(self, item: DoneItem) -> str:
+        """What decided this, when it was taught, and how it has done since.
+
+        The owner opening a rule-decided item is being asked to judge the rule,
+        not just this thread, so precision belongs here: a rule they have
+        overridden twice out of three firings is one they should be replacing.
+        """
+        rule = self._rule(item.rule_id) if item.rule_id else None
+        if rule is None:
+            return ""
+        taught = rule.created_at.astimezone().strftime("%-d %b")
+        hits = f"{rule.hit_count} hit" + ("" if rule.hit_count == 1 else "s")
+        overs = (f"{rule.override_count} override"
+                 + ("" if rule.override_count == 1 else "s"))
+        return (f"Rule: {rule.scope} {rule.pattern} → {rule.summary}\n"
+                f"Taught {taught} · {hits}, {overs}")
 
     def _rule_id_of(self, item: DoneItem) -> Optional[str]:
         for record in (self._last_run or {}).get("executed", []):
