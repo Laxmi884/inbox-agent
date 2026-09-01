@@ -38,6 +38,12 @@ deletion. Those are blocked in code; proposing them only wastes a turn.
   discounts on things the owner uses may be valuable. Prefer
   `newsletter_valuable` when the content carries specific, dated, actionable
   information; prefer `newsletter_noise` when it is generic filler.
+- **A `newsletter_valuable` stays in the inbox.** Label it and set
+  `also_archive` false: the owner keeps it unread and reads it later, and
+  archiving it is how a thing worth reading gets lost. This is what
+  `also_archive` already meant - filing without reading is for mail the owner
+  will not open, such as a job alert or a receipt - but it was being set true
+  here anyway. `newsletter_noise` still leaves the inbox.
 - Set `confidence` below 0.5 whenever you are guessing. Low confidence is useful
   to the owner; a confident wrong answer is not.
 - Security and account notices should be surfaced rather than archived by

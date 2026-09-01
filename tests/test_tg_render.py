@@ -359,6 +359,23 @@ def test_the_panel_names_the_label_rather_than_counting_it():
     assert "t1@example.com" in text
 
 
+def test_the_panel_uses_the_digest_block_shape():
+    """Two dense lines read fine in a terminal and wrap into a wall on a phone.
+
+    The mistake the layout rules at the top of this file exist to prevent, made
+    again in a new renderer: subject, sender and what was done each get their
+    own line, and a blank line separates one entry from the next, exactly as the
+    held items above them do. Checked on a phone before this was written down.
+    """
+    text, _ = done_panel(done_view([
+        done("t1", subject="First one", actions=[("label", "recruiter"),
+                                                 ("archive", None)]),
+        done("t2", subject="Second one")]))
+    body = text.split("labels: recruiter 1", 1)[1]
+    assert body.startswith("\n\n1. First one\n"), body[:60]
+    assert "\n1. First one\nt1@example.com\n→ label(recruiter), archive\n\n2. Second one" in text
+
+
 def test_the_panel_summarises_which_labels_were_used():
     """Scanning twelve lines to learn that everything went to one label is the
     work the summary line does instead."""

@@ -29,9 +29,12 @@ TG_MAX_TEXT = 4096
 # A phone screen, roughly. Beyond this the queue is scrolling, not scanning.
 HELD_PAGE_SIZE = 8
 
-# Done items are two lines to a held item's three, and they are read rather than
-# acted on, so more of them fit the same screen.
-DONE_PAGE_SIZE = 12
+# Same as the queue above it. Done entries were packed two to a line and 12 to a
+# page on the theory that a list to scan tolerates more density than a queue to
+# work through; on a phone that theory produced a wall, because Telegram wraps
+# every one of those lines. Same block shape, same page size, one layout to
+# learn.
+DONE_PAGE_SIZE = HELD_PAGE_SIZE
 
 # Section order is hold-reason precedence order, so the most consequential
 # things are nearest the top of the message where they are read first.
@@ -420,18 +423,21 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
     budget = TG_MAX_TEXT - len("\n".join(head)) - len(_OVERFLOW % 999) - 2
     used = 0
     for offset, item in enumerate(window, start=page * DONE_PAGE_SIZE + 1):
-        # Two lines and no blank between them: this is a list to scan, not a
-        # queue to work through, and the sender starting the second line is
-        # already enough to separate one entry from the next. The rule mark goes
-        # on the action line because that is the claim it qualifies.
+        # The held item's three-line block, with what was done where the reason
+        # goes: what it was, who sent it, what happened to it. The rule mark
+        # goes on the action line because that is the claim it qualifies.
         block = (f"{offset}. {_oneline(item.subject, _SUBJECT_CAP)}\n"
-                 f"{_oneline(item.sender, _SENDER_CAP)} → {_done_actions(item)}"
+                 f"{_oneline(item.sender, _SENDER_CAP)}\n"
+                 f"→ {_done_actions(item)}"
                  f"{'  · rule' if item.from_rule else ''}")
-        if used + len(block) + 1 > budget:
+        if used + len(block) + 2 > budget:
             break
-        used += len(block) + 1
+        used += len(block) + 2
         shown += 1
         lines.append(block)
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()     # the separator after the last block has nothing to separate
     if shown < len(window):
         lines.append("")
         lines.append(_OVERFLOW % (len(window) - shown))
