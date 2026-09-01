@@ -30,6 +30,27 @@ HELD_NS = ("held", "items")
 _SEARCH_PAGE_SIZE = 1000
 
 
+def _search_all(store, namespace: tuple[str, ...]) -> list:
+    """Every entry in a namespace, not just the first page.
+
+    BaseStore.search() defaults to limit=10. Both stores in this module read
+    collections that grow past that, and a silently truncated read would drop
+    rules 11+ or hide queued work the owner is waiting on - exactly the
+    invisible failure this system's audit design exists to prevent. Paginate
+    with an explicit limit/offset until a page comes back short, which is the
+    correct end-of-results signal for any count.
+    """
+    out: list = []
+    offset = 0
+    while True:
+        page = store.search(namespace, limit=_SEARCH_PAGE_SIZE, offset=offset)
+        out.extend(page)
+        if len(page) < _SEARCH_PAGE_SIZE:
+            break
+        offset += _SEARCH_PAGE_SIZE
+    return out
+
+
 def build_store(embeddings=None, dims: int = 768) -> InMemoryStore:
     """A store with optional semantic search over rule text.
 
@@ -130,22 +151,9 @@ class PreferenceStore:
         return rule
 
     def rules(self) -> list[Rule]:
-        """All stored rules, regardless of how many there are.
-
-        `InMemoryStore.search()` defaults to limit=10, which would otherwise
-        silently truncate the rule set as it grows past that default. Paginate
-        with an explicit limit/offset until a page comes back short of a full
-        page, which is the correct end-of-results signal for any rule count.
-        """
-        out: list[Rule] = []
-        offset = 0
-        while True:
-            page = self._store.search(RULES_NS, limit=_SEARCH_PAGE_SIZE, offset=offset)
-            out.extend(Rule.model_validate(item.value["rule"]) for item in page)
-            if len(page) < _SEARCH_PAGE_SIZE:
-                break
-            offset += _SEARCH_PAGE_SIZE
-        return out
+        """All stored rules, regardless of how many there are."""
+        page = _search_all(self._store, RULES_NS)
+        return [Rule.model_validate(item.value["rule"]) for item in page]
 
     def _put(self, rule: Rule) -> None:
         self._store.put(
@@ -288,18 +296,7 @@ class HeldQueue:
         self._store.delete(HELD_NS, thread_id)
 
     def all(self) -> list[HeldItem]:
-        """Everything held, oldest first.
-
-        Paginates for the same reason rules() does: BaseStore.search() defaults
-        to limit=10, and a silently truncated queue would hide work the owner is
-        waiting to do - the exact invisible failure this system is built against.
-        """
-        out: list[HeldItem] = []
-        offset = 0
-        while True:
-            page = self._store.search(HELD_NS, limit=_SEARCH_PAGE_SIZE, offset=offset)
-            out.extend(HeldItem.model_validate(entry.value["held"]) for entry in page)
-            if len(page) < _SEARCH_PAGE_SIZE:
-                break
-            offset += _SEARCH_PAGE_SIZE
-        return sorted(out, key=lambda h: h.first_held_at)
+        """Everything held, oldest first."""
+        page = _search_all(self._store, HELD_NS)
+        items = [HeldItem.model_validate(entry.value["held"]) for entry in page]
+        return sorted(items, key=lambda h: h.first_held_at)
