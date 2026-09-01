@@ -257,9 +257,18 @@ class HeldQueue:
     """Proposals waiting on the owner, across runs.
 
     Separate from PreferenceStore because the lifetimes differ: a rule is
-    permanent knowledge, a held item is a piece of work in flight. Same backing
-    BaseStore, different namespace, so there is still exactly one thing to
-    persist later.
+    permanent knowledge, a held item is a piece of work in flight. The class
+    itself is store-agnostic - any BaseStore, its own namespace - so the two
+    could in principle share one store the way they already share one kind of
+    backend.
+
+    Callers wire them with two separate store instances instead. Rules go in
+    a store built with embeddings (`build_store(get_embeddings())`) so rule
+    text is semantically searchable; a held item's payload has no `text`
+    field for that index to key off, so sharing that store would spend real
+    embedding calls on a payload the index has nothing to do with. One
+    interface, one persistence mechanism to reason about later - just not one
+    instance in practice.
     """
 
     def __init__(self, store):

@@ -36,6 +36,10 @@ from .store import HeldQueue, PreferenceStore, rule_from_correction
 # silently drift from ActionKind if it's ever extended.
 VALID_ACTION_KINDS = frozenset(get_args(ActionKind))
 
+# TriageState.mode is a plain str, not a Literal - see route_after_partition
+# for why an unrecognised value must raise rather than quietly act.
+VALID_MODES = frozenset({"incremental", "backlog"})
+
 
 class TriageState(TypedDict, total=False):
     limit: int
@@ -151,6 +155,12 @@ def _run_actions(actions, *, decision, verdict, client, settings, log, context):
             )
             executed.append(record.model_dump(mode="json"))
         except ForbiddenActionError as exc:
+            # execute_action already wrote the durable refusal record; this
+            # makes the refusal visible to whatever is holding the state too
+            # (a notebook, the interrupt path's reviewer, auto_execute's
+            # confident tier, a future Telegram bot), since print() reaches
+            # none of them and the JSONL file is not something any of them
+            # renders by default.
             refused.append({"thread_id": decision.thread_id,
                             "kind": action.kind, "error": str(exc)})
     return executed, refused
@@ -253,8 +263,16 @@ def build_graph(
         }
 
     def route_after_partition(state: TriageState) -> str:
-        # Backlog previews before committing; everything else acts then reports.
-        return "review" if state.get("mode") == "backlog" else "auto_execute"
+        # Absent means incremental: act then report. But an unrecognised value is
+        # a caller bug, and this router chooses between "act on a real mailbox"
+        # and "ask first" - so a near miss must stop rather than fall through to
+        # acting. Same reasoning as the deny-list normalising "Send_Message" and
+        # " send_message" instead of letting a near miss through.
+        mode = state.get("mode") or "incremental"
+        if mode not in VALID_MODES:
+            raise ValueError(
+                f"unknown run mode {mode!r}; expected one of {sorted(VALID_MODES)}")
+        return "review" if mode == "backlog" else "auto_execute"
 
     def auto_execute(state: TriageState, config: RunnableConfig) -> dict:
         context = _context(config)
@@ -301,9 +319,10 @@ def build_graph(
 
             # The interrupt's whole purpose is a trust boundary: the executed
             # set must be a subset of what the human was actually shown. A
-            # resume payload naming a thread that never appeared in this batch -
-            # stale, replayed, or forged - must be skipped before any indexing
-            # happens, on every verdict branch.
+            # resume payload naming a thread that never appeared in this
+            # batch - stale, replayed, or forged - must be skipped before any
+            # indexing happens, on every verdict branch (approve AND edit),
+            # not just guarded where a crash would otherwise be obvious.
             decision = decisions.get(thread_id)
             if decision is None:
                 skipped.append({"thread_id": thread_id, "verdict": verdict,

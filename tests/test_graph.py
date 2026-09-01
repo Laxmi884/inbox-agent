@@ -255,9 +255,23 @@ def test_state_does_not_carry_email_bodies(wiring):
     """Bodies must not be duplicated into every checkpoint."""
     graph = build_graph(**wiring)
     cfg = {"configurable": {"thread_id": "bounded-1"}}
-    result = graph.invoke({"limit": 5}, cfg)
+    result = graph.invoke({"limit": 5, "mode": "backlog"}, cfg)
 
     blob = json.dumps({k: v for k, v in result.items() if k != "__interrupt__"})
+    assert '"body"' not in blob, "state is carrying email bodies"
+    assert "thread_ids" in result, "state should carry ids"
+    assert result["thread_ids"] == ["t1"]
+
+
+def test_state_does_not_carry_email_bodies_on_the_incremental_path(wiring):
+    """Same bound, the other branch out of partition(): auto_execute's and
+    enqueue_held's state (executed/refused/auto/held) must not carry bodies
+    either - this is a property of TriageState, not just of the review node."""
+    graph = build_graph(**wiring)
+    cfg = {"configurable": {"thread_id": "bounded-1b"}}
+    result = graph.invoke({"limit": 5}, cfg)
+
+    blob = json.dumps(result)
     assert '"body"' not in blob, "state is carrying email bodies"
     assert "thread_ids" in result, "state should carry ids"
     assert result["thread_ids"] == ["t1"]
@@ -468,8 +482,24 @@ def test_two_runs_accumulate_held_items_rather_than_replacing_them(tmp_path):
 
     graph.invoke({"limit": 1}, {"configurable": {"thread_id": "run-1"}})
     assert len(held.all()) == 1
+    first_held_at = held.get("t1").first_held_at
+    run_id_1 = held.get("t1").run_id
+
     graph.invoke({"limit": 2}, {"configurable": {"thread_id": "run-2"}})
     assert len(held.all()) == 2
+
+    # The property under test is carryover, not the count: under replacement
+    # semantics (queue cleared and rebuilt each run) run 2 would ALSO end with
+    # two items, so len(held.all()) == 2 alone cannot distinguish the two
+    # designs. t1's first_held_at must be the same instant across both runs -
+    # it has been waiting since run 1, not since run 2 - even though it is
+    # legitimately re-held (and its run_id refreshed, per HeldQueue.add's
+    # docstring) each time a later run still proposes the same action for it.
+    t1 = held.get("t1")
+    assert t1 is not None, "t1 must still be in the queue after run 2"
+    assert t1.first_held_at == first_held_at, \
+        "carryover broke: t1 looks freshly held instead of still waiting"
+    assert t1.run_id != run_id_1, "run_id should refresh to the later run"
 
 
 def test_backlog_mode_still_suspends_at_the_interrupt(wiring):
@@ -488,3 +518,15 @@ def test_backlog_mode_executes_nothing_before_approval(wiring):
                  {"configurable": {"thread_id": "run-f"}})
     assert wiring["log"].records() == []
     assert wiring["held"].all() == []
+
+
+def test_an_unrecognised_mode_raises_rather_than_acting(wiring):
+    """route_after_partition fails closed. A near-miss like "Backlog" or a
+    future typo must stop the run, not silently fall through to the branch
+    that acts on a real mailbox."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    with pytest.raises(ValueError, match="unknown run mode"):
+        graph.invoke({"limit": 10, "mode": "Backlog"},
+                     {"configurable": {"thread_id": "run-g"}})
+    assert wiring["log"].records() == [], "must not have acted before raising"

@@ -1127,16 +1127,22 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from inbox_agent.audit import AuditLog
 from inbox_agent.graph import build_graph
 from inbox_agent.config import get_llm
+from inbox_agent.store import HeldQueue
 
 log = AuditLog(settings.audit_log)
 teach_prefs = PreferenceStore(build_store())     # fresh, so §9 is reproducible
+# Own store, own namespace (see HeldQueue's docstring in store.py): a held
+# item is work in flight, not durable preference knowledge, and build_graph
+# now requires the queue explicitly (task 4) rather than building one itself.
+teach_held = HeldQueue(build_store())
 
 cm = SqliteSaver.from_conn_string("inbox_agent/checkpoints.sqlite")
 checkpointer = cm.__enter__()    # kept open across cells; closes with the kernel
 
 llm = get_llm() if settings.backend != "offline" else None
 g = build_graph(client=client, prefs=teach_prefs, policy=pol, llm=llm,
-                settings=settings, log=log, checkpointer=checkpointer)
+                settings=settings, log=log, held=teach_held,
+                checkpointer=checkpointer)
 
 gg = g.get_graph()
 print("nodes:", list(gg.nodes))
@@ -1179,7 +1185,7 @@ cfg = {"configurable": {"thread_id": "teach-inspect"}}
 if settings.backend == "offline":
     print("skipped: needs an LLM to reach the review gate")
 else:
-    g.invoke({"limit": 2}, cfg)
+    g.invoke({"limit": 2, "mode": "backlog"}, cfg)
     snap = g.get_state(cfg)
     print("keys persisted in state:")
     for k, v in snap.values.items():
@@ -1268,7 +1274,7 @@ review_cfg = {"configurable": {"thread_id": "teach-interrupt"}}
 if settings.backend == "offline":
     print("skipped: needs an LLM")
 else:
-    result = g.invoke({"limit": LIMIT}, review_cfg)
+    result = g.invoke({"limit": LIMIT, "mode": "backlog"}, review_cfg)
 
     print("keys returned by invoke():", sorted(result))
     print("\n-> '__interrupt__' present means the run SUSPENDED, it did not finish.\n")
@@ -1358,7 +1364,7 @@ code(r"""
 # Demonstrate it: forge a resume payload naming a thread never in the batch.
 if settings.backend != "offline":
     forge_cfg = {"configurable": {"thread_id": "teach-forged"}}
-    res = g.invoke({"limit": 3}, forge_cfg)
+    res = g.invoke({"limit": 3, "mode": "backlog"}, forge_cfg)
     req = ReviewRequest.model_validate(res["__interrupt__"][0].value)
 
     shown = [i.thread_id for i in req.items]
@@ -1537,7 +1543,7 @@ if settings.backend == "offline":
     print("skipped: needs an LLM")
 else:
     e2e_cfg = {"configurable": {"thread_id": "teach-e2e"}}
-    r1 = g.invoke({"limit": LIMIT}, e2e_cfg)
+    r1 = g.invoke({"limit": LIMIT, "mode": "backlog"}, e2e_cfg)
     req2 = ReviewRequest.model_validate(r1["__interrupt__"][0].value)
 
     print("PROPOSED:")
