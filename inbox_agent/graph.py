@@ -1,6 +1,6 @@
 """Stage A pipeline (spec section 4.2).
 
-    fetch -> prefilter -> classify -> propose -> partition -+-> auto_execute -> enqueue_held -+
+    fetch -> prefilter -> classify -> apply_rules -> propose -> partition -+-> auto_execute -> enqueue_held -+
                                                              +-> <interrupt> -> execute ------+-> mark_triaged -> learn
 
 partition splits the batch by the autonomy ladder (inbox_agent/partition.py).
@@ -246,6 +246,45 @@ def build_graph(
         decided.sort(key=lambda d: order[d.thread_id])
         return {"decisions": [d.model_dump() for d in decided]}
 
+    def apply_rules(state: TriageState) -> dict:
+        """Rewrite what the model proposed where the owner has taught otherwise.
+
+        The second of two places rules fire, and the split is forced by the
+        data rather than chosen: prefilter matches properties of the raw thread
+        and runs before the model, so a rule about a CATEGORY has nowhere to be
+        applied there - the category is the model's conclusion, not the
+        thread's attribute.
+
+        A rewrite, not a re-judgment. The model's category stands and the
+        owner's rule decides what happens to mail of that category, which is
+        exactly the correction that motivated it: "you were right that it is a
+        valuable newsletter, you were wrong to archive it."
+
+        Attributed to the rule - source, rule_id, a recorded hit - so the
+        digest's "came from rules you taught me" counts it and precision can
+        move. A rewrite the owner cannot see taught them nothing.
+        """
+        rewritten = []
+        for raw in state.get("decisions", []):
+            decision = Decision.model_validate(raw)
+            matches = prefs.matching_category(decision.category)
+            if matches:
+                # Most recently created wins, the same way prefilter resolves a
+                # tie: the owner's latest word is the current one.
+                rule = max(matches, key=lambda r: r.created_at)
+                prefs.record_hit(rule.id)
+                decision = decision.model_copy(update={
+                    "actions": [Action(kind=t.kind, thread_id=decision.thread_id,
+                                       params=dict(t.params))
+                                for t in rule.actions],
+                    "reason": (f"{decision.reason} (your rule for "
+                               f"{decision.category}: {rule.summary})"),
+                    "source": "rule",
+                    "rule_id": rule.id,
+                })
+            rewritten.append(decision.model_dump())
+        return {"decisions": rewritten}
+
     def propose(state: TriageState) -> dict:
         threads = {t.id: t for t in _threads(state)}
         items = []
@@ -407,7 +446,8 @@ def build_graph(
         return {"learned": learned, "skipped": learn_skips}
 
     builder = StateGraph(TriageState)
-    for name, fn in (("fetch", fetch), ("triage", triage), ("propose", propose),
+    for name, fn in (("fetch", fetch), ("triage", triage),
+                     ("apply_rules", apply_rules), ("propose", propose),
                      ("partition", partition_node), ("auto_execute", auto_execute),
                      ("enqueue_held", enqueue_held), ("mark_triaged", mark_triaged),
                      ("review", review), ("execute", execute), ("learn", learn)):
@@ -415,7 +455,8 @@ def build_graph(
 
     builder.add_edge(START, "fetch")
     builder.add_edge("fetch", "triage")
-    builder.add_edge("triage", "propose")
+    builder.add_edge("triage", "apply_rules")
+    builder.add_edge("apply_rules", "propose")
     builder.add_edge("propose", "partition")
     builder.add_conditional_edges("partition", route_after_partition,
                                   {"auto_execute": "auto_execute", "review": "review"})

@@ -1,4 +1,6 @@
 import json
+from datetime import datetime, timezone
+
 import pytest
 
 from langgraph.types import Command
@@ -8,7 +10,9 @@ from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.classify import ThreadJudgment
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph, learn_from_response
-from inbox_agent.models import ActionTemplate, Action, ReviewResponse, Thread
+from inbox_agent.models import (
+    Action, ActionTemplate, Decision, ReviewResponse, Rule, Thread,
+)
 from inbox_agent.policy import Policy
 from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 
@@ -647,3 +651,82 @@ def test_deny_listed_label_kind_is_visible_in_skipped_and_does_not_crash(wiring)
     assert "__interrupt__" not in result, "the run must complete, not hang"
     assert any(s["thread_id"] == "t1" and s.get("stage") == "mark_triaged"
                for s in result["skipped"])
+
+
+# --- category rules, applied after the model --------------------------------
+# The case that started this: the model is right that a newsletter is valuable
+# and wrong to archive it. A category rule rewrites the actions; the category,
+# which the model got right, stands.
+
+def _category_rule(category="promotion", rid="r-cat", kinds=(("label", "promotion"),)):
+    return Rule(id=rid, scope="category", pattern=category,
+                actions=[ActionTemplate(kind=k, params={"label": v} if v else {})
+                         for k, v in kinds],
+                provenance="owner keeps these in the inbox",
+                created_at=datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+
+def test_a_category_rule_rewrites_what_the_model_proposed(wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring["prefs"].add_rule(_category_rule())
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    out = graph.invoke({"limit": 10, "mode": "incremental"},
+                       {"configurable": {"thread_id": "cat-1"}})
+    decisions = [Decision.model_validate(d) for d in out["decisions"]]
+    kinds = {k for d in decisions for k in [a.kind for a in d.actions]}
+    assert "archive" not in kinds, "the category rule did not remove the archive"
+    assert "label" in kinds
+
+
+def test_a_rewritten_decision_is_credited_to_the_rule(wiring):
+    """The digest counts "came from rules you taught me". A rewrite IS the rule
+    deciding, so it has to be attributed or the learning stays invisible - and
+    precision cannot move on a rule that never records a hit."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring["prefs"].add_rule(_category_rule())
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    out = graph.invoke({"limit": 10, "mode": "incremental"},
+                       {"configurable": {"thread_id": "cat-2"}})
+    decisions = [Decision.model_validate(d) for d in out["decisions"]]
+    assert all(d.source == "rule" and d.rule_id == "r-cat" for d in decisions)
+    assert wiring["prefs"].rules()[0].hit_count == len(decisions)
+
+
+def test_a_thread_with_no_category_rule_is_left_alone(wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    out = graph.invoke({"limit": 10, "mode": "incremental"},
+                       {"configurable": {"thread_id": "cat-3"}})
+    decisions = [Decision.model_validate(d) for d in out["decisions"]]
+    assert any("archive" in [a.kind for a in d.actions] for d in decisions)
+
+
+def test_a_sender_rule_still_short_circuits_the_model(wiring):
+    """Precedence, asserted rather than described: a pre-model rule means the
+    model never runs, so apply_rules never sees the thread."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring["prefs"].add_rule(Rule(
+        id="r-send", scope="sender", pattern="deals@shop.com",
+        actions=[ActionTemplate(kind="trash")], provenance="p",
+        created_at=datetime(2026, 9, 1, tzinfo=timezone.utc)))
+    wiring["prefs"].add_rule(_category_rule())
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    out = graph.invoke({"limit": 10, "mode": "incremental"},
+                       {"configurable": {"thread_id": "cat-4"}})
+    by_id = {d["thread_id"]: Decision.model_validate(d) for d in out["decisions"]}
+    hit = next(d for d in by_id.values() if d.rule_id == "r-send")
+    assert hit.category == "rule_match", "the model ran on a thread a rule covered"
+    assert [a.kind for a in hit.actions] == ["trash"]
+
+
+def test_the_rewritten_reason_says_it_was_the_owners_rule(wiring):
+    """The reason is the only record of a judgement the owner ever sees, and
+    after a rewrite the model's sentence alone would be a lie by omission."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring["prefs"].add_rule(_category_rule())
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    out = graph.invoke({"limit": 10, "mode": "incremental"},
+                       {"configurable": {"thread_id": "cat-5"}})
+    reason = Decision.model_validate(out["decisions"][0]).reason
+    assert "your rule" in reason.lower()
+    assert "promotion" in reason
