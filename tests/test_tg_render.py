@@ -185,6 +185,35 @@ def test_page_two_shows_the_remainder_and_keeps_absolute_numbering():
     assert f"{HELD_PAGE_SIZE + 1}." in text
 
 
+def test_a_section_count_is_the_whole_section_not_just_this_page():
+    """A page-scoped count is the same falsehood the redesign set out to remove.
+
+    Held items are ordered by when they were first held, so a section is spread
+    across pages whenever reasons interleave in arrival order - which is the
+    normal case, not an edge one. Counting only what fits told a reader of page
+    one that five things were waiting to be trashed when eight were, and then
+    repeated the heading on page two with a different number.
+    """
+    order = ["trash", "security_alert", "trash", "trash", "trash", "trash",
+             "security_alert", "security_alert", "trash", "trash",
+             "security_alert", "security_alert", "trash"]   # 8 trash, 5 security
+    items = [held(f"t{i:02d}", reason, held_at=NOW + timedelta(seconds=i))
+             for i, reason in enumerate(order)]
+    first, _ = digest(view(items), page=0)
+    second, _ = digest(view(items), page=1)
+
+    assert "🗑 TRASH — needs your OK (5 of 8)" in first
+    assert "🔒 SECURITY (3 of 5)" in first
+    assert "🗑 TRASH — needs your OK (3 of 8)" in second
+    assert "🔒 SECURITY (2 of 5)" in second
+
+
+def test_a_section_shown_whole_reports_a_plain_count():
+    """"(2 of 2)" would be noise on the common case - one page, nothing hidden."""
+    text, _ = digest(view([held("t1", "trash"), held("t2", "trash")]))
+    assert "🗑 TRASH — needs your OK (2)" in text
+
+
 def test_an_out_of_range_page_clamps_rather_than_raising():
     """Reached from a callback. A stale one must land somewhere sane."""
     text, _ = digest(view([held("t1", "trash")]), page=99)
@@ -195,6 +224,24 @@ def test_an_empty_queue_still_renders_the_report():
     text, kb = digest(view([]))
     assert "DONE" in text
     assert "0 waiting" in text or "waiting" not in text
+
+
+def test_a_field_cut_short_says_it_was_cut_short():
+    """Subjects are capped at 70 and marketing subjects run long, so on a real
+    inbox most trash items are cut. A hard slice ends them mid-word - "Make it
+    happen sooner with 30% mo" - which reads as a corrupted message rather than
+    as a subject that continues.
+    """
+    text, _ = digest(view([held("t1", "trash", subject="Make it happen " * 20)]))
+    subject_line = [l for l in text.splitlines() if l.startswith("1. ")][0]
+    assert subject_line.endswith("…")
+    assert len(subject_line) <= len("1. ") + render_tg._SUBJECT_CAP
+
+
+def test_a_field_that_fits_is_left_alone():
+    text, _ = digest(view([held("t1", "trash", subject="Short one")]))
+    assert "1. Short one" in text
+    assert "…" not in text
 
 
 def test_never_exceeds_the_telegram_cap():

@@ -49,6 +49,13 @@ _SUBJECT_CAP = 70
 _SENDER_CAP = 60
 _REASON_CAP = 160
 
+# Room reserved per section heading when budgeting: the blank line before it,
+# plus the widest count it can carry - " (nnn of nnn)". Reserved rather than
+# measured because the count is not known until the budget has decided what
+# fits, and over-reserving costs at most one item on a page that is already at
+# the 4096 wall.
+_SECTION_HEADER_SLACK = 16
+
 # Printed when a page's items do not all fit. Reserved for up front, so the
 # note itself cannot be the thing that overflows.
 _OVERFLOW = "… %d more did not fit in one message"
@@ -138,8 +145,17 @@ def _oneline(text: str, cap: int) -> str:
     breaks the three-line grid the whole layout depends on, and .strip() only
     trims the ends. Subject and sender get the same treatment - a folded header
     can carry a newline too - so the grid is guaranteed rather than usual.
+
+    A cut field ends in an ellipsis. Marketing subjects routinely run past the
+    70-character cap, and a hard slice ends them mid-word, which reads as a
+    corrupted message rather than as a subject that continues. The ellipsis is
+    counted inside the cap, so every field stays exactly as wide as the budget
+    below was told it would be.
     """
-    return " ".join(text.split())[:cap]
+    flat = " ".join(text.split())
+    if len(flat) <= cap:
+        return flat
+    return flat[:cap - 1].rstrip() + "…"
 
 
 def _held_line(number: int, item: HeldItem, now: datetime) -> str:
@@ -224,20 +240,36 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
         cost = len(_held_line(numbers[held_item.thread_id], held_item,
                               view.run_at)) + 1
         if title not in charged:
-            cost += len(title) + 6      # " (n)" and the blank line before it
+            cost += len(title) + _SECTION_HEADER_SLACK
         if used + cost > budget:
             break
         used += cost
         charged.add(title)
         shown.append(held_item)
 
+    # Counted over the whole queue, not over `shown`. A section spans pages
+    # whenever hold reasons interleave in arrival order, which is the normal
+    # case; counting only what fits told the reader of page one that five things
+    # were waiting to be trashed when eight were, and then repeated the same
+    # heading on page two with a different number. The queue size in the header
+    # was right the whole time, which is what made the section counts read as
+    # authoritative rather than as a subtotal.
+    totals: dict[str, int] = {}
+    for h in ordered:
+        totals[h.hold_reason] = totals.get(h.hold_reason, 0) + 1
+
     lines = list(head)
     for reason, title in SECTIONS:
         section = [h for h in shown if h.hold_reason == reason]
         if not section:
             continue
+        total = totals[reason]
+        # "(2 of 2)" would be noise on the common case - one page, nothing
+        # hidden - so the plain count survives wherever it is the whole truth.
+        count = (f"{len(section)} of {total}" if len(section) != total
+                 else str(total))
         lines.append("")
-        lines.append(f"{title} ({len(section)})")
+        lines.append(f"{title} ({count})")
         for held_item in section:
             lines.append(_held_line(numbers[held_item.thread_id],
                                     held_item, view.run_at))
