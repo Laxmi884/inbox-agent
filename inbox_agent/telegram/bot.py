@@ -52,6 +52,11 @@ class Bot:
         self._message_id: Optional[int] = None
         self._page = 0
         self._digest_id = ""
+        # Whether the CURRENT message reports a run. False for a /held digest,
+        # and it has to be state rather than an argument to _show: paging that
+        # message re-renders it, and the DONE block must not reappear on page 2
+        # of a message that never claimed a run in the first place.
+        self._run_report = True
         # Counts runs actually started, so a test can assert that /held ran none.
         self._runs_started = 0
         self._last_run: Optional[dict] = None   # the graph result for the digest
@@ -111,34 +116,50 @@ class Bot:
     def _new_digest_id(self) -> str:
         return uuid.uuid4().hex[:DIGEST_ID_LEN]
 
-    def _view(self) -> DigestView:
+    def _view(self, *, run_report: bool = True) -> DigestView:
         """Assemble what the digest renders: this run's work plus the queue.
 
         The done counts come from the audit records the run wrote, not from
         graph state: the audit log is the durable record of what actually
         reached Gmail, and it is the same source the undo path will read.
+
+        `run_report=False` is /held, which ran nothing. `_last_run` still holds
+        the LAST run's result, and reporting it would stamp 08:00's counts with
+        the current clock - and again on every later /held. So /held reports no
+        run at all rather than someone else's.
         """
-        result = self._last_run or {}
+        result = self._last_run if run_report else None
         done_by_kind: dict[str, int] = {}
         rule_decided = 0
-        for record in result.get("executed", []):
-            if record.get("action") == "label" and \
-                    record.get("params", {}).get("label") == self.settings.triaged_label:
+        for record in (result or {}).get("executed", []):
+            # .get() throughout: a malformed record must not raise here. This
+            # runs AFTER the graph executed, so an exception costs the owner the
+            # digest for work that already reached Gmail - the one moment a
+            # crash is most expensive and least recoverable.
+            kind = record.get("action")
+            if not kind:
+                continue
+            if kind == "label" and (record.get("params") or {}).get(
+                    "label") == self.settings.triaged_label:
                 continue  # bookkeeping, not work the owner cares about
-            done_by_kind[record["action"]] = done_by_kind.get(record["action"], 0) + 1
+            done_by_kind[kind] = done_by_kind.get(kind, 0) + 1
             if str(record.get("actor", "")).startswith("rule:"):
                 rule_decided += 1
         return DigestView(
             run_at=datetime.now(timezone.utc),
-            total=len(result.get("thread_ids", [])),
+            total=len((result or {}).get("thread_ids", [])),
             done_by_kind=done_by_kind,
             rule_decided=rule_decided,
             held=self.held.all(),
             digest_id=self._digest_id,
+            # Dry-run actions were audited but never reached Gmail. The banner
+            # that says so is on the terminal; the digest is on the phone.
+            dry_run=bool(self.settings.dry_run),
+            run_report=run_report,
         )
 
     def _show(self, *, edit: bool) -> None:
-        text, keyboard = digest(self._view(), self._page)
+        text, keyboard = digest(self._view(run_report=self._run_report), self._page)
         if edit and self._message_id is not None:
             self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
         else:
@@ -167,10 +188,12 @@ class Bot:
             self._start(limit)
         elif command == "/held":
             # Shows the queue without running anything: the queue outlives runs,
-            # so looking at it must not require producing more work.
+            # so looking at it must not require producing more work. And with no
+            # run, no run report - see _view's run_report.
             self._page = 0
             self._message_id = None
             self._digest_id = self._new_digest_id()
+            self._run_report = False
             self._show(edit=False)
         elif command == "/status":
             self._status()
@@ -188,6 +211,7 @@ class Bot:
         self._intents = {}
         self._message_id = None
         self._digest_id = self._new_digest_id()
+        self._run_report = True
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
@@ -203,9 +227,14 @@ class Bot:
             # Silence is indistinguishable from an empty inbox, which is a
             # failure the owner would trust for days without noticing. Say so.
             log.exception("triage failed")
+            # NOT "nothing was executed" - the same falsehood /cancel used to
+            # tell. The run can raise anywhere, including after auto_execute
+            # has already pushed actions through the chokepoint, so the honest
+            # claim is that it did not finish. /held shows what survived.
             self.transport.send_message(
                 self.chat_id, f"Triage failed: {type(exc).__name__}. "
-                              f"Nothing was executed. /triage to retry.")
+                              f"The run did not finish; some actions may already "
+                              f"have run. /held to see the queue, /triage to retry.")
             return
         elapsed = time.monotonic() - started
         log.info("triage done in %.1fs: %s executed, %s held", elapsed,
@@ -238,7 +267,13 @@ class Bot:
         # buttons it drew, or a stale tap re-renders a run that was abandoned.
         self._digest_id = ""
         log.info("run cancelled; moved to run=%s", self._run)
-        self.transport.send_message(self.chat_id, "Cancelled. Nothing was executed.")
+        # NOT "nothing was executed": /triage is incremental now and has already
+        # acted by the time this can be typed. Saying otherwise would tell the
+        # owner their mail is untouched when the agent has archived half of it.
+        # What cancelling actually does is retire the buttons, so that is what
+        # it says. /cancel's real subject - abandoning a parked run - is Plan 3.
+        self.transport.send_message(
+            self.chat_id, "Cancelled. Buttons on the last digest are no longer active.")
 
     def _on_callback(self, query: dict) -> None:
         intent = decode(query.get("data", ""))
@@ -269,9 +304,28 @@ class Bot:
             return
 
     # --- the interrupt path -------------------------------------------------
-    # Unreached from /triage, which no longer parks. Kept whole for Plan 3's
-    # /backlog sweep - the one job that genuinely has to be previewed before it
-    # commits - and covered meanwhile at the graph level in tests/test_graph.py.
+    #
+    # WARNING TO WHOEVER WIRES /backlog: _resume IS NOT READY TO BE CALLED.
+    #
+    # It is unreached today - /triage no longer parks - and it is not intact.
+    # The half that collected verdicts went with the interrupt UI: the
+    # approve/reject/label callback branch that wrote into `self._intents` was
+    # deleted, because no digest button emits those kinds any more. `_intents`
+    # now has three writers, every one of them `= {}`, and a single reader here.
+    #
+    # to_response() defaults every thread the intents do not name to "approve".
+    # So calling _resume as it stands resumes with an empty mapping, which is a
+    # blanket approval of the entire parked batch with no route to reject a
+    # single item - on /backlog, a 500-thread historical sweep, which is the
+    # precise outcome previewing that sweep exists to prevent.
+    #
+    # Plan 3 must rebuild verdict collection (a detail view, its buttons, and
+    # the callback branch that records them) BEFORE connecting anything to this.
+    # Restoring the deleted branch now would be untriggerable code pinned by a
+    # synthetic test, against a contract Plan 3 is going to redesign anyway.
+    #
+    # Execution of a resume payload is covered meanwhile at the graph level in
+    # tests/test_graph.py; nothing covers this method.
 
     def _resume(self, request: ReviewRequest) -> None:
         response = to_response(request, self._intents, self.categories)

@@ -43,7 +43,15 @@ SECTIONS: tuple[tuple[str, str], ...] = (
 ATTENTION_REASONS = frozenset({"needs_reply", "security_alert"})
 
 _SUBJECT_CAP = 70
+# Capped like the others. Uncapped it was the one unbounded field in the message
+# and the only route to the 4096-char wall, where the budget below would start
+# dropping items off the bottom of a page that has room for them.
+_SENDER_CAP = 60
 _REASON_CAP = 160
+
+# Printed when a page's items do not all fit. Reserved for up front, so the
+# note itself cannot be the thing that overflows.
+_OVERFLOW = "… %d more did not fit in one message"
 
 
 @dataclass
@@ -61,6 +69,17 @@ class DigestView:
     rule_decided: int
     held: list[HeldItem] = field(default_factory=list)
     digest_id: str = ""
+    # Under dry-run the actions were audited but never reached Gmail. The old
+    # digest listed proposals, so it could not mislead; this one reports work as
+    # DONE, and the startup banner that says dry_run is on does not reach the
+    # phone. "Done" for something that did not happen is the single most
+    # expensive thing this message could get wrong.
+    dry_run: bool = False
+    # False for /held, which shows the queue without having run anything. With
+    # it true the previous run's counts get stamped with the current clock -
+    # "16:00 · 22 threads · DONE (18)" for work done at 08:00, again on every
+    # later /held. A report of a run that did not happen.
+    run_report: bool = True
 
 
 def rule_decided_count(request: ReviewRequest) -> int:
@@ -112,6 +131,17 @@ def _age(item: HeldItem, now: datetime) -> str:
     return f" · waiting since {held_at.astimezone().strftime('%a %H:%M')}"
 
 
+def _oneline(text: str, cap: int) -> str:
+    """Collapse to a single line, then cap.
+
+    `reason` is model-generated and models routinely emit newlines; a single one
+    breaks the three-line grid the whole layout depends on, and .strip() only
+    trims the ends. Subject and sender get the same treatment - a folded header
+    can carry a newline too - so the grid is guaranteed rather than usual.
+    """
+    return " ".join(text.split())[:cap]
+
+
 def _held_line(number: int, item: HeldItem, now: datetime) -> str:
     """Three lines: what it is, who sent it, and why the agent wants this.
 
@@ -122,9 +152,9 @@ def _held_line(number: int, item: HeldItem, now: datetime) -> str:
     """
     conf = (f" · {item.item.confidence:.2f}"
             if item.item.confidence < LOW_CONFIDENCE else "")
-    why = (item.item.reason or NO_REASON).strip()[:_REASON_CAP]
-    return (f"{number}. {item.item.subject[:_SUBJECT_CAP]}\n"
-            f"{item.item.sender}{conf}{_age(item, now)}\n"
+    why = _oneline(item.item.reason or NO_REASON, _REASON_CAP) or NO_REASON
+    return (f"{number}. {_oneline(item.item.subject, _SUBJECT_CAP)}\n"
+            f"{_oneline(item.item.sender, _SENDER_CAP)}{conf}{_age(item, now)}\n"
             f"{why}")
 
 
@@ -146,18 +176,64 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     # on page 2, so a number the owner reads means the same thing on every page.
     numbers = {h.thread_id: n for n, h in enumerate(ordered, start=1)}
 
-    stat = " · ".join(f"{count} {kind}"
-                      for kind, count in sorted(view.done_by_kind.items())
-                      if count)
-    lines = [f"Inbox · {view.run_at.astimezone().strftime('%H:%M')} · "
-             f"{view.total} threads"]
-    lines.append(f"{stat} · {len(ordered)} waiting" if stat
-                 else f"{len(ordered)} waiting")
+    clock = view.run_at.astimezone().strftime("%H:%M")
+    if view.run_report:
+        stat = " · ".join(f"{count} {kind}"
+                          for kind, count in sorted(view.done_by_kind.items())
+                          if count)
+        head = [f"Inbox · {clock} · {view.total} threads",
+                f"{stat} · {len(ordered)} waiting" if stat
+                else f"{len(ordered)} waiting"]
+    else:
+        # /held. No run happened, so there is no run to report - not even a
+        # thread count, which would be a count of nothing dressed as a result.
+        head = [f"Held · {clock}", f"{len(ordered)} waiting"]
     if pages > 1:
-        lines[0] += f"  (page {page + 1}/{pages})"
+        head[0] += f"  (page {page + 1}/{pages})"
 
+    done_total = sum(view.done_by_kind.values())
+    tail: list[str] = []
+    if view.run_report:
+        # Never the word "done" for something that did not reach Gmail.
+        done_title = "✓ WOULD HAVE DONE" if view.dry_run else "✓ DONE"
+        tail = ["", f"{done_title} ({done_total})"]
+        if view.rule_decided:
+            # Make the learning visible. As rules accumulate this climbs and the
+            # sections above shrink. Suppressed at zero: "0 came from rules you
+            # taught me" reads as a failure rather than as a not-yet.
+            tail.append(f"{view.rule_decided} came from rules you taught me")
+
+    # Lay the window out in section order before budgeting, so what falls off
+    # the cap is whole items from the end rather than half of one.
+    laid_out = [(title, h) for reason, title in SECTIONS
+                for h in window if h.hold_reason == reason]
+
+    # Budget the item blocks instead of slicing the finished message. The DONE
+    # block is appended last, so a slice at the cap would drop the entire report
+    # while leaving its "Show the N done" button on the keyboard; and a slice
+    # lands mid-line, leaving half an item on screen under a numbered button
+    # that still claims to open it. Dropping whole items keeps the text and the
+    # keyboard describing the same list, which is what every callback index
+    # assumes. With every field capped this is unreachable in practice - it is
+    # the guarantee, not the common path.
+    budget = TG_MAX_TEXT - len("\n".join(head + tail)) - len(_OVERFLOW % 999) - 2
+    used = 0
+    shown: list[HeldItem] = []
+    charged: set[str] = set()
+    for title, held_item in laid_out:
+        cost = len(_held_line(numbers[held_item.thread_id], held_item,
+                              view.run_at)) + 1
+        if title not in charged:
+            cost += len(title) + 6      # " (n)" and the blank line before it
+        if used + cost > budget:
+            break
+        used += cost
+        charged.add(title)
+        shown.append(held_item)
+
+    lines = list(head)
     for reason, title in SECTIONS:
-        section = [h for h in window if h.hold_reason == reason]
+        section = [h for h in shown if h.hold_reason == reason]
         if not section:
             continue
         lines.append("")
@@ -165,21 +241,21 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
         for held_item in section:
             lines.append(_held_line(numbers[held_item.thread_id],
                                     held_item, view.run_at))
+    if len(shown) < len(window):
+        lines.append("")
+        lines.append(_OVERFLOW % (len(window) - len(shown)))
+    lines += tail
 
-    done_total = sum(view.done_by_kind.values())
-    lines.append("")
-    lines.append(f"✓ DONE ({done_total})")
-    if view.rule_decided:
-        # Make the learning visible. As rules accumulate this climbs and the
-        # sections above shrink. Suppressed at zero: "0 came from rules you
-        # taught me" reads as a failure rather than as a not-yet.
-        lines.append(f"{view.rule_decided} came from rules you taught me")
-
+    # Belt and braces on a hard protocol limit. The budget above should already
+    # have kept this under; a message Telegram rejects outright is worse than a
+    # message with one truncated line.
     text = "\n".join(lines)[:TG_MAX_TEXT]
 
+    # Built from `shown`, never `window`: a button for an item the text does not
+    # show is a button whose number the owner cannot read.
     keyboard: list[list[tuple[str, str]]] = []
     row: list[tuple[str, str]] = []
-    for held_item in window:
+    for held_item in shown:
         row.append((str(numbers[held_item.thread_id]),
                     encode("open", numbers[held_item.thread_id] - 1,
                            digest_id=view.digest_id)))
@@ -189,7 +265,7 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     if row:
         keyboard.append(row)
 
-    if done_total:
+    if view.run_report and done_total:
         keyboard.append([(f"📋 Show the {done_total} done",
                           encode("done", digest_id=view.digest_id))])
 

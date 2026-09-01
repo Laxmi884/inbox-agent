@@ -166,14 +166,56 @@ def test_the_digest_shows_what_the_run_held(bot):
 def test_the_done_counts_leave_out_the_triaged_label(bot):
     """The triaged label is bookkeeping, not work the owner cares about.
 
-    Every processed thread gets one, so leaving it in would make the report say
-    the agent did twice as much as it did.
+    Driven against _view() directly rather than through a run. mark_triaged
+    currently writes its records to the audit log without surfacing them into
+    state's `executed`, so an end-to-end version of this test passes just as
+    happily with the filter deleted - it pins nothing. A real label the owner
+    asked for is in here too, so the filter cannot be "drop all labels".
     """
     b, t, _ = bot
+    b._last_run = {
+        "thread_ids": ["t0", "t1", "t2"],
+        "executed": [
+            {"action": "archive", "params": {}, "actor": "agent"},
+            {"action": "label", "params": {"label": "work"}, "actor": "agent"},
+            {"action": "label", "params": {"label": b.settings.triaged_label},
+             "actor": "agent"},
+            {"action": "label", "params": {"label": b.settings.triaged_label},
+             "actor": "rule:r-1"},
+        ],
+    }
+    view = b._view()
+    assert view.done_by_kind == {"archive": 1, "label": 1}, view.done_by_kind
+    assert view.total == 3
+    # The rule-decided count must not credit the bookkeeping record either.
+    assert view.rule_decided == 0
+
+
+def test_a_rule_decided_action_is_counted_as_learning(bot):
+    b, t, _ = bot
+    b._last_run = {"thread_ids": ["t0"], "executed": [
+        {"action": "archive", "params": {}, "actor": "rule:r-1"},
+        {"action": "archive", "params": {}, "actor": "agent"}]}
+    assert b._view().rule_decided == 1
+
+
+def test_a_malformed_audit_record_does_not_take_the_digest_down(bot):
+    """This runs AFTER the graph executed. A crash here costs the owner the
+    report for work that already reached Gmail."""
+    b, t, _ = bot
+    b._last_run = {"thread_ids": ["t0"], "executed": [
+        {"actor": "agent"},                        # no action
+        {"action": "label", "params": None, "actor": "agent"},   # null params
+        {"action": "archive"}]}                    # no params, no actor
+    assert b._view().done_by_kind == {"label": 1, "archive": 1}
+
+
+def test_a_dry_run_digest_does_not_claim_the_work_was_done(bot):
+    """The fixture is dry_run=True, which is how this project dogfoods next."""
+    b, t, _ = bot
+    assert b.settings.dry_run
     b.handle_update(msg("/triage 4"))
-    counts = b._view().done_by_kind
-    assert counts == {"archive": 4}, counts
-    assert "label" not in counts
+    assert "WOULD HAVE DONE" in t.sent[-1]["text"]
 
 
 def test_a_failing_triage_says_so_rather_than_going_quiet(bot, monkeypatch):
@@ -189,7 +231,12 @@ def test_a_failing_triage_says_so_rather_than_going_quiet(bot, monkeypatch):
 
     monkeypatch.setattr(b.graph, "invoke", boom)
     b.handle_update(msg("/triage 4"))
-    assert "failed" in t.sent[-1]["text"].lower()
+    text = t.sent[-1]["text"]
+    assert "failed" in text.lower()
+    assert "RuntimeError" in text, "the owner cannot act on an unnamed failure"
+    # The run can raise after auto_execute already acted, so it must not claim
+    # a clean slate any more than /cancel may.
+    assert "nothing was executed" not in text.lower()
 
 
 # --- commands ---------------------------------------------------------------
@@ -201,6 +248,32 @@ def test_held_command_shows_the_queue_without_running_a_triage(bot):
     b.handle_update(msg("/held"))
     assert len(t.sent) == before + 1
     assert b._runs_started == 0
+
+
+def test_held_does_not_re_report_the_previous_runs_work(bot):
+    """_last_run survives, so a naive /held stamps 08:00's counts with the
+    current clock - and does it again on every later /held."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert "DONE" in t.sent[-1]["text"], "the run digest should report the run"
+
+    b.handle_update(msg("/held"))
+    text = t.sent[-1]["text"]
+    assert "DONE" not in text, "/held re-reported a run it did not perform"
+    assert "threads" not in text
+    assert "taught" not in text
+    labels = [l for row in (t.sent[-1]["keyboard"] or []) for (l, _) in row]
+    assert not any("done" in l.lower() for l in labels)
+
+
+def test_paging_a_held_digest_does_not_bring_the_run_report_back(bot):
+    """_run_report has to be state: paging re-renders the same message."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/held"))
+    b.handle_update(cb(encode("next", digest_id=b._digest_id)))
+    assert t.edited, "paging did not re-render"
+    assert "DONE" not in t.edited[-1]["text"]
 
 
 def test_held_is_offered_in_the_help_text(bot):
@@ -228,6 +301,17 @@ def test_cancel_invalidates_the_current_digest(bot):
     before = len(t.edited)
     b.handle_update(cb(stale))
     assert len(t.edited) == before, "a cancelled digest still accepted a tap"
+
+
+def test_cancel_does_not_claim_nothing_was_executed(bot):
+    """/triage is incremental: by the time /cancel can be typed the agent has
+    already acted. Telling the owner their mail is untouched would be false."""
+    b, t, log = bot
+    b.handle_update(msg("/triage 4"))
+    assert log.records(), "the run should have executed before /cancel"
+    b.handle_update(msg("/cancel"))
+    assert "nothing was executed" not in t.sent[-1]["text"].lower()
+    assert "cancelled" in t.sent[-1]["text"].lower()
 
 
 # --- callbacks --------------------------------------------------------------
@@ -259,10 +343,14 @@ def test_a_callback_carrying_no_digest_id_at_all_is_ignored(bot):
 def test_hostile_callback_data_is_answered_and_ignored(bot):
     b, t, log = bot
     b.handle_update(msg("/triage 4"))
-    before = len(log.records())
-    for junk in ("", "zzz", "a:-1", "../../x", "l:1"):
-        b.handle_update(cb(junk))
+    before, answered = len(log.records()), len(t.answered)
+    junk = ("", "zzz", "a:-1", "../../x", "l:1")
+    for data in junk:
+        b.handle_update(cb(data))
     assert len(log.records()) == before, "junk callback data reached Gmail"
+    # ANSWERED, not just ignored. Telegram spins the button until the query is
+    # answered, so silently dropping one leaves the owner staring at a spinner.
+    assert len(t.answered) == answered + len(junk)
 
 
 def test_a_forged_index_from_the_digest_executes_nothing(bot):

@@ -7,6 +7,7 @@ interrupt path uses, and Plan 3's /backlog is what brings it back into the bot.
 from datetime import datetime, timedelta, timezone
 
 from inbox_agent.models import Action, HeldItem, ReviewItem, ReviewRequest
+from inbox_agent.telegram import render_tg
 from inbox_agent.telegram.callbacks import decode
 from inbox_agent.telegram.render_tg import (
     DigestView, HELD_PAGE_SIZE, TG_MAX_TEXT, digest, header, paged,
@@ -30,21 +31,24 @@ def request(n=5, n_rule=0):
     return ReviewRequest(run_id="run1", policy_version="local:test", items=items)
 
 
-def held(tid, reason, *, conf=0.9, subject=None, held_at=NOW, reason_text="because"):
+def held(tid, reason, *, conf=0.9, subject=None, held_at=NOW, reason_text="because",
+         sender=None):
     return HeldItem(
         thread_id=tid, run_id="r1", first_held_at=held_at, hold_reason=reason,
         item=ReviewItem(
             thread_id=tid, category="promotion", subject=subject or f"Subject {tid}",
-            sender=f"{tid}@example.com", snippet="s",
+            sender=sender or f"{tid}@example.com", snippet="s",
             proposed=[Action(kind="trash", thread_id=tid)],
             reason=reason_text, confidence=conf, source="model"))
 
 
-def view(held_items=(), *, total=22, done=None, rule_decided=12):
+def view(held_items=(), *, total=22, done=None, rule_decided=12,
+         dry_run=False, run_report=True):
     return DigestView(
         run_at=NOW, total=total,
         done_by_kind=done if done is not None else {"archive": 9, "label": 6, "draft": 3},
-        rule_decided=rule_decided, held=list(held_items), digest_id="7f2a")
+        rule_decided=rule_decided, held=list(held_items), digest_id="7f2a",
+        dry_run=dry_run, run_report=run_report)
 
 
 # --- the learning-visibility header -----------------------------------------
@@ -194,10 +198,80 @@ def test_an_empty_queue_still_renders_the_report():
 
 
 def test_never_exceeds_the_telegram_cap():
-    items = [held(f"t{i:02d}", "trash", subject="x" * 200, reason_text="y" * 400)
+    items = [held(f"t{i:02d}", "trash", subject="x" * 200, reason_text="y" * 400,
+                  sender="s" * 300 + "@example.com")
              for i in range(HELD_PAGE_SIZE)]
-    text, _ = digest(view(items))
+    text, kb = digest(view(items))
     assert len(text) <= TG_MAX_TEXT
+    # Every field is capped, so a full page of maximal items still fits and
+    # nothing is dropped. The keyboard must therefore offer all eight.
+    numbers = [label for row in kb for (label, _) in row if label.isdigit()]
+    assert numbers == [str(i) for i in range(1, HELD_PAGE_SIZE + 1)]
+
+
+def test_a_truncated_digest_keeps_its_keyboard_honest(monkeypatch):
+    """The cap is unreachable now that every field is capped, so this lowers it.
+
+    What is being pinned is the invariant, not the arithmetic: text and keyboard
+    must describe the same list. A slice at the cap broke both halves of that -
+    it dropped the DONE block while leaving its button, and cut an item in half
+    while leaving the numbered button that claims to open it.
+    """
+    monkeypatch.setattr(render_tg, "TG_MAX_TEXT", 600)
+    items = [held(f"t{i:02d}", "trash", reason_text="y" * 150)
+             for i in range(HELD_PAGE_SIZE)]
+    text, kb = digest(view(items))
+
+    assert len(text) <= 600
+    assert text.endswith("came from rules you taught me"), \
+        "the run report was truncated away"
+    assert "DONE" in text
+    assert "did not fit" in text, "items vanished with nothing saying so"
+    assert not text.endswith(" "), "truncated mid-line"
+
+    shown = {label for row in kb for (label, _) in row if label.isdigit()}
+    for n in range(1, HELD_PAGE_SIZE + 1):
+        in_text = f"\n{n}. " in text
+        assert (str(n) in shown) == in_text, \
+            f"item {n}: button={str(n) in shown} but shown in text={in_text}"
+
+
+def test_a_dry_run_never_claims_the_work_was_done():
+    """Under INBOX_DRY_RUN nothing reached Gmail. The startup banner that says
+    so is on a terminal; this message is on a phone."""
+    text, _ = digest(view([held("t1", "trash")], dry_run=True))
+    assert "✓ WOULD HAVE DONE (18)" in text
+    assert "✓ DONE" not in text
+
+
+def test_a_live_run_says_done_plainly():
+    text, _ = digest(view([held("t1", "trash")], dry_run=False))
+    assert "✓ DONE (18)" in text
+    assert "WOULD HAVE" not in text
+
+
+def test_a_queue_only_view_reports_no_run_at_all():
+    """/held ran nothing, so there is no run to report - and the last run's
+    counts under the current clock would be a report of a run that did not
+    happen."""
+    text, kb = digest(view([held("t1", "trash")], run_report=False))
+    assert "DONE" not in text
+    assert "threads" not in text
+    assert "taught" not in text
+    assert "1 waiting" in text
+    labels = [label for row in kb for (label, _) in row]
+    assert not any("done" in l.lower() for l in labels)
+
+
+def test_a_newline_in_a_model_written_reason_cannot_break_the_grid():
+    """`reason` comes from an LLM and models routinely emit newlines. One of
+    them turns the three-line block into four and shifts everything below."""
+    text, _ = digest(view([held("t1", "trash", subject="A\nB",
+                                sender="a\nb@example.com",
+                                reason_text="line one\n\nline two")]))
+    # Everything after the section header, up to the blank line before DONE.
+    block = text.split("TRASH")[1].split("\n\n")[0].split("\n")[1:]
+    assert block == ["1. A B", "a b@example.com", "line one line two"], block
 
 
 def test_the_digest_carries_its_id_into_every_callback():
@@ -251,9 +325,17 @@ def test_paged_hides_prev_on_first_and_next_on_last():
 
 
 def test_every_rendered_callback_is_within_the_byte_cap():
-    big_digest = digest(view([held(f"t{i:03d}", "needs_reply")
-                              for i in range(60)]))
-    for _, kb in (big_digest, paged(request(60), 30, categories=["a"] * 10)):
+    """The LAST page matters, not the first: page 0 only ever encodes indices
+    0-7, so measuring it alone never sees a multi-digit index at all."""
+    items = [held(f"t{i:03d}", "needs_reply") for i in range(60)]
+    last_page = (len(items) - 1) // HELD_PAGE_SIZE
+    first, last = digest(view(items), 0), digest(view(items), last_page)
+
+    widest = max(len(label) for row in last[1] for (label, _) in row
+                 if label.isdigit())
+    assert widest == 2, "the last page did not encode a multi-digit index"
+
+    for _, kb in (first, last, paged(request(60), 30, categories=["a"] * 10)):
         for row in kb:
             for _, data in row:
                 assert len(data.encode()) <= 64, data
