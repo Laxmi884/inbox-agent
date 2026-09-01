@@ -25,7 +25,8 @@ from .audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_act
 from .classify import classify_batch
 from .config import Settings
 from .models import (
-    Action, ActionKind, Decision, ReviewItem, ReviewRequest, ReviewResponse, Thread,
+    Action, ActionKind, ActionTemplate, Decision, ReviewItem, ReviewRequest,
+    ReviewResponse, Thread,
 )
 from .partition import partition
 from .policy import Policy
@@ -128,7 +129,12 @@ def learn_from_response(
         # next time. Intended: do not "fix" this into skipping reject+edits.
         note = (f"owner rejected {rejected} on thread {thread_id}" if rejected
                 else f"corrected proposal on thread {thread_id}: owner chose {kind}")
-        rule = rule_from_correction(by_id[thread_id], kind, note,
+        # params travel with the kind now. An edit that said label(receipt)
+        # used to teach a rule that said "label" and nothing else, which is the
+        # rule shape that raised KeyError against a live mailbox.
+        params = dict(edits[0].params) if edits else {}
+        rule = rule_from_correction(by_id[thread_id],
+                                    [ActionTemplate(kind=kind, params=params)], note,
                                     rejected=rejected, corpus=threads)
         prefs.add_rule(rule)
         learned.append(rule.id)

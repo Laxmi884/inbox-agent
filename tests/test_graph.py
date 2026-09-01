@@ -8,7 +8,7 @@ from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.classify import ThreadJudgment
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph, learn_from_response
-from inbox_agent.models import Action, ReviewResponse, Thread
+from inbox_agent.models import ActionTemplate, Action, ReviewResponse, Thread
 from inbox_agent.policy import Policy
 from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 
@@ -126,7 +126,7 @@ def test_rejection_becomes_a_learned_rule(wiring):
         config)
     rules = wiring["prefs"].rules()
     assert len(rules) == 1
-    assert rules[0].action == "label"
+    assert [a.kind for a in rules[0].actions] == ["label"]
     assert "t1" in rules[0].provenance
 
 
@@ -140,7 +140,7 @@ def test_learn_from_response_records_provenance():
                        edits={"t1": [Action(kind="archive", thread_id="t1")]},
                        instructions=[]),
         threads, prefs)
-    assert prefs.rules()[0].action == "archive"
+    assert [a.kind for a in prefs.rules()[0].actions] == ["archive"]
     assert "corrected" in prefs.rules()[0].provenance
 
 
@@ -150,7 +150,7 @@ def test_rule_matched_threads_skip_the_model(wiring):
     from inbox_agent.store import rule_from_correction
 
     thread = wiring["client"].get_thread("t1")
-    wiring["prefs"].add_rule(rule_from_correction(thread, "trash", "owner said delete"))
+    wiring["prefs"].add_rule(rule_from_correction(thread, [ActionTemplate(kind="trash")], "owner said delete"))
 
     class ExplodingLLM:
         def with_structured_output(self, schema): return self
@@ -204,7 +204,7 @@ def test_forbidden_action_is_visible_in_state(wiring):
 
     Uses a caller-configured forbidden kind ("archive") rather than an
     ALWAYS_FORBIDDEN one ("send_message"/"delete_forever"): those aren't valid
-    Rule.action literals, and routing one through the edit path would also hit
+    Rule action literals, and routing one through the edit path would also hit
     learn_from_response's rule-creation step - a separate, pre-existing gap
     (rule_from_correction assumes edits[0].kind is a valid ActionKind) that is
     out of scope for this fix round and is called out in the report instead.
@@ -407,7 +407,7 @@ def test_a_bare_reject_now_teaches_a_rule(wiring):
     assert final["learned"], "a bare reject taught nothing"
     rule = wiring["prefs"].rules()[0]
     assert rule.rejected_action == "archive", "did not record WHAT was rejected"
-    assert rule.action == "none"
+    assert [a.kind for a in rule.actions] == ["none"]
 
 
 # --- the autonomy split ------------------------------------------------------

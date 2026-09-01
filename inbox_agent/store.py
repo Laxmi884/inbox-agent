@@ -18,7 +18,7 @@ from typing import Optional
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.sqlite import SqliteStore
 
-from .models import ActionKind, HeldItem, ReviewItem, Rule, Thread
+from .models import ActionKind, ActionTemplate, HeldItem, ReviewItem, Rule, Thread
 
 RULES_NS = ("prefs", "rules")
 INSTRUCTIONS_NS = ("prefs", "instructions")
@@ -167,10 +167,15 @@ def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None
     return "sender", "unknown"
 
 
-def rule_from_correction(thread: Thread, action: ActionKind, note: str,
+def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: str,
                          *, rejected: Optional[ActionKind] = None,
                          corpus: Optional[list[Thread]] = None) -> Rule:
     """Turn one human correction into a durable, attributable rule.
+
+    `actions` is the sequence to take next time, not a single kind: the
+    correction the owner most wants to teach - "label it, but leave it in the
+    inbox" - is a statement about a sequence, and a single kind could not even
+    say which label to apply.
 
     `rejected` records a bare "not this" - a reject with no replacement. The
     spec counts every reject OR edit as a candidate rule; only edits used to
@@ -181,7 +186,7 @@ def rule_from_correction(thread: Thread, action: ActionKind, note: str,
         id=f"r-{uuid.uuid4().hex[:8]}",
         scope=scope,
         pattern=pattern,
-        action=action,
+        actions=list(actions),
         rejected_action=rejected,
         provenance=note,
         created_at=datetime.now(timezone.utc),
@@ -205,7 +210,7 @@ class PreferenceStore:
         self._store.put(
             RULES_NS, rule.id,
             {"rule": rule.model_dump(mode="json"),
-             "text": f"{rule.scope} {rule.pattern} -> {rule.action}. {rule.provenance}"},
+             "text": f"{rule.scope} {rule.pattern} -> {rule.summary}. {rule.provenance}"},
         )
 
     def _get(self, rule_id: str) -> Optional[Rule]:
@@ -289,7 +294,7 @@ class PreferenceStore:
 
     def as_table(self) -> list[dict]:
         return [
-            {"id": r.id, "scope": r.scope, "pattern": r.pattern, "action": r.action,
+            {"id": r.id, "scope": r.scope, "pattern": r.pattern, "action": r.summary,
              "hit_count": r.hit_count, "overrides": r.override_count,
              "precision": ("-" if r.precision is None else f"{r.precision:.2f}"),
              "overridden": r.overridden,

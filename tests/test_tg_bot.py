@@ -18,7 +18,7 @@ from inbox_agent.classify import ThreadJudgment
 from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph
-from inbox_agent.models import Action, ReviewItem
+from inbox_agent.models import ActionTemplate, Action, ReviewItem
 from inbox_agent.policy import Policy
 from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 from inbox_agent.telegram.bot import Bot

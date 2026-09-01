@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from inbox_agent.models import Action, ReviewItem, Thread
+from inbox_agent.models import ActionTemplate, Action, ReviewItem, Thread
 from inbox_agent.store import (
     HeldQueue, PreferenceStore, open_store, rule_from_correction,
 )
@@ -85,7 +85,7 @@ def test_learned_rules_and_instructions_survive_a_restart(db):
     process ended."""
     store = open_store(db)
     prefs = PreferenceStore(store)
-    prefs.add_rule(rule_from_correction(thread(), "archive", "user archived it"))
+    prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "user archived it"))
     prefs.add_instruction("never trash mail from my accountant")
     store.conn.close()
 
@@ -101,7 +101,7 @@ def test_a_rules_hit_count_survives_a_restart(db):
     often than a rule fires four times."""
     store = open_store(db)
     prefs = PreferenceStore(store)
-    rule = prefs.add_rule(rule_from_correction(thread(), "archive", "because"))
+    rule = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "because"))
     for _ in range(3):
         prefs.record_hit(rule.id)
     prefs.record_override(rule.id)

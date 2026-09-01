@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from inbox_agent.models import Rule, Thread
+from inbox_agent.models import ActionTemplate, Rule, Thread
 from inbox_agent.store import (
     PreferenceStore, build_store, choose_scope, rule_from_correction,
 )
@@ -62,7 +62,7 @@ def test_choose_scope_never_returns_an_empty_pattern():
 
 
 def test_rule_from_correction_uses_the_chosen_scope():
-    r = rule_from_correction(thread(), "archive", "corrected")
+    r = rule_from_correction(thread(), [ActionTemplate(kind="archive")], "corrected")
     assert r.scope in ("sender", "domain", "fingerprint", "subject")
     assert r.pattern
 
@@ -73,26 +73,26 @@ def test_a_reject_records_that_the_action_was_wrong():
     """The spec says every reject or edit becomes a candidate rule. A reject
     with no edit says 'not this' - which is real signal even without a
     replacement."""
-    r = rule_from_correction(thread(), "none", "owner rejected archive",
+    r = rule_from_correction(thread(), [ActionTemplate(kind="none")], "owner rejected archive",
                              rejected="archive")
     assert r.rejected_action == "archive"
-    assert r.action == "none"
+    assert [a.kind for a in r.actions] == ["none"]
 
 
 def test_a_rejected_rule_does_not_propose_the_rejected_action():
     prefs = PreferenceStore(build_store())
-    prefs.add_rule(rule_from_correction(thread(), "none", "rejected",
+    prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="none")], "rejected",
                                         rejected="archive"))
     matches = prefs.matching(thread())
     assert matches
-    assert all(m.action != "archive" for m in matches)
+    assert all("archive" not in [a.kind for a in m.actions] for m in matches)
 
 
 # --- precision --------------------------------------------------------------
 
 def test_a_rule_tracks_how_often_it_was_overridden():
     prefs = PreferenceStore(build_store())
-    r = prefs.add_rule(rule_from_correction(thread(), "archive", "learned"))
+    r = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "learned"))
     for _ in range(3):
         prefs.record_hit(r.id)
     prefs.record_override(r.id)
@@ -103,7 +103,7 @@ def test_a_rule_tracks_how_often_it_was_overridden():
 
 def test_precision_is_reported():
     prefs = PreferenceStore(build_store())
-    r = prefs.add_rule(rule_from_correction(thread(), "archive", "learned"))
+    r = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "learned"))
     for _ in range(8):
         prefs.record_hit(r.id)
     for _ in range(2):
@@ -116,7 +116,7 @@ def test_a_rule_with_no_hits_has_no_precision_rather_than_a_fake_one():
     """0 hits is unknown, not perfect. Reporting 1.0 would rank an untested
     rule above a proven one."""
     prefs = PreferenceStore(build_store())
-    r = prefs.add_rule(rule_from_correction(thread(), "archive", "learned"))
+    r = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "learned"))
     stored = [x for x in prefs.rules() if x.id == r.id][0]
     assert stored.precision is None
 
@@ -125,7 +125,7 @@ def test_a_rule_that_is_overridden_enough_stops_matching():
     """A rule that keeps being undone is worse than no rule: it produces
     confident, citable, wrong decisions."""
     prefs = PreferenceStore(build_store())
-    r = prefs.add_rule(rule_from_correction(thread(), "archive", "learned"))
+    r = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "learned"))
     for _ in range(4):
         prefs.record_hit(r.id)
     assert prefs.matching(thread()), "should still match while it is working"
@@ -138,7 +138,7 @@ def test_a_demoted_rule_is_kept_not_deleted():
     """Same reasoning as mark_overridden: a rule the owner overruled is part of
     the record of why past actions happened."""
     prefs = PreferenceStore(build_store())
-    r = prefs.add_rule(rule_from_correction(thread(), "archive", "learned"))
+    r = prefs.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "learned"))
     for _ in range(6):
         prefs.record_hit(r.id)
         prefs.record_override(r.id)
