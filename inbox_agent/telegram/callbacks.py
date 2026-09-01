@@ -24,8 +24,16 @@ from ..models import Action, ReviewRequest, ReviewResponse
 # Telegram hard-caps callback_data at 64 bytes. This is protocol, not policy.
 CB_MAX_BYTES = 64
 
+# Four hex characters, minted per digest. Positions used to resolve against a
+# parked checkpoint, so an index always named the list the human was shown. With
+# a queue that outlives runs, positions shift between digests and a tap on
+# yesterday's message would land on today's item 3. The id makes the message
+# itself identify which list it belongs to.
+DIGEST_ID_LEN = 4
+_HEX = set("0123456789abcdef")
+
 Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all",
-               "open", "list", "noop"]
+               "open", "list", "done", "approve_attention", "noop"]
 
 _CODE_TO_KIND: dict[str, Kind] = {
     "a": "approve", "r": "reject", "l": "label",
@@ -35,6 +43,8 @@ _CODE_TO_KIND: dict[str, Kind] = {
     "o": "open",
     # Back to the digest from a single item.
     "L": "list",
+    # Opening the run's audit records, and the attention-tier one-tap approve.
+    "D": "done", "T": "approve_attention",
 }
 _KIND_TO_CODE = {v: k for k, v in _CODE_TO_KIND.items()}
 
@@ -49,17 +59,38 @@ class Intent:
     kind: Kind
     index: Optional[int] = None
     label_index: Optional[int] = None
+    digest_id: str = ""
 
 
 def encode(kind: Kind, index: Optional[int] = None,
-           label_index: Optional[int] = None) -> str:
-    code = _KIND_TO_CODE[kind]
-    parts = [code]
+           label_index: Optional[int] = None, *, digest_id: str = "") -> str:
+    parts = [_KIND_TO_CODE[kind]]
     if index is not None:
         parts.append(str(index))
     if label_index is not None:
         parts.append(str(label_index))
+    if digest_id:
+        parts.append(digest_id)
     return ":".join(parts)
+
+
+def _is_digest_id(raw: str) -> bool:
+    """A digest id is exactly DIGEST_ID_LEN lowercase hex characters.
+
+    Length plus alphabet is what keeps it distinguishable from an index: an
+    index is short and decimal, so "7f2a" can never be one. Bounded for the same
+    reason _MAX_PARSED_INDEX is - refuse absurd input before parsing it.
+    """
+    return len(raw) == DIGEST_ID_LEN and all(c in _HEX for c in raw)
+
+
+def _parse(raw: str) -> Optional[int]:
+    # str.isdigit() rejects "-1", "1e5", "", and anything non-ASCII-numeric, so a
+    # negative index cannot be constructed here at all.
+    if not raw.isdigit() or len(raw) > 5:
+        return None
+    value = int(raw)
+    return value if value <= _MAX_PARSED_INDEX else None
 
 
 def decode(data: str) -> Intent:
@@ -74,31 +105,29 @@ def decode(data: str) -> Intent:
     kind = _CODE_TO_KIND.get(parts[0])
     if kind is None:
         return Intent("noop")
+    rest = parts[1:]
 
-    if kind in ("prev", "next", "approve_all", "list"):
-        return Intent(kind)
+    digest_id = ""
+    if rest and _is_digest_id(rest[-1]):
+        digest_id = rest[-1]
+        rest = rest[:-1]
 
-    def parse(raw: str) -> Optional[int]:
-        # str.isdigit() rejects "-1", "1e5", "", and anything non-ASCII-numeric,
-        # so a negative index cannot be constructed here at all.
-        if not raw.isdigit() or len(raw) > 5:
-            return None
-        value = int(raw)
-        return value if value <= _MAX_PARSED_INDEX else None
+    if kind in ("prev", "next", "approve_all", "list", "done", "approve_attention"):
+        return Intent(kind, digest_id=digest_id) if not rest else Intent("noop")
 
     if kind in ("approve", "reject", "open"):
-        if len(parts) != 2:
+        if len(rest) != 1:
             return Intent("noop")
-        index = parse(parts[1])
-        return Intent(kind, index) if index is not None else Intent("noop")
+        index = _parse(rest[0])
+        return (Intent(kind, index, digest_id=digest_id)
+                if index is not None else Intent("noop"))
 
-    # label needs both an item index and a category index
-    if len(parts) != 3:
+    if len(rest) != 2:
         return Intent("noop")
-    index, label_index = parse(parts[1]), parse(parts[2])
+    index, label_index = _parse(rest[0]), _parse(rest[1])
     if index is None or label_index is None:
         return Intent("noop")
-    return Intent("label", index, label_index)
+    return Intent("label", index, label_index, digest_id=digest_id)
 
 
 def resolve_thread_id(intent: Intent, request: ReviewRequest) -> Optional[str]:

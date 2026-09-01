@@ -135,3 +135,41 @@ def test_open_contributes_no_verdict():
     r = to_response(req, {1: Intent("open", 1)})
     assert r.decisions["t1"] == "approve"
     assert r.edits == {}
+
+
+# --- digest id round-trip and staleness check --------------------------------
+
+def test_digest_id_round_trips_for_every_kind():
+    for kind, args in (("open", (3,)), ("approve", (3,)), ("reject", (3,)),
+                       ("label", (3, 2)), ("prev", ()), ("next", ()),
+                       ("done", ()), ("approve_attention", ()), ("list", ())):
+        data = encode(kind, *args, digest_id="7f2a")
+        got = decode(data)
+        assert got.kind == kind, data
+        assert got.digest_id == "7f2a", data
+
+
+def test_index_and_label_index_survive_alongside_the_digest_id():
+    got = decode(encode("label", 3, 2, digest_id="7f2a"))
+    assert (got.index, got.label_index) == (3, 2)
+
+
+def test_encoding_stays_inside_the_64_byte_cap():
+    for kind, args in (("label", (9999, 99)), ("open", (9999,))):
+        assert len(encode(kind, *args, digest_id="7f2a").encode()) <= CB_MAX_BYTES
+
+
+def test_a_callback_without_a_digest_id_decodes_with_an_empty_one():
+    """Backwards compatible: a message sent before this change still decodes,
+    and the bot's staleness check treats an empty id as not-current."""
+    assert decode("a:3").digest_id == ""
+
+
+def test_garbage_is_still_a_noop():
+    for data in ("", "zzz", "a:", "a:x:7f2a", "l:1:7f2a", "a:1:2:3:4"):
+        assert decode(data).kind == "noop"
+
+
+def test_a_digest_id_that_is_not_hex_is_rejected():
+    """Bounds what we will parse at all, the same reasoning as _MAX_PARSED_INDEX."""
+    assert decode("a:3:zz//").kind == "noop"
