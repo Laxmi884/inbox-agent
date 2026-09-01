@@ -50,11 +50,12 @@ def test_thread_ids_never_appear_in_callback_data():
 
 def test_decode_never_raises_on_hostile_input():
     for junk in ("", "a", "a:", "a:x", "l:1", "l:x:y", "zzz", "a:1:2:3",
-                 "../../etc/passwd", "a:-1", "a:" + "9" * 400, "\x00", "a:1\n"):
+                 "../../etc/passwd", "a:-1", "a:" + "9" * 400, "\x00", "a:1\n",
+                 "a:²", "a:٣", "l:1:²", "o:³"):
         got = decode(junk)
         assert isinstance(got, Intent)
         assert got.kind in {"approve", "reject", "label", "prev", "next",
-                            "approve_all", "noop"}
+                            "approve_all", "open", "list", "done", "approve_attention", "noop"}
 
 
 def test_out_of_range_index_resolves_to_nothing():

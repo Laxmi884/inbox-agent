@@ -29,6 +29,12 @@ CB_MAX_BYTES = 64
 # a queue that outlives runs, positions shift between digests and a tap on
 # yesterday's message would land on today's item 3. The id makes the message
 # itself identify which list it belongs to.
+#
+# Ambiguity: a 4-digit decimal index like "1234" is also valid hex, so
+# decode("a:1234") reads the index as a digest id and returns noop. This is the
+# safe direction — a callback with no digest id is exactly the stale shape we
+# want rejected — and every call site passes a digest_id, so real encodes never
+# hit this. It bites only above 999 held items.
 DIGEST_ID_LEN = 4
 _HEX = set("0123456789abcdef")
 
@@ -78,16 +84,19 @@ def _is_digest_id(raw: str) -> bool:
     """A digest id is exactly DIGEST_ID_LEN lowercase hex characters.
 
     Length plus alphabet is what keeps it distinguishable from an index: an
-    index is short and decimal, so "7f2a" can never be one. Bounded for the same
-    reason _MAX_PARSED_INDEX is - refuse absurd input before parsing it.
+    index is short and decimal, so "7f2a" can never be one. The length check
+    short-circuits before scanning an attacker-supplied unbounded string
+    character-by-character, the same safety as _MAX_PARSED_INDEX.
     """
     return len(raw) == DIGEST_ID_LEN and all(c in _HEX for c in raw)
 
 
 def _parse(raw: str) -> Optional[int]:
-    # str.isdigit() rejects "-1", "1e5", "", and anything non-ASCII-numeric, so a
-    # negative index cannot be constructed here at all.
-    if not raw.isdigit() or len(raw) > 5:
+    # str.isdigit() alone is unsafe: Unicode digit characters like ² and ٣ return
+    # True but int() raises ValueError on them. isascii() is required to exclude
+    # non-ASCII digits. This also guards against negative indices: "-1" and "1e5"
+    # both fail both checks.
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 5:
         return None
     value = int(raw)
     return value if value <= _MAX_PARSED_INDEX else None
