@@ -633,6 +633,25 @@ class Bot:
         self.transport.send_message(
             self.chat_id, "Cancelled. Buttons on the last digest are no longer active.")
 
+    def _ack(self, callback_id: str, text: str = "") -> None:
+        """Clear the spinner. Never let failing to do so cost the tap.
+
+        answerCallbackQuery is cosmetic - it stops Telegram spinning the button
+        and optionally shows a toast. The query id expires in seconds, so any
+        tap that queued while the bot was down comes back as
+        "query is too old and response timeout expired or query ID is invalid",
+        and this used to be called BEFORE the work, unguarded: the 400 aborted
+        the handler and the action was silently lost. Seen live as eleven
+        tracebacks and nothing acted on.
+
+        Swallowed at info, not warning: an expired ack is the normal
+        consequence of a restart, not a fault to investigate.
+        """
+        try:
+            self.transport.answer_callback(callback_id, text)
+        except Exception as exc:
+            log.info("could not acknowledge callback %s: %s", callback_id, exc)
+
     def _on_callback(self, query: dict) -> None:
         """Every path answers the callback, and says something when it refuses.
 
@@ -645,8 +664,7 @@ class Bot:
         intent = decode(query.get("data", ""))
         answer = query.get("id", "")
         if intent.kind == "noop":
-            self.transport.answer_callback(
-                answer, "That button came from an older message.")
+            self._ack(answer, "That button came from an older message.")
             return
         if not self._digest_id or intent.digest_id != self._digest_id:
             # A tap on a superseded digest. Positions have shifted since that
@@ -659,12 +677,11 @@ class Bot:
             # moments when no digest exists.
             log.info("ignored a callback from digest %r (current %r)",
                      intent.digest_id, self._digest_id)
-            self.transport.answer_callback(
-                answer, "That digest is out of date - send /triage or /held "
-                        "for a current one.")
+            self._ack(answer, "That digest is out of date - send /triage or "
+                             "/held for a current one.")
             return
 
-        self.transport.answer_callback(answer)
+        self._ack(answer)
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
@@ -706,9 +723,8 @@ class Bot:
             # Plan 2 gives these their real behaviour. Say so rather than
             # re-rendering an unchanged message, which Telegram rejects as
             # unmodified and which therefore looks like nothing at all.
-            self.transport.answer_callback(
-                answer, "Not built yet - opening an item and approving the "
-                        "attention tier land in the next step.")
+            self._ack(answer, "Not built yet - approving the attention tier "
+                             "lands in the next step.")
             return
 
     # --- the interrupt path -------------------------------------------------

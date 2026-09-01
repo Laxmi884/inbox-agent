@@ -727,3 +727,46 @@ def test_a_dry_run_approval_does_not_claim_it_reached_gmail(bot):
     _open_held(b)
     b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
     assert "would have" in t.edited[-1]["text"].lower()
+
+
+# --- acknowledging a tap must never cost the tap ------------------------------
+# answerCallbackQuery clears the spinner and nothing else. Telegram expires a
+# query id in seconds, so any tap that queued while the bot was down comes back
+# as "query is too old" - and that 400 used to abort the handler before the work
+# ran. Seen live: eleven taps, eleven tracebacks, nothing acted on.
+
+class FailingAckTransport(FakeTransport):
+    def answer_callback(self, callback_id, text=""):
+        super().answer_callback(callback_id, text)
+        raise RuntimeError("Bad Request: query is too old")
+
+
+def test_a_failed_acknowledgement_does_not_cost_the_action(bot):
+    b, t, _ = bot
+    b.transport = FailingAckTransport()
+    b.handle_update(msg("/triage 4"))
+    b.transport.edited.clear()
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    assert b.transport.edited, "the ack failing stopped the panel from rendering"
+
+
+def test_a_failed_acknowledgement_on_a_stale_tap_does_not_raise(bot):
+    """The stale branch answers too, and its answer expires for exactly the
+    same reason - the tap has been sitting in Telegram's backlog."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.transport = FailingAckTransport()
+    b.handle_update(cb(encode("done", digest_id="dead")))   # must not raise
+
+
+def test_a_failed_acknowledgement_on_a_verdict_still_writes_the_rule(bot):
+    """The expensive case: the owner taught something and the ack expired."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "promotion"), ("archive", None)))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.transport = FailingAckTransport()
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_wide", 0, digest_id=b._digest_id)))
+    assert b.prefs.rules(), "a correction was lost because the spinner failed"
