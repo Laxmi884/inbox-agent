@@ -83,3 +83,83 @@ def test_create_draft_returns_simulated_and_draft_length(snapshot_file):
 def test_missing_snapshot_gives_actionable_error(tmp_path):
     with pytest.raises(FileNotFoundError, match="snapshot"):
         load_snapshot(tmp_path / "absent.json")
+
+
+from inbox_agent.gmail import matches_query
+
+
+def _thread(i, labels):
+    return {"id": f"t{i}", "subject": f"S{i}", "sender": f"s{i}@x.com", "to": [],
+            "date": "2026-08-26T10:00:00Z", "snippet": "s", "body": "",
+            "label_ids": labels}
+
+
+@pytest.fixture
+def mixed_snapshot(tmp_path):
+    data = [
+        _thread(0, ["INBOX", "UNREAD"]),
+        _thread(1, ["INBOX"]),                       # read
+        _thread(2, ["INBOX", "UNREAD", "agent/triaged"]),
+        _thread(3, ["UNREAD"]),                      # archived
+        _thread(4, ["INBOX", "UNREAD"]),
+    ]
+    p = tmp_path / "threads.json"
+    p.write_text(json.dumps(data))
+    return p
+
+
+def test_matches_query_honours_is_unread():
+    t = Thread.model_validate(_thread(0, ["INBOX", "UNREAD"]))
+    assert matches_query(t, "is:unread")
+    r = Thread.model_validate(_thread(1, ["INBOX"]))
+    assert not matches_query(r, "is:unread")
+
+
+def test_matches_query_honours_negated_label():
+    t = Thread.model_validate(_thread(2, ["INBOX", "agent/triaged"]))
+    assert not matches_query(t, "-label:agent/triaged")
+    assert matches_query(t, "label:agent/triaged")
+
+
+def test_matches_query_is_case_insensitive_on_labels():
+    t = Thread.model_validate(_thread(2, ["INBOX", "AGENT/TRIAGED"]))
+    assert not matches_query(t, "-label:agent/triaged")
+
+
+def test_empty_query_matches_everything():
+    t = Thread.model_validate(_thread(1, ["INBOX"]))
+    assert matches_query(t, "")
+
+
+def test_unknown_query_term_raises_rather_than_being_ignored():
+    """A term the snapshot cannot honour must fail loudly.
+
+    The live client passes `query` to Gmail verbatim, so an unknown term works
+    there and would silently do nothing here - which would make every snapshot
+    test a false negative for that term.
+    """
+    t = Thread.model_validate(_thread(0, ["INBOX", "UNREAD"]))
+    with pytest.raises(ValueError, match="newer_than:2d"):
+        matches_query(t, "is:unread newer_than:2d")
+
+
+def test_snapshot_client_filters_by_query(mixed_snapshot):
+    client = SnapshotGmailClient(mixed_snapshot)
+    got = client.list_threads(query="in:inbox is:unread -label:agent/triaged")
+    assert [t.id for t in got] == ["t0", "t4"]
+
+
+def test_snapshot_client_filters_before_applying_the_limit(mixed_snapshot):
+    """limit=2 must mean two MATCHING threads, not two candidates then filtered.
+
+    Filtering after the limit is the bug that makes a mailbox with a read run
+    of 50 look empty.
+    """
+    client = SnapshotGmailClient(mixed_snapshot)
+    got = client.list_threads(limit=2, query="in:inbox is:unread -label:agent/triaged")
+    assert [t.id for t in got] == ["t0", "t4"]
+
+
+def test_no_query_still_returns_everything_in_order(mixed_snapshot):
+    client = SnapshotGmailClient(mixed_snapshot)
+    assert len(client.list_threads()) == 5
