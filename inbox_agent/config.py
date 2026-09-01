@@ -40,6 +40,11 @@ class Settings:
     forbidden_actions: frozenset[str]
     context_hub_skill: str
     context_hub_tag: str
+    # A needs_reply older than this stops being held in the inbox. 90 days is a
+    # deliberate default: long enough that a real conversation is genuinely
+    # over, short enough to matter when clearing a backlog. Defaulted so every
+    # existing construction of Settings keeps working unchanged.
+    stale_after_days: int = 90
 
 
 def load_settings() -> Settings:
@@ -59,6 +64,7 @@ def load_settings() -> Settings:
         forbidden_actions=ALWAYS_FORBIDDEN | frozenset(configured),
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
+        stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
     )
 
 

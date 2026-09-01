@@ -284,3 +284,82 @@ def test_execute_skip_survives_the_learn_node(wiring):
         "edits": {}, "instructions": [],
     }), cfg)
     assert any(s["thread_id"] == "ghost" for s in final["skipped"])
+
+
+def test_stale_threads_are_demoted_inside_the_pipeline(tmp_path):
+    """End-to-end: a two-year-old needs_reply leaves the inbox."""
+    import json as _json
+    from datetime import datetime, timezone
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    old = (datetime.now(timezone.utc).replace(year=datetime.now().year - 2)
+           .isoformat().replace("+00:00", "Z"))
+    data = [{"id": "old1", "subject": "Are you still interested?",
+             "sender": "someone@example.com", "to": [], "date": old,
+             "snippet": "waiting on you", "body": "", "label_ids": ["INBOX"]}]
+    snap = tmp_path / "threads.json"
+    snap.write_text(_json.dumps(data))
+
+    settings = Settings(backend="offline", dry_run=True, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "a.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev",
+                        stale_after_days=90)
+
+    class NeedsReply:
+        def with_structured_output(self, schema): return self
+        def invoke(self, m):
+            return ThreadJudgment(category="needs_reply", action="none",
+                                  reason="a person is waiting", confidence=0.9)
+
+    graph = build_graph(client=SnapshotGmailClient(snap),
+                        prefs=PreferenceStore(build_store()),
+                        policy=Policy(text="P", version="v", source="local"),
+                        llm=NeedsReply(), settings=settings,
+                        log=AuditLog(settings.audit_log),
+                        checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 5}, {"configurable": {"thread_id": "stale-1"}})
+    item = result["__interrupt__"][0].value["items"][0]
+
+    # NOTE: ReviewItem carries no `category` - it is dropped when Decision is
+    # turned into a ReviewItem, so the human never sees the classification, only
+    # the action. Category preservation is asserted at the unit level in
+    # tests/test_recency.py; here we can only observe the action and the reason.
+    assert [a["kind"] for a in item["proposed"]] == ["archive"]
+    assert "stale" in item["reason"].lower() or "days old" in item["reason"]
+
+
+def test_a_recent_needs_reply_still_stays_in_the_inbox(tmp_path):
+    """The control: demotion must not fire on fresh mail."""
+    import json as _json
+    from datetime import datetime, timezone
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    data = [{"id": "new1", "subject": "Are you free tomorrow?",
+             "sender": "someone@example.com", "to": [],
+             "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+             "snippet": "waiting", "body": "", "label_ids": ["INBOX"]}]
+    snap = tmp_path / "threads.json"
+    snap.write_text(_json.dumps(data))
+
+    settings = Settings(backend="offline", dry_run=True, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "a.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev",
+                        stale_after_days=90)
+
+    class NeedsReply:
+        def with_structured_output(self, schema): return self
+        def invoke(self, m):
+            return ThreadJudgment(category="needs_reply", action="none",
+                                  reason="a person is waiting", confidence=0.9)
+
+    graph = build_graph(client=SnapshotGmailClient(snap),
+                        prefs=PreferenceStore(build_store()),
+                        policy=Policy(text="P", version="v", source="local"),
+                        llm=NeedsReply(), settings=settings,
+                        log=AuditLog(settings.audit_log),
+                        checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 5}, {"configurable": {"thread_id": "fresh-1"}})
+    item = result["__interrupt__"][0].value["items"][0]
+    assert [a["kind"] for a in item["proposed"]] == ["none"]
