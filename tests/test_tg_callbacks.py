@@ -112,3 +112,26 @@ def test_label_intent_with_out_of_range_category_is_dropped():
     r = to_response(req, {0: Intent("label", 0, 99)}, categories=["a", "b"])
     assert r.decisions["t0"] == "approve"
     assert "t0" not in r.edits
+
+
+# --- opening one item from the digest ---------------------------------------
+# The digest shipped with only "Approve all" and "Next", which made it a
+# read-only screen: there was no way to correct anything without leaving it.
+
+def test_open_intent_round_trips_and_carries_an_index():
+    i = decode(encode("open", 4))
+    assert i.kind == "open" and i.index == 4
+
+
+def test_open_intent_resolves_like_any_other_index():
+    req = request(3)
+    assert resolve_thread_id(Intent("open", 1), req) == "t1"
+    assert resolve_thread_id(Intent("open", 99), req) is None
+
+
+def test_open_contributes_no_verdict():
+    """Opening an item is navigation, not a decision."""
+    req = request(3)
+    r = to_response(req, {1: Intent("open", 1)})
+    assert r.decisions["t1"] == "approve"
+    assert r.edits == {}

@@ -183,3 +183,39 @@ def test_paged_mode_edits_one_message_instead_of_sending_many(bot, tmp_path,
     b.handle_update(cb(encode("next")))
     assert len(t.sent) == 1, "paged mode sent extra messages"
     assert len(t.edited) == 2, "paged mode did not edit in place"
+
+
+def test_tapping_an_item_number_opens_it_in_paged_view(bot):
+    """The digest was read-only: approve-all or nothing."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage"))
+    assert "1." in t.sent[0]["text"]              # digest listing
+    b.handle_update(cb(encode("open", 2)))
+    assert t.edited, "opening an item did not update the message"
+    assert "3/4" in t.edited[-1]["text"], "not showing item 3 of 4"
+
+
+def test_list_button_returns_to_the_digest(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage"))
+    b.handle_update(cb(encode("open", 1)))
+    b.handle_update(cb(encode("list")))
+    assert "1." in t.edited[-1]["text"] and "2." in t.edited[-1]["text"]
+
+
+def test_deciding_an_item_in_paged_view_advances_to_the_next(bot):
+    """Reviewing is a flow; stopping on the item you just handled feels stuck."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage"))
+    b.handle_update(cb(encode("open", 0)))
+    b.handle_update(cb(encode("reject", 0)))
+    assert "2/4" in t.edited[-1]["text"]
+
+
+def test_a_verdict_given_in_paged_view_survives_to_the_resume(bot):
+    b, t, log = bot
+    b.handle_update(msg("/triage"))
+    b.handle_update(cb(encode("open", 1)))
+    b.handle_update(cb(encode("reject", 1)))
+    b.handle_update(cb(encode("approve_all")))
+    assert len(log.records()) == 3, "the rejection was lost between views"

@@ -22,7 +22,8 @@ TG_MAX_TEXT = 4096
 # Leave room for the header and the "... and N more" footer so pagination
 # arithmetic never has to be exact-to-the-byte.
 _TEXT_BUDGET = TG_MAX_TEXT - 400
-DIGEST_PAGE_SIZE = 25
+DIGEST_PAGE_SIZE = 15   # two lines per item now, so fewer fit
+MAX_ITEM_BUTTONS = 10   # a phone keyboard past this is unusable
 
 
 def rule_decided_count(request: ReviewRequest) -> int:
@@ -80,19 +81,41 @@ def digest(request: ReviewRequest, page: int = 0,
 
     for offset, item in enumerate(window):
         i = start + offset
-        src = "rule" if item.source == "rule" else "    "
-        row = (f"{i + 1:>3}. {item.sender[:24]:<24} {item.subject[:34]:<34} "
-               f"→ {_actions(item)}{_flag(item)}  {src}")
-        # Budget check per row rather than at the end, so the message is never
-        # assembled oversized and then chopped.
-        if sum(len(x) + 1 for x in lines) + len(row) > _TEXT_BUDGET:
-            lines.append(f"     … {len(window) - offset} more on this page")
+        # Two short lines per item, never padded columns. Telegram renders
+        # proportional text and wraps it, so `{:<24}` padding does not align
+        # anything - it just injects runs of spaces that survive the wrap and
+        # turn the message into a wall. Verified on a real phone.
+        tag = " ·rule" if item.source == "rule" else ""
+        block = (f"{i + 1}. {item.subject[:52]}\n"
+                 f"↳ {_actions(item)}{_flag(item)} — {item.sender[:30]}{tag}")
+        if sum(len(x) + 1 for x in lines) + len(block) > _TEXT_BUDGET:
+            lines.append(f"… {len(window) - offset} more on this page")
             break
-        lines.append(row)
+        lines.append(block)
 
-    keyboard: list[list[tuple[str, str]]] = [
-        [("✅ Approve all", encode("approve_all"))]
-    ]
+    keyboard: list[list[tuple[str, str]]] = []
+
+    # One button per item, so the digest is correctable without leaving it.
+    # Capped: a 50-button keyboard is unusable on a phone, and the flagged
+    # shortcut below is the route into a large batch.
+    shown = window[:MAX_ITEM_BUTTONS]
+    row: list[tuple[str, str]] = []
+    for offset, _ in enumerate(shown):
+        i = start + offset
+        row.append((str(i + 1), encode("open", i)))
+        if len(row) == 5:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    flagged = [i for i, it in enumerate(items) if it.confidence < LOW_CONFIDENCE]
+    if flagged:
+        keyboard.append([(f"🔎 Review {len(flagged)} flagged",
+                          encode("open", flagged[0]))])
+
+    keyboard.append([("✅ Approve all", encode("approve_all"))])
+
     nav: list[tuple[str, str]] = []
     if page > 0:
         nav.append(("◀ Prev", encode("prev")))
@@ -152,10 +175,11 @@ def paged(request: ReviewRequest, index: int,
 
     nav: list[tuple[str, str]] = []
     if i > 0:
-        nav.append(("◀ Prev", encode("prev")))
+        nav.append(("◀", encode("prev")))
+    nav.append(("☰ List", encode("list")))
     if i < len(items) - 1:
-        nav.append(("Next ▶", encode("next")))
-    nav.append(("✅ Approve all", encode("approve_all")))
+        nav.append(("▶", encode("next")))
     keyboard.append(nav)
+    keyboard.append([("✅ Approve all", encode("approve_all"))])
 
     return text, keyboard

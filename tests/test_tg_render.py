@@ -129,3 +129,43 @@ def test_every_rendered_callback_is_within_the_byte_cap():
         for row in kb:
             for _, data in row:
                 assert len(data.encode()) <= 64, data
+
+
+# --- digest must be correctable and readable --------------------------------
+
+def test_digest_offers_a_button_per_item_so_it_is_not_read_only():
+    from inbox_agent.telegram.callbacks import decode as d
+    _, kb = digest(request(6))
+    opens = [d(data) for row in kb for (_, data) in row if d(data).kind == "open"]
+    assert len(opens) == 6, "no way to correct an individual item"
+    assert {o.index for o in opens} == set(range(6))
+
+
+def test_digest_offers_a_shortcut_to_the_flagged_items():
+    from inbox_agent.telegram.callbacks import decode as d
+    items = [item(0, conf=0.2), item(1, conf=0.95), item(2, conf=0.1)]
+    req = ReviewRequest(run_id="r", policy_version="v", items=items)
+    text, kb = digest(req)
+    labels = [t for row in kb for (t, _) in row]
+    assert any("2" in t and "flag" in t.lower() for t in labels), labels
+
+
+def test_digest_has_no_flagged_shortcut_when_nothing_is_flagged():
+    _, kb = digest(request(4))
+    labels = [t for row in kb for (t, _) in row]
+    assert not any("flag" in t.lower() for t in labels)
+
+
+def test_digest_does_not_fake_monospace_columns():
+    """Telegram renders proportional text and wraps it, so padded columns
+    collapse into a wall. Measured on a real phone before this test existed."""
+    text, _ = digest(request(6))
+    assert "   " not in text.replace("\n", ""), "still padding columns with spaces"
+
+
+def test_digest_per_item_buttons_are_capped_on_large_batches():
+    """A 50-item keyboard is unusable; the flagged shortcut carries those."""
+    _, kb = digest(request(50))
+    from inbox_agent.telegram.callbacks import decode as d
+    opens = [x for row in kb for (_, data) in row if (x := d(data)).kind == "open"]
+    assert len(opens) <= 10

@@ -24,11 +24,17 @@ from ..models import Action, ReviewRequest, ReviewResponse
 # Telegram hard-caps callback_data at 64 bytes. This is protocol, not policy.
 CB_MAX_BYTES = 64
 
-Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all", "noop"]
+Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all",
+               "open", "list", "noop"]
 
 _CODE_TO_KIND: dict[str, Kind] = {
     "a": "approve", "r": "reject", "l": "label",
     "p": "prev", "n": "next", "A": "approve_all",
+    # Opening one item from the digest. Navigation, not a verdict - the digest
+    # shipped with only "approve all", which made it a read-only screen.
+    "o": "open",
+    # Back to the digest from a single item.
+    "L": "list",
 }
 _KIND_TO_CODE = {v: k for k, v in _CODE_TO_KIND.items()}
 
@@ -69,7 +75,7 @@ def decode(data: str) -> Intent:
     if kind is None:
         return Intent("noop")
 
-    if kind in ("prev", "next", "approve_all"):
+    if kind in ("prev", "next", "approve_all", "list"):
         return Intent(kind)
 
     def parse(raw: str) -> Optional[int]:
@@ -80,7 +86,7 @@ def decode(data: str) -> Intent:
         value = int(raw)
         return value if value <= _MAX_PARSED_INDEX else None
 
-    if kind in ("approve", "reject"):
+    if kind in ("approve", "reject", "open"):
         if len(parts) != 2:
             return Intent("noop")
         index = parse(parts[1])
@@ -129,6 +135,8 @@ def to_response(
         if thread_id is None:
             continue  # forged, stale or replayed - contributes nothing
 
+        if intent.kind == "open":
+            continue  # navigation carries no verdict
         if intent.kind == "reject":
             decisions[thread_id] = "reject"
         elif intent.kind == "label":

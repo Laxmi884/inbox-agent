@@ -42,7 +42,8 @@ class Bot:
         # Per-review UI state. Deliberately NOT the source of truth for what was
         # proposed - that is read back from the checkpoint (see _request).
         self._message_id: Optional[int] = None
-        self._page = 0
+        self._page = 0            # digest page, or item index in paged view
+        self._view = self.mode    # "digest" | "paged"; `open` switches at runtime
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
@@ -97,7 +98,7 @@ class Bot:
     # --- rendering ----------------------------------------------------------
 
     def _render(self, request: ReviewRequest) -> tuple[str, list]:
-        if self.mode == "paged":
+        if self._view == "paged":
             return paged(request, self._page, self.categories)
         return digest(request, self._page, self.categories)
 
@@ -122,6 +123,9 @@ class Bot:
     def _on_message(self, message: dict) -> None:
         text = (message.get("text") or "").strip()
         command, _, arg = text.partition(" ")
+        # Telegram appends @botname when a command is sent in a group, or when
+        # the client disambiguates. Strip it so /triage@my_bot 6 still parses.
+        command = command.split("@", 1)[0]
 
         if command == "/triage":
             limit = int(arg) if arg.strip().isdigit() else self.settings.snapshot_size
@@ -138,13 +142,24 @@ class Bot:
     def _start(self, limit: int) -> None:
         self._run += 1
         self._page = 0
+        self._view = self.mode
         self._intents = {}
         self._message_id = None
+
+        log.info("triage start: limit=%s run=%s", limit, self._run)
+        started = time.monotonic()
         self.graph.invoke({"limit": limit}, self._config)
+        elapsed = time.monotonic() - started
+
         request = self._request()
         if request is None:
+            log.warning("triage produced nothing to review (%.1fs)", elapsed)
             self.transport.send_message(self.chat_id, "Nothing to review.")
             return
+        n = len(request.items)
+        log.info("triage done: %s threads in %.1fs (%.2fs/thread), %s rule-decided",
+                 n, elapsed, elapsed / max(n, 1),
+                 sum(1 for i in request.items if i.source == "rule"))
         self._show(request, edit=False)
 
     def _status(self) -> None:
@@ -166,8 +181,10 @@ class Bot:
         """
         self._run += 1
         self._page = 0
+        self._view = self.mode
         self._intents = {}
         self._message_id = None
+        log.info("run cancelled; moved to run=%s", self._run)
         self.transport.send_message(self.chat_id, "Cancelled. Nothing was executed.")
 
     def _on_callback(self, query: dict) -> None:
@@ -183,6 +200,19 @@ class Bot:
         if intent.kind == "noop":
             return
 
+        if intent.kind == "open":
+            if intent.index is not None:
+                self._view = "paged"
+                self._page = intent.index
+                self._show(request, edit=True)
+            return
+
+        if intent.kind == "list":
+            self._view = "digest"
+            self._page = 0
+            self._show(request, edit=True)
+            return
+
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
             self._page = max(0, self._page + step)
@@ -192,6 +222,11 @@ class Bot:
         if intent.kind in ("approve", "reject", "label"):
             if intent.index is not None:
                 self._intents[intent.index] = intent
+                log.info("verdict: item %s -> %s", intent.index, intent.kind)
+                # After deciding one item, advance - reviewing is a flow, and
+                # stopping on the item you just handled makes it feel stuck.
+                if self._view == "paged" and intent.index < len(request.items) - 1:
+                    self._page = intent.index + 1
             self._show(request, edit=True)
             return
 
@@ -203,6 +238,7 @@ class Bot:
         final = self.graph.invoke(
             Command(resume=response.model_dump(mode="json")), self._config)
 
+        log.info("resuming with %s explicit verdict(s)", len(self._intents))
         executed = len(final.get("executed", []))
         refused = len(final.get("refused", []))
         skipped = len(final.get("skipped", []))
@@ -219,6 +255,8 @@ class Bot:
             lines.append(f"{skipped} skipped (not part of the reviewed batch).")
         self.transport.send_message(self.chat_id, "\n".join(lines))
 
+        log.info("run complete: %s executed, %s refused, %s skipped, %s learned",
+                 executed, refused, skipped, learned)
         self._intents = {}
         self._message_id = None
 
