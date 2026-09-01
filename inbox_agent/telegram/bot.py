@@ -227,6 +227,19 @@ class Bot:
 # Transport
 # ---------------------------------------------------------------------------
 
+class TelegramError(RuntimeError):
+    """A Bot API failure, carrying the API's own description and NOT the URL.
+
+    The URL contains the bot token. httpx.HTTPStatusError puts the URL in its
+    message, so letting that propagate writes a live credential into every
+    traceback and log line.
+    """
+
+    def __init__(self, method: str, status: int, description: str):
+        self.method, self.status, self.description = method, status, description
+        super().__init__(f"{method} failed [{status}]: {description}")
+
+
 class HttpTransport:
     """Raw Bot API over httpx. No telegram library.
 
@@ -237,12 +250,46 @@ class HttpTransport:
 
     def __init__(self, token: str, timeout: float = 65.0):
         import httpx
+        self._token = token
         self._base = f"https://api.telegram.org/bot{token}"
         self._client = httpx.Client(timeout=timeout)
+        # httpx logs the full request URL at INFO, and the token is IN the URL.
+        # Left alone this writes the credential into the log on every single
+        # poll. Nothing here needs httpx's request log.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    @staticmethod
+    def _clean(payload: dict) -> dict:
+        """Drop None values.
+
+        Telegram rejects an explicit null where it expects an object:
+        {"reply_markup": null} answers `400 object expected as reply markup`.
+        The key has to be ABSENT, not null - which is exactly the difference a
+        fake transport does not model, and why this went unnoticed until the
+        first real message.
+        """
+        return {k: v for k, v in payload.items() if v is not None}
+
+    @staticmethod
+    def _redact(text: str, token: str) -> str:
+        return text.replace(token, "<token>") if token else text
 
     def _post(self, method: str, **payload) -> dict:
-        r = self._client.post(f"{self._base}/{method}", json=payload)
-        r.raise_for_status()
+        try:
+            r = self._client.post(f"{self._base}/{method}",
+                                  json=self._clean(payload))
+        except Exception as exc:
+            raise TelegramError(method, 0, self._redact(str(exc), self._token)) from None
+        if r.status_code >= 400:
+            try:
+                description = r.json().get("description", r.text[:200])
+            except Exception:
+                description = r.text[:200]
+            # `from None` so the httpx exception - which carries the tokenised
+            # URL - never appears in the chained traceback either.
+            raise TelegramError(method, r.status_code,
+                                self._redact(str(description), self._token)) from None
         return r.json().get("result", {})
 
     @staticmethod
