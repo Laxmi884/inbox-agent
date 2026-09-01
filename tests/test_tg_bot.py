@@ -10,6 +10,8 @@ are covered where they now live - at the graph level in tests/test_graph.py and
 at the boundary in tests/test_tg_callbacks.py.
 """
 import json
+from datetime import datetime, timezone
+
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -18,11 +20,13 @@ from inbox_agent.classify import ThreadJudgment
 from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph
-from inbox_agent.models import ActionTemplate, Action, ReviewItem
+from inbox_agent.models import ActionTemplate, Action, ReviewItem, Rule
 from inbox_agent.policy import Policy
 from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 from inbox_agent.telegram.bot import Bot
-from inbox_agent.telegram.callbacks import encode
+from inbox_agent.telegram.callbacks import decode, encode
+
+NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
 
 class FakeLLM:
@@ -71,14 +75,17 @@ def bot(tmp_path, snapshot_file):
     # Two instances over two stores would let the bot show an empty queue while
     # the graph quietly filled another one.
     held = HeldQueue(build_store())
+    # One store, shared by the graph that reads rules and the bot that writes
+    # them - two instances would let a correction land where nothing reads it.
+    prefs = PreferenceStore(build_store())
     graph = build_graph(client=SnapshotGmailClient(snapshot_file),
-                        prefs=PreferenceStore(build_store()),
+                        prefs=prefs,
                         policy=Policy(text="P", version="local:t", source="local"),
                         llm=FakeLLM(), settings=settings, log=log, held=held,
                         checkpointer=InMemorySaver())
     t = FakeTransport()
     return Bot(transport=t, graph=graph, settings=settings, held=held,
-               categories=["recruiter", "promotion"]), t, log
+               prefs=prefs, categories=["recruiter", "promotion"]), t, log
 
 
 def msg(text, chat_id=42):
@@ -386,10 +393,15 @@ def test_a_stale_tap_says_so_instead_of_doing_nothing(bot):
 
 
 def test_a_button_with_no_behaviour_yet_says_that_too(bot):
-    """`open` lands in Plan 2. Until then it must not look broken."""
+    """Asserted on approve_attention, the last button still waiting on a later
+    plan. It was `open` until `open` was built; the invariant is that a button
+    which cannot act says so rather than answering with silence, not that any
+    particular button stays unbuilt."""
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    for item in [review_item(f"a{i}", category="needs_reply") for i in range(2)]:
+        b.held.add(item, run_id="r1", reason="needs_reply")
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
     assert t.answered[-1]["text"], "an inert button answered with silence"
 
 
@@ -505,3 +517,141 @@ def test_paging_the_digest_edits_one_message_instead_of_sending_many(bot):
     b.handle_update(cb(encode("prev", digest_id=b._digest_id)))
     assert len(t.sent) == 1, "paging sent extra messages"
     assert len(t.edited) == 2, "paging did not edit in place"
+
+
+# --- corrections write rules -------------------------------------------------
+# The loop the design named and never closed: the agent acts alone on the
+# majority of mail, and until now nothing it did alone could teach it anything.
+
+def _done_run(b, thread_id="t0", category="promotion", actions=(("archive", None),),
+              actor="agent"):
+    """Put one known done item in front of the bot, so a verdict has something
+    to correct that the test controls."""
+    b._last_run = {
+        "thread_ids": [thread_id],
+        "auto": [review_item(thread_id, category=category).model_dump(mode="json")],
+        "executed": [{"thread_id": thread_id, "action": kind,
+                      "params": {"label": label} if label else {}, "actor": actor}
+                     for kind, label in actions],
+    }
+
+
+def test_tapping_a_number_opens_the_item(bot):
+    """The button that did nothing for two sessions."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
+    assert "keep" in kinds
+    assert "Subject t0" in t.edited[-1]["text"]
+
+
+def test_a_verdict_asks_how_wide_before_writing_anything(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    assert b.prefs.rules() == [], "a rule was written before the scope was chosen"
+    kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
+    assert {"scope_narrow", "scope_wide"} <= set(kinds)
+
+
+def test_the_narrow_answer_writes_a_rule_about_the_sender(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "promotion"), ("archive", None)))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert rule.scope in ("sender", "domain", "fingerprint", "subject")
+    assert "archive" not in [a.kind for a in rule.actions], \
+        "keep in inbox taught a rule that still archives"
+
+
+def test_the_wide_answer_writes_a_rule_about_the_category(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "promotion"), ("archive", None)))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_wide", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert rule.scope == "category"
+    assert rule.pattern == "promotion"
+    assert [a.kind for a in rule.actions] == ["label"]
+
+
+def test_the_confirmation_says_the_rule_in_words(bot):
+    """A rule that cannot be read cannot be corrected."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "promotion"), ("archive", None)))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_wide", 0, digest_id=b._digest_id)))
+    assert "promotion" in t.edited[-1]["text"]
+    assert "label(promotion)" in t.edited[-1]["text"]
+
+
+def test_a_correction_claims_no_reversal(bot):
+    """Nothing was reversed - under dry-run nothing happened at all - and
+    saying otherwise is the most expensive thing this message could get wrong."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    blob = t.edited[-1]["text"].lower()
+    assert "undo" not in blob and "reversed" not in blob and "undone" not in blob
+
+
+def test_correcting_a_rule_decided_action_records_an_override(bot):
+    """record_override has had no caller since it was written. This is it: a
+    correction of what a rule proposed IS an override of that rule."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.prefs.add_rule(Rule(id="r-1", scope="sender", pattern="deals0@shop.com",
+                          actions=[ActionTemplate(kind="archive")],
+                          provenance="p", created_at=NOW))
+    _done_run(b, actor="rule:r-1")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    assert {r.id: r for r in b.prefs.rules()}["r-1"].override_count == 1
+
+
+def test_teaching_trash_says_it_will_not_ask_again(bot):
+    """Plan 1 decided a rule-proposed trash auto-executes. That makes this the
+    one verdict that widens what happens without a second question."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("teach_trash", 0, digest_id=b._digest_id)))
+    assert "without asking" in t.edited[-1]["text"].lower()
+    rule = b.prefs.rules()[0]
+    assert [a.kind for a in rule.actions] == ["trash"]
+    assert rule.scope != "category", "a category-wide trash rule is too wide to teach"
+
+
+def test_relabel_offers_the_policys_categories(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    labels = [l for row in t.edited[-1]["keyboard"] for (l, _) in row]
+    assert any("recruiter" in l for l in labels)

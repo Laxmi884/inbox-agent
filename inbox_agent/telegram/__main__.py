@@ -79,8 +79,10 @@ def main() -> int:
     transport = HttpTransport(settings.tg_token)
     # The same queue the graph fills: one instance, so the digest renders what
     # the run actually held rather than a second, permanently empty store.
+    # The same PreferenceStore the graph reads rules from: a correction is a
+    # store write, and two instances would let one land where nothing reads it.
     bot = Bot(transport=transport, graph=graph, settings=settings, held=held,
-              categories=categories)
+              prefs=prefs, categories=categories)
 
     print(f"backend   : {settings.backend}")
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")

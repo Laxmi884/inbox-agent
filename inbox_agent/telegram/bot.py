@@ -22,10 +22,10 @@ from typing import Optional, Sequence
 from langgraph.types import Command
 
 from ..config import Settings
-from ..models import ReviewRequest
-from ..store import HeldQueue
-from .callbacks import DIGEST_ID_LEN, Intent, decode, to_response
-from .render_tg import DigestView, DoneItem, digest, done_panel
+from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
+from ..store import HeldQueue, PreferenceStore, rule_from_correction
+from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
+from .render_tg import DigestView, DoneItem, digest, done_panel, item_view
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -34,8 +34,8 @@ class Bot:
     """Owns the graph, the checkpointer and the conversation with one human."""
 
     def __init__(self, *, transport, graph, settings: Settings,
-                 held: HeldQueue, categories: Sequence[str] = (),
-                 mode: Optional[str] = None):
+                 held: HeldQueue, prefs: PreferenceStore,
+                 categories: Sequence[str] = (), mode: Optional[str] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
@@ -43,6 +43,10 @@ class Bot:
         # sides are looking at the same one - two instances over two stores
         # would let the bot show an empty queue while the graph filled another.
         self.held = held
+        # The same store the graph reads rules from. A correction is a store
+        # write, not a message through graph state, which is what makes the
+        # learning loop independent of whether any run is parked.
+        self.prefs = prefs
         self.categories = list(categories)
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
@@ -65,6 +69,14 @@ class Bot:
         # The panel's own page, so opening the panel and coming back does not
         # move the owner to page one of a queue they were part way through.
         self._done_page = 0
+        # Which item is open, and the verdict waiting on a scope answer. The
+        # verdict is held rather than applied because writing on the first tap
+        # would pick a blast radius the owner never chose.
+        self._open_index = 0
+        self._pending: Optional[dict] = None
+        # Which list the item was opened from, so Back returns there rather
+        # than to whichever screen happens to be default.
+        self._panel_before_item = "digest"
         # Counts runs actually started, so a test can assert that /held ran none.
         self._runs_started = 0
         self._last_run: Optional[dict] = None   # the graph result for the digest
@@ -209,7 +221,9 @@ class Bot:
 
     def _show(self, *, edit: bool) -> None:
         view = self._view(run_report=self._run_report)
-        if self._panel == "done":
+        if self._panel == "item":
+            text, keyboard = self._item_screen()
+        elif self._panel == "done":
             view.done = self._done_items()
             text, keyboard = done_panel(view, self._done_page)
         else:
@@ -221,6 +235,203 @@ class Bot:
             self._message_id = (sent or {}).get("message_id")
 
     # --- dispatch -----------------------------------------------------------
+
+    def _open_item(self) -> Optional[tuple[str, DoneItem]]:
+        """The item the owner tapped, and which list it came from.
+
+        Resolved against the list that was rendered, never from the callback -
+        the callback carries a position precisely so a thread id cannot travel
+        in it.
+        """
+        if self._panel_before_item == "done":
+            items = self._done_items()
+            if 0 <= self._open_index < len(items):
+                return "done", items[self._open_index]
+            return None
+        queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
+        if 0 <= self._open_index < len(queue):
+            held = queue[self._open_index]
+            return "held", DoneItem(
+                thread_id=held.thread_id, subject=held.item.subject,
+                sender=held.item.sender,
+                actions=[(a.kind, (a.params or {}).get("label"))
+                         for a in held.item.proposed])
+        return None
+
+    def _item_screen(self) -> tuple[str, list]:
+        opened = self._open_item()
+        if opened is None:
+            # The list moved under the callback. Falling back to the list is
+            # the honest answer; guessing at a neighbouring item is not.
+            self._panel = self._panel_before_item
+            return digest(self._view(run_report=self._run_report), self._page)
+        kind, item = opened
+        why = ""
+        for raw in (self._last_run or {}).get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id") == item.thread_id:
+                why = raw.get("reason") or ""
+        actions_text = ", ".join(f"{k}({v})" if v else k for k, v in item.actions)
+        return item_view(item.subject, item.sender, actions_text, why,
+                         digest_id=self._digest_id, index=self._open_index,
+                         kind=kind, categories=self.categories)
+
+    def _ask_scope(self, verdict: str, item: DoneItem, category: str) -> None:
+        """Verdict first, scope second.
+
+        "Never archive this sender" and "never archive any valuable newsletter"
+        are different instructions behind the same tap, and only the owner knows
+        which was meant. Asking costs one tap; guessing costs a rule that
+        reaches mail they never meant to include.
+        """
+        text = (f"{item.subject}\n\nTeach this for…")
+        keyboard = [
+            [(f"Just {item.sender[:28]}",
+              encode("scope_narrow", self._open_index, digest_id=self._digest_id))],
+            [(f"Every {category}",
+              encode("scope_wide", self._open_index, digest_id=self._digest_id))],
+            [("↩ Back", encode("list", digest_id=self._digest_id))],
+        ]
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
+
+    def _verdict(self, intent) -> None:
+        """Turn a tapped verdict into the action sequence it stands for.
+
+        Each verdict maps to exactly one sequence, so what gets taught is what
+        the button said - the reason the vocabulary is buttons and not free
+        text. Nothing is written here: the scope question comes first, except
+        for trash, which is sender-only by design.
+        """
+        opened = self._open_item()
+        if opened is None:
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        _kind, item = opened
+        category = self._category_of(item.thread_id)
+
+        if intent.kind == "relabel" and intent.label_index is None:
+            # First tap: which label? Second tap arrives as relabel with one.
+            rows, row = [], []
+            for i, name in enumerate(self.categories):
+                row.append((name, encode("relabel", self._open_index, i,
+                                         digest_id=self._digest_id)))
+                if len(row) == 3:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append([("↩ Back", encode("list", digest_id=self._digest_id))])
+            self.transport.edit_message(self.chat_id, self._message_id,
+                                        f"{item.subject}\n\nLabel it as…", rows)
+            return
+
+        if intent.kind == "keep":
+            # Keep the label, drop everything that removes it from the inbox.
+            # Built from what actually happened rather than from a template, so
+            # a thread that was only labelled teaches only a label.
+            actions = [ActionTemplate(kind=k, params={"label": v} if v else {})
+                       for k, v in item.actions if k not in ("archive", "trash")]
+            if not actions:
+                actions = [ActionTemplate(kind="label", params={"label": category})]
+        elif intent.kind == "relabel":
+            chosen = self.categories[intent.label_index] \
+                if 0 <= (intent.label_index or 0) < len(self.categories) else category
+            # The original sequence with the label swapped: correcting the
+            # label should not silently also change whether it was archived.
+            actions = [ActionTemplate(kind=k, params={"label": chosen} if k == "label"
+                                      else ({"label": v} if v else {}))
+                       for k, v in item.actions] or \
+                      [ActionTemplate(kind="label", params={"label": chosen})]
+            category = chosen
+        else:
+            actions = [ActionTemplate(kind="trash")]
+
+        self._pending = {"verdict": intent.kind, "actions": actions,
+                         "category": category, "rule_id": self._rule_id_of(item)}
+        if intent.kind == "teach_trash":
+            # Sender-only, and not asked: a category-wide trash rule would
+            # auto-execute trash across a whole class of future mail on one tap
+            # (Plan 1's partition decision), which is a blast radius no single
+            # correction should be able to reach.
+            self._teach(wide=False)
+            return
+        self._ask_scope(intent.kind, item, category)
+
+    def _category_of(self, thread_id: str) -> str:
+        for raw in (self._last_run or {}).get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id") == thread_id:
+                return raw.get("category") or "other"
+        held = self.held.get(thread_id)
+        return (held.item.category if held else "other") or "other"
+
+    def _rule_id_of(self, item: DoneItem) -> Optional[str]:
+        for record in (self._last_run or {}).get("executed", []):
+            if record.get("thread_id") == item.thread_id:
+                actor = str(record.get("actor", ""))
+                if actor.startswith("rule:"):
+                    return actor.split(":", 1)[1]
+        return None
+
+    def _teach(self, *, wide: bool) -> None:
+        """Write the rule the pending verdict describes, and say what it says.
+
+        The confirmation names the rule in the digest's own vocabulary, because
+        a rule the owner cannot read is one they cannot correct. It never
+        mentions undo: nothing here reverses anything, and under dry-run there
+        was nothing to reverse in the first place.
+        """
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        opened = self._open_item()
+        if opened is None:
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        _kind, item = opened
+        category = pending["category"]
+        actions = pending["actions"]
+
+        if wide:
+            rule = Rule(id=f"r-{uuid.uuid4().hex[:8]}", scope="category",
+                        pattern=category, actions=actions,
+                        provenance=f"owner corrected {item.subject[:60]!r}",
+                        created_at=datetime.now(timezone.utc))
+            self.prefs.add_rule(rule)
+            reach = f"every {category}"
+        else:
+            thread = self._thread_for(item)
+            rule = rule_from_correction(
+                thread, actions, f"owner corrected {item.subject[:60]!r}")
+            self.prefs.add_rule(rule)
+            reach = f"{rule.scope} {rule.pattern}"
+
+        # A correction of what a rule proposed IS an override of that rule.
+        # This is the caller record_override has been waiting for since it was
+        # written; without it precision never moves and a bad rule is never
+        # demoted, however often it is corrected.
+        if item.from_rule and pending.get("rule_id"):
+            self.prefs.record_override(pending["rule_id"])
+
+        extra = (" I will do that without asking again, because a rule you "
+                 "taught is your own instruction." if pending["verdict"] == "teach_trash"
+                 else "")
+        self._panel = self._panel_before_item
+        self.transport.edit_message(
+            self.chat_id, self._message_id,
+            f"Learned: {reach} → {rule.summary}.{extra}\n\n"
+            f"That is for next time; this run is already done.",
+            [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _thread_for(self, item: DoneItem) -> Thread:
+        """The Thread choose_scope picks a scope from.
+
+        Built from what the item already carries rather than re-fetched: the
+        only fields choose_scope reads are sender and subject, and both are on
+        screen in front of the owner at the moment they press the button. The
+        rest of a Thread is not part of the decision.
+        """
+        return Thread(id=item.thread_id, subject=item.subject, sender=item.sender,
+                      to=[], date="", snippet="", body="", label_ids=[])
 
     def handle_update(self, update: dict) -> None:
         if not self._authorised(update):
@@ -385,7 +596,20 @@ class Bot:
             self._panel = "digest"
             self._show(edit=True)
             return
-        if intent.kind in ("open", "approve_attention"):
+        if intent.kind == "open":
+            # The screen the numbered buttons have always implied.
+            self._panel_before_item = self._panel
+            self._panel = "item"
+            self._open_index = intent.index or 0
+            self._show(edit=True)
+            return
+        if intent.kind in ("keep", "relabel", "teach_trash"):
+            self._verdict(intent)
+            return
+        if intent.kind in ("scope_narrow", "scope_wide"):
+            self._teach(wide=intent.kind == "scope_wide")
+            return
+        if intent.kind in ("approve_attention",):
             # Plan 2 gives these their real behaviour. Say so rather than
             # re-rendering an unchanged message, which Telegram rejects as
             # unmodified and which therefore looks like nothing at all.
