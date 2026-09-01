@@ -45,6 +45,14 @@ class Settings:
     # over, short enough to matter when clearing a backlog. Defaulted so every
     # existing construction of Settings keeps working unchanged.
     stale_after_days: int = 90
+    # Where the learned rules and the held queue live between runs. Both were
+    # in-memory while the queue was only ever read by the run that filled it;
+    # `agent/triaged` ended that, because a thread lost from the queue also
+    # leaves the fetch query and is not re-fetched by any mode, so losing it is
+    # no longer recoverable by running again. Defaulted, for the same reason
+    # stale_after_days is: every existing construction of Settings keeps
+    # working. Already gitignored - it holds real subjects and senders.
+    store_dir: Path = Path("inbox_agent/store")
     # Telegram review UI. Defaults keep every existing construction of Settings
     # (tests, the notebook) working unchanged; the bot refuses to start without
     # a token and a chat id, rather than running open to anyone who finds it.
@@ -112,6 +120,7 @@ def load_settings() -> Settings:
         snapshot_dir=Path(os.getenv("INBOX_SNAPSHOT_DIR", "inbox_agent/snapshot")),
         snapshot_size=int(os.getenv("INBOX_SNAPSHOT_SIZE", "50")),
         audit_log=Path(os.getenv("INBOX_AUDIT_LOG", "inbox_agent/audit.jsonl")),
+        store_dir=Path(os.getenv("INBOX_STORE_DIR", "inbox_agent/store")),
         forbidden_actions=ALWAYS_FORBIDDEN | frozenset(configured),
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),

@@ -9,11 +9,14 @@ Stage A. The interface is deliberately narrow so Mem0 can sit behind it later.
 """
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from langgraph.store.memory import InMemoryStore
+from langgraph.store.sqlite import SqliteStore
 
 from .models import ActionKind, HeldItem, ReviewItem, Rule, Thread
 
@@ -60,7 +63,50 @@ def build_store(embeddings=None, dims: int = 768) -> InMemoryStore:
     """
     if embeddings is None:
         return InMemoryStore()
-    return InMemoryStore(index={"embed": embeddings, "dims": dims, "fields": ["text"]})
+    return InMemoryStore(index=_index(embeddings, dims))
+
+
+def _index(embeddings, dims: int) -> Optional[dict]:
+    """Index config, or None when there is nothing to embed with.
+
+    Shared by both builders so an in-memory store and a SQLite one are indexed
+    on the same terms - otherwise a rule found by semantic search in the
+    notebook could be missed by the bot, and the difference would be invisible.
+    """
+    if embeddings is None:
+        return None
+    return {"embed": embeddings, "dims": dims, "fields": ["text"]}
+
+
+def open_store(path: Path | str, embeddings=None, dims: int = 768) -> SqliteStore:
+    """A store that outlives the process, at `path`.
+
+    `build_store` is memory: right for the suite, for the notebook, and for
+    anything whose lifetime is one run. It is wrong for the bot, and became
+    dangerous rather than merely lossy when `mark_triaged` landed. Every thread
+    a run processes leaves the fetch query, held ones included, and `fetch` uses
+    `settings.inbox_query` in both modes - so an item lost from the queue is not
+    re-fetched by `/triage`, and `/backlog` will not find it either. On a
+    restart the owner would not see a shorter digest; they would have threads
+    that no longer exist as far as the agent is concerned, recoverable only by
+    searching `label:agent/triaged` in Gmail by hand.
+
+    SQLite rather than a service for the same reason the audit log is a file:
+    it is one path, it is inspectable with tools the owner already has, and it
+    has no operational story to get wrong. Same BaseStore interface either way,
+    so `PreferenceStore` and `HeldQueue` are untouched by which one they get -
+    which is the whole reason they were written against the interface.
+
+    Autocommit (`isolation_level=None`) because SqliteStore opens its own
+    transactions; the default would nest them and every write would raise
+    `cannot start a transaction within a transaction`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn, index=_index(embeddings, dims))
+    store.setup()   # migrations, idempotent
+    return store
 
 
 # A rule that is wrong this often is worse than no rule: it produces confident,
