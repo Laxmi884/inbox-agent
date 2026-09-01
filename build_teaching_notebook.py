@@ -43,18 +43,32 @@ truth about it.
 ### What Stage A is
 
 An email triage agent that reads a frozen 50-thread Gmail snapshot, proposes a
-reversible action per thread, **stops and asks a human**, executes only what was
-approved through a single audited chokepoint, and turns corrections into durable
-rules.
+reversible action per thread, executes through a single audited chokepoint, asks
+a human about what genuinely needs one, and turns corrections into durable rules.
 
 ```
-  fetch ──▶ triage ──▶ propose ──▶ review ──▶ execute ──▶ learn
-                                     ▲  │
-                                     │  └── suspends here, durably
-                                     │
-                              a human answers, maybe hours later,
-                              maybe from a completely different UI
+  fetch ─▶ prefilter ─▶ classify ─▶ apply_rules ─▶ propose ─▶ partition ─┬─▶ auto_execute ─▶ enqueue_held ─┐
+                                                                        │                                 ├─▶ mark_triaged ─▶ learn
+                                                                        └─▶ <interrupt> ─▶ execute ───────┘
+                                                                              ▲  │
+                                                                              │  └── suspends here, durably
+                                                                              │
+                                                                       a human answers, maybe hours later,
+                                                                       maybe from a completely different UI
 ```
+
+**Read the fork carefully — it is the design.** Stage A as first written put
+*every* decision through the interrupt: the agent proposed fifty things and
+waited for fifty answers. `partition` splits that batch by authority. The
+confident and reversible majority goes left and **acts, then reports**; only
+what genuinely needs the owner goes right. The interrupt did not disappear — it
+is what a bulk sweep of historical mail still uses, because previewing five
+hundred actions before committing them is precisely what a durable suspension is
+for.
+
+That split is the difference between an agent that is *safe* and an agent that is
+*useful*, and it is worth being honest about the trade: gating everything is
+safer, and it is also why nobody would run it twice.
 
 The defining property: **the graph owns control flow, the model does not.** The
 model is never asked "what should we do next?" It is asked, 50 separate times,
@@ -573,18 +587,21 @@ the pagination defaults of whatever store you are on before you blame the model.
 """)
 
 code(r"""
+from inbox_agent.models import ActionTemplate
 from inbox_agent.store import PreferenceStore, build_store, rule_from_correction
 
 prefs = PreferenceStore(build_store())          # no embeddings needed for exact match
 t = threads[0]
 
-rule = rule_from_correction(t, "archive", f"you corrected thread {t.id}")
+# A rule stores ActionTemplates, not Actions. See the note below on why.
+rule = rule_from_correction(t, [ActionTemplate(kind="archive")],
+                            f"you corrected thread {t.id}")
 prefs.add_rule(rule)
 
 print(f"learned from one correction:")
 print(f"  scope      {rule.scope}")
 print(f"  pattern    {rule.pattern}")
-print(f"  action     {rule.action}")
+print(f"  actions    {rule.summary}")
 print(f"  provenance {rule.provenance}\n")
 
 hits = prefs.matching(t)
@@ -596,6 +613,127 @@ print(f"does it match an unrelated sender?     "
 code(r"""
 # PROOF
 test("tests/test_store.py")
+""")
+
+md(r"""
+### A rule stores templates, not actions — and why that is not pedantry
+
+Look at the two types side by side:
+
+```python
+class Action(BaseModel):          # what happens to ONE thread
+    kind: str
+    thread_id: str                # required
+    params: dict[str, Any]
+
+class ActionTemplate(BaseModel):  # what a rule wants done to mail it has
+    kind: str                     # not seen yet
+    params: dict[str, Any]
+```
+
+`Action` requires a `thread_id`, and that is correct: an action is always
+*about* one thread, and the chokepoint audits it that way. A rule has not met a
+thread yet, so it cannot hold an `Action` without inventing one. It holds the
+shape, and `prefilter._bind` joins shape to thread at match time.
+
+A small type distinction that removed a real production bug, so it is worth
+dwelling on. `Rule` used to carry a single `action: ActionKind` — one string,
+`"label"` or `"archive"`. Two things were unsayable:
+
+1. **Which label.** `prefilter` built `Action(kind=rule.action, thread_id=...)`
+   with **no params**, and the chokepoint dispatches a label with
+   `action.params["label"]`. A learned label rule raised `KeyError` the moment
+   it met a real mailbox.
+2. **A sequence.** The model routinely proposes label-*then*-archive, and the
+   correction an owner most wants to teach — "label it, but leave it in the
+   inbox" — is a statement about a sequence, not a kind.
+
+The `KeyError` is the more instructive half. Here is why nobody noticed:
+
+```python
+if settings.dry_run:
+    rec = AuditRecord(**base, result="simulated")
+    log.append(rec)
+    return rec                  # <-- returns BEFORE _dispatch
+```
+
+Under `INBOX_DRY_RUN=true` the broken rule returns `result="simulated"` and
+looks perfect. The bug is **invisible in the mode you develop in and fatal in
+the mode you ship in**. Generalise that: any safety switch that short-circuits
+the real work also short-circuits the errors the real work would have raised.
+Dry-run is not a weaker production; it is a *different code path*, and it hides
+exactly the failures it exists to protect you from.
+
+### Migration, because the store is now on disk
+
+Rules persist (`open_store`), so rules written before `actions` existed are
+sitting in a SQLite file. `Rule` accepts them:
+
+```python
+@model_validator(mode="before")
+def _accept_legacy_action(cls, data):
+    if isinstance(data, dict) and "action" in data and "actions" not in data:
+        data["actions"] = [{"kind": data.pop("action"), "params": {}}]
+    return data
+```
+
+Note what it does *not* do. A legacy `label` rule has no label to recover, so it
+converts to an empty template and is refused **by name** at bind time:
+
+> *rule r-old (sender 'x@y.com') says 'label' but names no label. It predates
+> labelled rules; correct one of these threads again to re-teach it.*
+
+Three options existed and two are worse. Dropping it silently deletes something
+the owner taught. Executing it silently is the `KeyError`, mid-run, after
+earlier actions have already reached Gmail. Refusing loudly, at the boundary
+where the data is still identifiable, is the only one that leaves the owner able
+to act.
+""")
+
+md(r"""
+### Rules fire in **two** places, and the reason is forced by the data
+
+`Rule.scope` is one of `sender`, `domain`, `fingerprint`, `subject` — and
+`category`. The first four are properties the raw thread already has, so
+`prefilter` matches them *before* the model runs, which is the whole point of
+`prefilter`: the cheapest LLM call is the one you don't make.
+
+`category` is different in kind. A category is not an attribute of an email; it
+is the model's **conclusion** about one. A rule about a category therefore
+cannot be applied in `prefilter` — at that moment the category does not exist.
+It is applied by a separate node, `apply_rules`, between `triage` and `propose`:
+
+```
+fetch ──▶ prefilter ──▶ classify ──▶ apply_rules ──▶ propose ──▶ partition ──▶ ...
+           │                            │
+           │                            └── category rules: rewrite the actions
+           └── sender-shaped rules: skip the model entirely
+```
+
+The two do genuinely different work:
+
+| | pre-model (`prefilter`) | post-model (`apply_rules`) |
+|---|---|---|
+| Matches on | the raw thread | the model's category |
+| Effect | the model is never called | the proposed actions are rewritten |
+| Saves | an LLM call | nothing — the call already happened |
+| Teaches | "you know what to do with this sender" | "you classified it right, then did the wrong thing" |
+
+`apply_rules` **rewrites; it does not re-judge.** The model's category stands and
+the owner's rule decides what happens to that category. That is the shape of the
+correction that motivated it — *"you were right that it is a valuable
+newsletter, you were wrong to archive it"* — and it is why teaching this
+preference does not require arguing with the classifier.
+
+Precedence falls out of the ordering instead of needing a tie-break rule: a
+sender rule means the model never runs, so `apply_rules` never sees that thread.
+
+**The generalisable lesson.** When you add a new kind of memory to an agent, ask
+what it is keyed on, then ask at what point in the pipeline that key *exists*.
+Memory keyed on raw input can short-circuit the model. Memory keyed on the
+model's own output cannot — it can only correct it afterwards. Putting the
+second where the first lives is a category error no type checker will catch,
+because both are just `Rule`.
 """)
 
 # ===========================================================================
@@ -1590,11 +1728,122 @@ run both cheaper and more explainable.
 """)
 
 # ===========================================================================
-# 12 — next
+# 12 — beyond stage A
 # ===========================================================================
 md(r"""
 ---
-# §12 · What Stage A deliberately is not
+# §12 · Acting alone, and learning from having acted
+
+Everything above describes a pipeline that proposes and waits. Running it for
+real changed two things about that, and both are worth understanding because
+they are the questions every agent that touches a real account eventually hits:
+**what may it do without asking**, and **how does it get better at doing it**.
+
+### 1. The autonomy ladder, implemented
+
+The spec always had one — `label`, `archive` and `draft` at "always" authority,
+`trash` never. It was implemented nowhere: `propose` put every decision into the
+review list. `partition` is that ladder as a pure function, and being a pure
+function is the point — it is the security-relevant decision in the system, so
+it is a table you can read and a test you can exhaust, not behaviour smeared
+across a graph node.
+
+The hold reasons, in precedence order, first match wins:
+
+| reason | why it waits |
+|---|---|
+| `trash` | irreversible enough to want a person, unless a **rule** proposed it |
+| `low_confidence` | the model said `< 0.5`; a guess is not authority |
+| `needs_reply` | a human is waiting on the owner |
+| `security_alert` | the owner should see it, whatever the proposal is |
+
+Two of those are *authorisation* ("may I?") and two are *attention* ("you should
+look at this"). They render as separate sections and only the attention tier
+gets a one-tap approve, because a blanket button that could reach `trash` is a
+rubber stamp on precisely the set that must not be rubber-stamped.
+
+Note the exception in row one. **Trash proposed by a learned rule executes
+without asking.** A rule is the owner's own prior instruction; asking again is
+the noise the design exists to remove. That is a real widening of authority
+earned by a correction, which is why the button that teaches it says so.
+
+### 2. A queue that outlives the run, and why that forced persistence
+
+Held items used to live in the graph checkpoint, which made "what is
+outstanding?" a question about a parked run. Once items carry forward across
+runs, the queue is the source of truth and the checkpoint is not.
+
+Then `mark_triaged` arrived — every processed thread gets an `agent/triaged`
+label so a labelled-but-still-inbox thread is not re-triaged forever — and it
+quietly changed what losing the queue *means*. The fetch query is:
+
+```
+in:inbox is:unread -label:agent/triaged
+```
+
+A held thread carries that label too. So a queue entry that disappears is not
+merely forgotten: the thread it named will never be fetched again, by `/triage`
+or by `/backlog`, because both use the same query. Before the label, losing the
+queue meant a short digest. After it, losing the queue means threads that no
+longer exist as far as the agent is concerned.
+
+That is why `open_store()` exists. The lesson is not "persist things" — it is
+that **a feature can change the severity of a limitation you had already
+accepted**, silently, without touching the code that limitation lives in. The
+in-memory store was a reasonable deferral right up until the moment it wasn't,
+and nothing about `store.py` changed on the day it stopped being reasonable.
+
+### 3. Learning from what the agent did alone
+
+Here is the failure this whole section is really about. `learn_from_response` is
+keyed on the interrupt's response:
+
+```python
+for thread_id, verdict in response.decisions.items():
+```
+
+Corrections arrive as verdicts on a review payload. So an action taken *without*
+a review teaches nothing — not by oversight, but **by construction**. Then
+`partition` moved the majority of mail onto exactly that path. The agent got
+quieter and learned less, which is the wrong direction for a system whose whole
+premise is that review shrinks as it is corrected.
+
+The fix is not a bigger prompt. It is a second, independent route into the same
+store: open a done item, say what was wrong, and the bot writes a rule directly.
+No graph state, no parked run, no interrupt — a store write and a confirmation,
+durable the moment it lands.
+
+Two design decisions inside that are worth stealing:
+
+- **Verdict first, scope second.** "Never archive this sender" and "never
+  archive any valuable newsletter" are different instructions behind the same
+  tap. The system cannot know which was meant, so it asks. One extra tap buys
+  the difference between a rule that fixes one sender and a rule that reaches a
+  whole class of mail.
+- **Teaching and undoing are separable.** `undo_action()` refuses on dry-run
+  records, correctly — under dry-run nothing happened, so there is nothing to
+  reverse. But a correction can still *teach*. Shipping the teaching half alone
+  meant every part of it could be exercised immediately; the undo half attaches
+  to the same buttons the day the agent goes live.
+
+### What it looks like when it works
+
+A correction made on a phone became `sender no-reply@p.simplywall.st → trash`.
+It survived a process restart, matched in `prefilter` on the next run before the
+model was called, auto-executed because a rule-proposed trash is the owner's own
+instruction, and the digest reported which rule decided it.
+
+That is the loop closing: a human correction becomes cheaper inference, less
+review, and a citable reason — which is what "the agent learns" has to mean if
+it is going to mean anything you can audit.
+""")
+
+# ===========================================================================
+# 13 — next
+# ===========================================================================
+md(r"""
+---
+# §13 · What Stage A deliberately is not
 
 Stage A is the **deterministic baseline**. Its limits are chosen, not accidental:
 
