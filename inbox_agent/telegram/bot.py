@@ -15,14 +15,17 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from langgraph.types import Command
 
 from ..config import Settings
 from ..models import ReviewRequest
-from .callbacks import Intent, decode, to_response
-from .render_tg import digest, paged
+from ..store import HeldQueue
+from .callbacks import DIGEST_ID_LEN, Intent, decode, to_response
+from .render_tg import DigestView, digest
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -31,19 +34,27 @@ class Bot:
     """Owns the graph, the checkpointer and the conversation with one human."""
 
     def __init__(self, *, transport, graph, settings: Settings,
-                 categories: Sequence[str] = (), mode: Optional[str] = None):
+                 held: HeldQueue, categories: Sequence[str] = (),
+                 mode: Optional[str] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
+        # The queue the graph fills. Injected rather than built here so both
+        # sides are looking at the same one - two instances over two stores
+        # would let the bot show an empty queue while the graph filled another.
+        self.held = held
         self.categories = list(categories)
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
 
-        # Per-review UI state. Deliberately NOT the source of truth for what was
-        # proposed - that is read back from the checkpoint (see _request).
+        # Per-digest UI state. Deliberately NOT the source of truth for what is
+        # outstanding - that is the queue, which outlives every run.
         self._message_id: Optional[int] = None
-        self._page = 0            # digest page, or item index in paged view
-        self._view = self.mode    # "digest" | "paged"; `open` switches at runtime
+        self._page = 0
+        self._digest_id = ""
+        # Counts runs actually started, so a test can assert that /held ran none.
+        self._runs_started = 0
+        self._last_run: Optional[dict] = None   # the graph result for the digest
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
@@ -97,13 +108,37 @@ class Bot:
 
     # --- rendering ----------------------------------------------------------
 
-    def _render(self, request: ReviewRequest) -> tuple[str, list]:
-        if self._view == "paged":
-            return paged(request, self._page, self.categories)
-        return digest(request, self._page, self.categories)
+    def _new_digest_id(self) -> str:
+        return uuid.uuid4().hex[:DIGEST_ID_LEN]
 
-    def _show(self, request: ReviewRequest, *, edit: bool) -> None:
-        text, keyboard = self._render(request)
+    def _view(self) -> DigestView:
+        """Assemble what the digest renders: this run's work plus the queue.
+
+        The done counts come from the audit records the run wrote, not from
+        graph state: the audit log is the durable record of what actually
+        reached Gmail, and it is the same source the undo path will read.
+        """
+        result = self._last_run or {}
+        done_by_kind: dict[str, int] = {}
+        rule_decided = 0
+        for record in result.get("executed", []):
+            if record.get("action") == "label" and \
+                    record.get("params", {}).get("label") == self.settings.triaged_label:
+                continue  # bookkeeping, not work the owner cares about
+            done_by_kind[record["action"]] = done_by_kind.get(record["action"], 0) + 1
+            if str(record.get("actor", "")).startswith("rule:"):
+                rule_decided += 1
+        return DigestView(
+            run_at=datetime.now(timezone.utc),
+            total=len(result.get("thread_ids", [])),
+            done_by_kind=done_by_kind,
+            rule_decided=rule_decided,
+            held=self.held.all(),
+            digest_id=self._digest_id,
+        )
+
+    def _show(self, *, edit: bool) -> None:
+        text, keyboard = digest(self._view(), self._page)
         if edit and self._message_id is not None:
             self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
         else:
@@ -130,6 +165,13 @@ class Bot:
         if command == "/triage":
             limit = int(arg) if arg.strip().isdigit() else self.settings.snapshot_size
             self._start(limit)
+        elif command == "/held":
+            # Shows the queue without running anything: the queue outlives runs,
+            # so looking at it must not require producing more work.
+            self._page = 0
+            self._message_id = None
+            self._digest_id = self._new_digest_id()
+            self._show(edit=False)
         elif command == "/status":
             self._status()
         elif command == "/cancel":
@@ -137,36 +179,38 @@ class Bot:
         else:
             self.transport.send_message(
                 self.chat_id,
-                "Commands: /triage [n] · /status · /cancel")
+                "Commands: /triage [n] · /held · /status · /cancel")
 
     def _start(self, limit: int) -> None:
         self._run += 1
+        self._runs_started += 1
         self._page = 0
-        self._view = self.mode
         self._intents = {}
         self._message_id = None
+        self._digest_id = self._new_digest_id()
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
-        # mode="backlog": the bot's whole review flow (digest/paged rendering,
-        # approve_all, per-item reject/edit) is built on the graph parking at
-        # the interrupt and being resumed later. The auto-execute/held-queue
-        # split (task 8) is not wired into this UI yet, so /triage must still
-        # get everything in front of the human rather than have some of it
-        # silently act and vanish before _request() ever reads the checkpoint.
-        self.graph.invoke({"limit": limit, "mode": "backlog"}, self._config)
-        elapsed = time.monotonic() - started
-
-        request = self._request()
-        if request is None:
-            log.warning("triage produced nothing to review (%.1fs)", elapsed)
-            self.transport.send_message(self.chat_id, "Nothing to review.")
+        # mode="incremental": /triage ACTS. The confident, reversible majority
+        # is executed and only what genuinely needs the owner goes to the queue,
+        # which is what this whole design is for. It ran in backlog mode while
+        # the bot rendered from a parked checkpoint - that transitional hack is
+        # what the queue and the digest replace.
+        try:
+            self._last_run = self.graph.invoke(
+                {"limit": limit, "mode": "incremental"}, self._config)
+        except Exception as exc:
+            # Silence is indistinguishable from an empty inbox, which is a
+            # failure the owner would trust for days without noticing. Say so.
+            log.exception("triage failed")
+            self.transport.send_message(
+                self.chat_id, f"Triage failed: {type(exc).__name__}. "
+                              f"Nothing was executed. /triage to retry.")
             return
-        n = len(request.items)
-        log.info("triage done: %s threads in %.1fs (%.2fs/thread), %s rule-decided",
-                 n, elapsed, elapsed / max(n, 1),
-                 sum(1 for i in request.items if i.source == "rule"))
-        self._show(request, edit=False)
+        elapsed = time.monotonic() - started
+        log.info("triage done in %.1fs: %s executed, %s held", elapsed,
+                 len(self._last_run.get("executed", [])), len(self.held.all()))
+        self._show(edit=False)
 
     def _status(self) -> None:
         request = self._request()
@@ -187,57 +231,47 @@ class Bot:
         """
         self._run += 1
         self._page = 0
-        self._view = self.mode
         self._intents = {}
         self._message_id = None
+        # Drop the digest id too, so the message still on the owner's screen
+        # stops being tappable. Cancelling the conversation has to cancel the
+        # buttons it drew, or a stale tap re-renders a run that was abandoned.
+        self._digest_id = ""
         log.info("run cancelled; moved to run=%s", self._run)
         self.transport.send_message(self.chat_id, "Cancelled. Nothing was executed.")
 
     def _on_callback(self, query: dict) -> None:
         intent = decode(query.get("data", ""))
         self.transport.answer_callback(query.get("id", ""))
-
-        request = self._request()
-        if request is None:
-            # Finished, cancelled, or never started. A replayed callback lands
-            # here and must do nothing at all.
-            return
-
         if intent.kind == "noop":
             return
-
-        if intent.kind == "open":
-            if intent.index is not None:
-                self._view = "paged"
-                self._page = intent.index
-                self._show(request, edit=True)
-            return
-
-        if intent.kind == "list":
-            self._view = "digest"
-            self._page = 0
-            self._show(request, edit=True)
+        if not self._digest_id or intent.digest_id != self._digest_id:
+            # A tap on a superseded digest. Positions have shifted since that
+            # message was drawn, so acting on it would act on the wrong thread.
+            #
+            # The empty-id check is not redundant: decode() reports an id-less
+            # callback as digest_id="", which is also this object's state before
+            # the first digest and after /cancel. Comparing alone would let ""
+            # match "" and make an id-less callback valid in exactly the two
+            # moments when no digest exists.
+            log.info("ignored a callback from digest %r (current %r)",
+                     intent.digest_id, self._digest_id)
             return
 
         if intent.kind in ("next", "prev"):
-            step = 1 if intent.kind == "next" else -1
-            self._page = max(0, self._page + step)
-            self._show(request, edit=True)
+            self._page = max(0, self._page + (1 if intent.kind == "next" else -1))
+            self._show(edit=True)
+            return
+        if intent.kind in ("open", "done", "approve_attention"):
+            # Plan 2 gives these their real behaviour. Re-rendering keeps the
+            # message live rather than silently doing nothing.
+            self._show(edit=True)
             return
 
-        if intent.kind in ("approve", "reject", "label"):
-            if intent.index is not None:
-                self._intents[intent.index] = intent
-                log.info("verdict: item %s -> %s", intent.index, intent.kind)
-                # After deciding one item, advance - reviewing is a flow, and
-                # stopping on the item you just handled makes it feel stuck.
-                if self._view == "paged" and intent.index < len(request.items) - 1:
-                    self._page = intent.index + 1
-            self._show(request, edit=True)
-            return
-
-        if intent.kind == "approve_all":
-            self._resume(request)
+    # --- the interrupt path -------------------------------------------------
+    # Unreached from /triage, which no longer parks. Kept whole for Plan 3's
+    # /backlog sweep - the one job that genuinely has to be previewed before it
+    # commits - and covered meanwhile at the graph level in tests/test_graph.py.
 
     def _resume(self, request: ReviewRequest) -> None:
         response = to_response(request, self._intents, self.categories)

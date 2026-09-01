@@ -68,7 +68,9 @@ def main() -> int:
 
     categories = policy_categories(policy)
     transport = HttpTransport(settings.tg_token)
-    bot = Bot(transport=transport, graph=graph, settings=settings,
+    # The same queue the graph fills: one instance, so the digest renders what
+    # the run actually held rather than a second, permanently empty store.
+    bot = Bot(transport=transport, graph=graph, settings=settings, held=held,
               categories=categories)
 
     print(f"backend   : {settings.backend}")
