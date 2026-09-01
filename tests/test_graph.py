@@ -25,7 +25,7 @@ class FakeLLM:
 def snapshot_file(tmp_path):
     data = [{"id": "t1", "subject": "Sale", "sender": "deals@shop.com", "to": [],
              "date": "2026-08-26T10:00:00Z", "snippet": "s", "body": "b",
-             "label_ids": ["INBOX"]}]
+             "label_ids": ["INBOX", "UNREAD"]}]
     p = tmp_path / "threads.json"
     p.write_text(json.dumps(data))
     return p
@@ -106,7 +106,10 @@ def test_rejecting_executes_nothing(wiring):
         Command(resume={"decisions": {"t1": "reject"}, "edits": {}, "instructions": []}),
         config)
     assert final["executed"] == []
-    assert wiring["log"].records() == []
+    # mark_triaged still runs on every processed thread (including a rejected
+    # one) and writes its own "simulated" label record, so the log is no
+    # longer empty - only the archive that reject blocked must be absent.
+    assert not any(r.action == "archive" for r in wiring["log"].records())
 
 
 def test_rejection_becomes_a_learned_rule(wiring):
@@ -170,7 +173,10 @@ def test_approve_unknown_thread_id_does_not_crash(wiring):
         config)
     assert final["executed"] == []
     assert any(s["thread_id"] == "ghost-thread" for s in final["skipped"])
-    assert wiring["log"].records() == []
+    # ghost-thread was never in the fetched batch, so mark_triaged - which only
+    # walks state["thread_ids"] - never touches it either, unlike t1, which
+    # legitimately picks up a triaged-label record.
+    assert not any(r.thread_id == "ghost-thread" for r in wiring["log"].records())
 
 
 def test_edit_unknown_thread_id_executes_nothing(wiring):
@@ -187,7 +193,9 @@ def test_edit_unknown_thread_id_executes_nothing(wiring):
         config)
     assert final["executed"] == []
     assert any(s["thread_id"] == "ghost-thread-2" for s in final["skipped"])
-    assert wiring["log"].records() == []
+    # Same reasoning as the ghost-thread case above: mark_triaged only walks
+    # the real fetched batch, so a forged id gets no record of any kind.
+    assert not any(r.thread_id == "ghost-thread-2" for r in wiring["log"].records())
 
 
 def test_forbidden_action_is_visible_in_state(wiring):
@@ -312,7 +320,7 @@ def test_stale_threads_are_demoted_inside_the_pipeline(tmp_path):
            .isoformat().replace("+00:00", "Z"))
     data = [{"id": "old1", "subject": "Are you still interested?",
              "sender": "someone@example.com", "to": [], "date": old,
-             "snippet": "waiting on you", "body": "", "label_ids": ["INBOX"]}]
+             "snippet": "waiting on you", "body": "", "label_ids": ["INBOX", "UNREAD"]}]
     snap = tmp_path / "threads.json"
     snap.write_text(_json.dumps(data))
 
@@ -356,7 +364,7 @@ def test_a_recent_needs_reply_still_stays_in_the_inbox(tmp_path):
     data = [{"id": "new1", "subject": "Are you free tomorrow?",
              "sender": "someone@example.com", "to": [],
              "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-             "snippet": "waiting", "body": "", "label_ids": ["INBOX"]}]
+             "snippet": "waiting", "body": "", "label_ids": ["INBOX", "UNREAD"]}]
     snap = tmp_path / "threads.json"
     snap.write_text(_json.dumps(data))
 
@@ -530,3 +538,56 @@ def test_an_unrecognised_mode_raises_rather_than_acting(wiring):
         graph.invoke({"limit": 10, "mode": "Backlog"},
                      {"configurable": {"thread_id": "run-g"}})
     assert wiring["log"].records() == [], "must not have acted before raising"
+
+
+# --- fetch only unread untriaged mail, and mark what was processed ----------
+
+
+def test_fetch_only_picks_unread_untriaged_inbox_mail(tmp_path):
+    from langgraph.checkpoint.memory import InMemorySaver
+    settings = Settings(backend="offline", dry_run=True, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "audit.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev")
+    rows = [
+        _row("unread") | {"label_ids": ["INBOX", "UNREAD"]},
+        _row("read") | {"label_ids": ["INBOX"]},
+        _row("done") | {"label_ids": ["INBOX", "UNREAD", "agent/triaged"]},
+        _row("archived") | {"label_ids": ["UNREAD"]},
+    ]
+    snap = _snapshot(tmp_path, rows)
+    graph = build_graph(
+        client=SnapshotGmailClient(snap), prefs=PreferenceStore(build_store()),
+        policy=Policy(text="T", version="local:test", source="local"),
+        llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
+        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-q"}})
+    assert result["thread_ids"] == ["unread"]
+
+
+def test_every_processed_thread_gets_the_triaged_label(tmp_path):
+    """Both tiers. A held item is processed too - it is in the queue, and
+    leaving it unlabelled would re-triage it on the next run."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    # dry_run=False: mark_triaged goes through execute_action like any other
+    # action (that's the whole point), and execute_action's dry-run branch
+    # never dispatches to the client (tests/test_audit.py::
+    # test_dry_run_does_not_touch_the_client pins this down) - so observing
+    # the label actually land on the thread requires a live run, the same way
+    # tests/test_audit.py::test_live_run_reaches_the_client does for archive.
+    settings = Settings(backend="offline", dry_run=False, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "audit.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev")
+    snap = _snapshot(tmp_path, [_row("t1"), _row("t2")])
+    client = SnapshotGmailClient(snap)
+    graph = build_graph(
+        client=client, prefs=PreferenceStore(build_store()),
+        policy=Policy(text="T", version="local:test", source="local"),
+        llm=FakeLLM(ThreadJudgment(category="other", action="archive", label=None,
+                                   reason="unsure", confidence=0.2)),
+        settings=settings, log=AuditLog(settings.audit_log),
+        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+    graph.invoke({"limit": 2}, {"configurable": {"thread_id": "run-m"}})
+    for tid in ("t1", "t2"):
+        assert settings.triaged_label in client.get_thread(tid).label_ids

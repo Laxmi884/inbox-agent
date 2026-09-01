@@ -62,3 +62,18 @@ def test_mask_does_not_reveal_short_secrets(monkeypatch):
     assert short_secret not in result
     assert "8 chars" in result
     assert "<redacted>" in result
+
+
+def test_triaged_label_defaults_and_is_overridable(monkeypatch):
+    from inbox_agent.config import load_settings
+    monkeypatch.delenv("INBOX_TRIAGED_LABEL", raising=False)
+    assert load_settings().triaged_label == "agent/triaged"
+    monkeypatch.setenv("INBOX_TRIAGED_LABEL", "bot/seen")
+    assert load_settings().triaged_label == "bot/seen"
+
+
+def test_inbox_query_excludes_read_and_already_triaged_mail(monkeypatch):
+    from inbox_agent.config import load_settings
+    monkeypatch.setenv("INBOX_TRIAGED_LABEL", "agent/triaged")
+    q = load_settings().inbox_query
+    assert "in:inbox" in q and "is:unread" in q and "-label:agent/triaged" in q

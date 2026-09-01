@@ -1,7 +1,7 @@
 """Stage A pipeline (spec section 4.2).
 
-    fetch -> prefilter -> classify -> propose -> partition -+-> auto_execute -> enqueue_held -+-> learn
-                                                             +-> <interrupt> -> execute -------+
+    fetch -> prefilter -> classify -> propose -> partition -+-> auto_execute -> enqueue_held -+
+                                                             +-> <interrupt> -> execute --------+-> mark_triaged -> learn
 
 partition splits the batch by the autonomy ladder (inbox_agent/partition.py).
 Confident, reversible actions act then report (auto_execute); everything else
@@ -11,6 +11,7 @@ backlog run can be resumed hours later from a different UI.
 """
 from __future__ import annotations
 
+import logging as log_module
 import operator
 import uuid
 from typing import Annotated, Optional, TypedDict, get_args
@@ -216,7 +217,9 @@ def build_graph(
         return [client.get_thread(i) for i in state["thread_ids"]]
 
     def fetch(state: TriageState) -> dict:
-        threads = client.list_threads(limit=state.get("limit", settings.snapshot_size))
+        threads = client.list_threads(
+            limit=state.get("limit", settings.snapshot_size),
+            query=settings.inbox_query)
         return {"thread_ids": [t.id for t in threads]}
 
     def triage(state: TriageState) -> dict:
@@ -298,6 +301,29 @@ def build_graph(
                      run_id=run_id, reason=raw["reason"])
         return {}
 
+    def mark_triaged(state: TriageState) -> dict:
+        """Label every thread this run processed, both tiers.
+
+        Held items are marked too: they are in the queue and will be shown from
+        there, so leaving them unlabelled would re-triage them on every run
+        while they wait - which is exactly the flood this label exists to stop.
+
+        Goes through execute_action like anything else, so it is audited, and is
+        refused by the deny-list and skipped by dry-run on the same terms.
+        """
+        context = _context(None)
+        for thread_id in state.get("thread_ids", []):
+            action = Action(kind="label", thread_id=thread_id,
+                            params={"label": settings.triaged_label})
+            try:
+                execute_action(action, client=client, settings=settings, log=log,
+                               actor="agent", context=context)
+            except ForbiddenActionError:
+                # Configured out. Not fatal: the run's real work already happened.
+                log_module.getLogger(__name__).warning(
+                    "triaged label refused by the deny-list; threads will be re-triaged")
+        return {}
+
     def review(state: TriageState) -> dict:
         """Suspend for the human. Durable: resume from any UI, any time."""
         answer = interrupt(state["review"])
@@ -356,7 +382,7 @@ def build_graph(
     builder = StateGraph(TriageState)
     for name, fn in (("fetch", fetch), ("triage", triage), ("propose", propose),
                      ("partition", partition_node), ("auto_execute", auto_execute),
-                     ("enqueue_held", enqueue_held),
+                     ("enqueue_held", enqueue_held), ("mark_triaged", mark_triaged),
                      ("review", review), ("execute", execute), ("learn", learn)):
         builder.add_node(name, fn)
 
@@ -367,9 +393,10 @@ def build_graph(
     builder.add_conditional_edges("partition", route_after_partition,
                                   {"auto_execute": "auto_execute", "review": "review"})
     builder.add_edge("auto_execute", "enqueue_held")
-    builder.add_edge("enqueue_held", "learn")
+    builder.add_edge("enqueue_held", "mark_triaged")
+    builder.add_edge("mark_triaged", "learn")
     builder.add_edge("review", "execute")
-    builder.add_edge("execute", "learn")
+    builder.add_edge("execute", "mark_triaged")
     builder.add_edge("learn", END)
 
     return builder.compile(checkpointer=checkpointer)

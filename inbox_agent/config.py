@@ -45,6 +45,22 @@ class Settings:
     # over, short enough to matter when clearing a backlog. Defaulted so every
     # existing construction of Settings keeps working unchanged.
     stale_after_days: int = 90
+    # Applied to every thread the agent has processed, so it leaves the fetch
+    # query. Without it, threads that were labelled but left in the inbox - and
+    # everything decided `none` - stay INBOX+UNREAD forever and are re-triaged,
+    # re-charged and re-reported in every single digest until read by hand.
+    #
+    # In Gmail rather than a local set on purpose: it is visible, so "why did it
+    # ignore this?" has an answer you can see in the mailbox; it survives losing
+    # the local store; and `label` is already at "always" authority, so it grants
+    # no new capability. Marking as READ would have worked too and was rejected -
+    # it destroys unread as a signal for the human and is not on the ladder.
+    triaged_label: str = "agent/triaged"
+
+    @property
+    def inbox_query(self) -> str:
+        return f"in:inbox is:unread -label:{self.triaged_label}"
+
     # Telegram review UI. Defaults keep every existing construction of Settings
     # (tests, the notebook) working unchanged; the bot refuses to start without
     # a token and a chat id, rather than running open to anyone who finds it.
@@ -71,6 +87,7 @@ def load_settings() -> Settings:
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
         stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
+        triaged_label=os.getenv("INBOX_TRIAGED_LABEL", "agent/triaged").strip(),
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),

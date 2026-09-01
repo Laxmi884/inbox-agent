@@ -44,7 +44,7 @@ class FakeTransport:
 def snapshot_file(tmp_path):
     data = [{"id": f"t{i}", "subject": f"Sale {i}", "sender": f"deals{i}@shop.com",
              "to": [], "date": "2026-08-26T10:00:00Z", "snippet": "s", "body": "",
-             "label_ids": ["INBOX"]} for i in range(4)]
+             "label_ids": ["INBOX", "UNREAD"]} for i in range(4)]
     p = tmp_path / "threads.json"
     p.write_text(json.dumps(data))
     return p
@@ -119,7 +119,10 @@ def test_approve_all_resumes_the_run_and_executes(bot):
     records = log.records()
     assert records, "nothing executed"
     assert all(r.dry_run for r in records), "dry-run must stay on"
-    assert len(records) == 4
+    # 4 archives (the approved actions) plus 4 triaged-label records - mark_triaged
+    # marks every thread the run processed, not just the approved ones.
+    assert len([r for r in records if r.action == "archive"]) == 4
+    assert len(records) == 8
 
 
 def test_a_forged_index_executes_nothing_extra(bot):
@@ -128,7 +131,11 @@ def test_a_forged_index_executes_nothing_extra(bot):
     b.handle_update(msg("/triage"))
     b.handle_update(cb(encode("reject", 99)))     # out of range
     b.handle_update(cb(encode("approve_all")))
-    assert len(log.records()) == 4                # all four, none extra, none skipped
+    records = log.records()
+    # all four archived, none extra, none skipped - plus 4 triaged-label
+    # records from mark_triaged, which marks the whole processed batch.
+    assert len([r for r in records if r.action == "archive"]) == 4
+    assert len(records) == 8
 
 
 def test_rejecting_one_item_then_approving_executes_three(bot):
@@ -136,7 +143,12 @@ def test_rejecting_one_item_then_approving_executes_three(bot):
     b.handle_update(msg("/triage"))
     b.handle_update(cb(encode("reject", 1)))
     b.handle_update(cb(encode("approve_all")))
-    assert len(log.records()) == 3
+    records = log.records()
+    # 3 archives (the rejected item stays unexecuted) plus 4 triaged-label
+    # records - mark_triaged marks every processed thread, including the
+    # rejected one.
+    assert len([r for r in records if r.action == "archive"]) == 3
+    assert len(records) == 7
 
 
 def test_replaying_a_callback_after_resume_does_not_double_execute(bot):
@@ -219,4 +231,8 @@ def test_a_verdict_given_in_paged_view_survives_to_the_resume(bot):
     b.handle_update(cb(encode("open", 1)))
     b.handle_update(cb(encode("reject", 1)))
     b.handle_update(cb(encode("approve_all")))
-    assert len(log.records()) == 3, "the rejection was lost between views"
+    records = log.records()
+    # As above: 3 archives + 4 triaged-label records from mark_triaged.
+    assert len([r for r in records if r.action == "archive"]) == 3, \
+        "the rejection was lost between views"
+    assert len(records) == 7
