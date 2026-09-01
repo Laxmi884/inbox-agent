@@ -10,8 +10,8 @@ from inbox_agent.models import Action, HeldItem, ReviewItem, ReviewRequest
 from inbox_agent.telegram import render_tg
 from inbox_agent.telegram.callbacks import decode
 from inbox_agent.telegram.render_tg import (
-    DigestView, HELD_PAGE_SIZE, TG_MAX_TEXT, digest, header, paged,
-    rule_decided_count,
+    DigestView, DONE_PAGE_SIZE, DoneItem, HELD_PAGE_SIZE, TG_MAX_TEXT, digest,
+    done_panel, header, paged, rule_decided_count,
 )
 
 NOW = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
@@ -329,6 +329,121 @@ def test_the_digest_carries_its_id_into_every_callback():
     intents = [decode(data) for row in kb for (_, data) in row]
     assert intents
     assert all(i.digest_id == "7f2a" for i in intents), intents
+
+
+# --- the done panel ---------------------------------------------------------
+# "3 label" tells the owner a label happened and refuses to say which one. The
+# digest reports the run; a report you cannot expand is a claim, not a report.
+
+def done(tid="t1", subject=None, sender=None, actions=(("archive", None),),
+         from_rule=False):
+    return DoneItem(thread_id=tid, subject=subject or f"Subject {tid}",
+                    sender=sender or f"{tid}@example.com",
+                    actions=list(actions), from_rule=from_rule)
+
+
+def done_view(items, *, dry_run=False):
+    return DigestView(run_at=NOW, total=len(items),
+                      done_by_kind={"archive": len(items)}, rule_decided=0,
+                      held=[], digest_id="7f2a", dry_run=dry_run,
+                      done=list(items))
+
+
+def test_the_panel_names_the_label_rather_than_counting_it():
+    """The question this panel exists to answer. "3 label" is not an answer."""
+    text, _ = done_panel(done_view([
+        done("t1", subject="You are Invited! Senior Data Analyst",
+             actions=[("label", "recruiter"), ("archive", None)])]))
+    assert "label(recruiter)" in text
+    assert "You are Invited! Senior Data Analyst" in text
+    assert "t1@example.com" in text
+
+
+def test_the_panel_summarises_which_labels_were_used():
+    """Scanning twelve lines to learn that everything went to one label is the
+    work the summary line does instead."""
+    items = ([done(f"r{i}", actions=[("label", "recruiter"), ("archive", None)])
+              for i in range(3)]
+             + [done("n1", actions=[("label", "newsletter_valuable")])])
+    text, _ = done_panel(done_view(items))
+    assert "recruiter 3" in text
+    assert "newsletter_valuable 1" in text
+
+
+def test_the_panel_headline_matches_the_number_on_the_button(bot_view=None):
+    """The button promises "Show the 21 done" and the panel opened on "(13)".
+
+    Both are true and they count different things - 21 actions across 13
+    threads, because a label-then-archive is one thread and two actions - which
+    is precisely why the message has to say which it means. Found by tapping the
+    button on a real run, not by the suite.
+    """
+    items = [done(f"t{i}", actions=[("label", "recruiter"), ("archive", None)])
+             for i in range(3)] + [done("t9", actions=[("archive", None)])]
+    view = DigestView(run_at=NOW, total=4, done_by_kind={"archive": 4, "label": 3},
+                      rule_decided=0, held=[held("h1", "trash")], digest_id="7f2a",
+                      done=items)
+    digest_text, kb = digest(view)
+    panel_text, _ = done_panel(view)
+
+    button = [label for row in kb for (label, _) in row if "done" in label]
+    assert button == ["📋 Show the 7 done"]
+    assert "(7)" in panel_text, "the panel headline disagreed with its own button"
+    assert "4 threads" in panel_text, "7 of what, across how many threads"
+
+
+def test_the_panel_says_would_have_under_dry_run():
+    """Same rule as the digest: never the word done for something that did not
+    reach Gmail."""
+    text, _ = done_panel(done_view([done()], dry_run=True))
+    assert "WOULD HAVE" in text
+    plain, _ = done_panel(done_view([done()]))
+    assert "WOULD HAVE" not in plain
+
+
+def test_the_panel_marks_what_a_rule_decided():
+    """The learning is the point; a run the owner taught should look taught."""
+    text, _ = done_panel(done_view([done("t1", from_rule=True)]))
+    assert "rule" in text.lower()
+
+
+def test_the_panel_offers_a_way_back_to_the_digest():
+    """A screen with no exit is a trap on a phone, where there is no Escape."""
+    _, kb = done_panel(done_view([done()]))
+    kinds = [decode(data).kind for row in kb for (_, data) in row]
+    assert "list" in kinds
+
+
+def test_the_panel_pages_rather_than_truncating():
+    items = [done(f"t{i:02d}") for i in range(DONE_PAGE_SIZE + 3)]
+    first, kb = done_panel(done_view(items))
+    assert "Subject t00" in first
+    assert f"Subject t{DONE_PAGE_SIZE:02d}" not in first
+    assert any(decode(data).kind == "next" for row in kb for (_, data) in row)
+
+    second, _ = done_panel(done_view(items), page=1)
+    assert f"Subject t{DONE_PAGE_SIZE:02d}" in second
+
+
+def test_an_out_of_range_panel_page_clamps_rather_than_raising():
+    """Reached from a callback, like every other page index here."""
+    text, _ = done_panel(done_view([done()]), page=99)
+    assert "Subject t1" in text
+
+
+def test_the_panel_never_exceeds_the_telegram_cap():
+    items = [done(f"t{i:02d}", subject="x" * 300, sender="s" * 300,
+                  actions=[("label", "y" * 100), ("archive", None)])
+             for i in range(DONE_PAGE_SIZE)]
+    text, _ = done_panel(done_view(items))
+    assert len(text) <= TG_MAX_TEXT
+
+
+def test_an_empty_run_says_so_rather_than_rendering_an_empty_screen():
+    text, kb = done_panel(done_view([]))
+    assert "nothing" in text.lower()
+    kinds = [decode(data).kind for row in kb for (_, data) in row]
+    assert "list" in kinds
 
 
 # --- paged ------------------------------------------------------------------

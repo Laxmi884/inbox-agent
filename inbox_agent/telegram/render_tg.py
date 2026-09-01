@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Optional, Sequence
 
 from ..models import HeldItem, ReviewRequest
 from ..render import LOW_CONFIDENCE, NO_REASON
@@ -28,6 +28,10 @@ TG_MAX_TEXT = 4096
 
 # A phone screen, roughly. Beyond this the queue is scrolling, not scanning.
 HELD_PAGE_SIZE = 8
+
+# Done items are two lines to a held item's three, and they are read rather than
+# acted on, so more of them fit the same screen.
+DONE_PAGE_SIZE = 12
 
 # Section order is hold-reason precedence order, so the most consequential
 # things are nearest the top of the message where they are read first.
@@ -62,6 +66,27 @@ _OVERFLOW = "… %d more did not fit in one message"
 
 
 @dataclass
+class DoneItem:
+    """One thread the run acted on, and what it did to it.
+
+    `actions` is (kind, label) pairs rather than pre-rendered text so the panel
+    can both print "label(recruiter)" and count how many went to `recruiter`
+    without parsing a string it just formatted.
+
+    Built from the audit records - what actually went through the chokepoint -
+    joined to the proposals for a subject and a sender, because an audit record
+    knows a thread by id and the owner does not.
+    """
+    thread_id: str
+    subject: str
+    sender: str
+    actions: list[tuple[str, Optional[str]]] = field(default_factory=list)
+    # The digest's header counts these; here they are marked individually, so
+    # "the rules you taught me" can be checked rather than taken on trust.
+    from_rule: bool = False
+
+
+@dataclass
 class DigestView:
     """Everything the digest renders, assembled by the caller.
 
@@ -87,6 +112,10 @@ class DigestView:
     # "16:00 · 22 threads · DONE (18)" for work done at 08:00, again on every
     # later /held. A report of a run that did not happen.
     run_report: bool = True
+    # What the run did, expanded. The digest carries the counts; this carries
+    # the list behind the "Show the N done" button, which said a label happened
+    # and could not say which one.
+    done: list[DoneItem] = field(default_factory=list)
 
 
 def rule_decided_count(request: ReviewRequest) -> int:
@@ -317,6 +346,110 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     if nav:
         keyboard.append(nav)
 
+    return text, keyboard
+
+
+_ACTION_CAP = 60
+
+
+def _done_actions(item: DoneItem) -> str:
+    """"label(recruiter), archive" - the same shape the review UI has always
+    used for a proposal, so a report of what happened reads like the proposal
+    it came from."""
+    rendered = ", ".join(f"{kind}({label})" if label else kind
+                         for kind, label in item.actions) or "none"
+    return _oneline(rendered, _ACTION_CAP)
+
+
+def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
+    """The list behind the digest's "Show the N done" button.
+
+    The digest says "33 archive · 17 label". That tells the owner a label
+    happened and refuses to say which one, which is the opposite of a report -
+    and the label is the part a correction would be about. This is the same
+    data expanded: one thread per entry, with what was done to it named.
+
+    Read-only on purpose. Undo belongs here and is not here yet: undo_action()
+    refuses on dry-run records, so its buttons cannot be exercised until the
+    agent is live against a real mailbox. A panel that shows what happened is
+    useful today; a row of buttons that all refuse would not be.
+    """
+    items = view.done
+    pages = max(1, (len(items) + DONE_PAGE_SIZE - 1) // DONE_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    window = items[page * DONE_PAGE_SIZE:(page + 1) * DONE_PAGE_SIZE]
+
+    # Never the word "done" for something that did not reach Gmail. Same rule as
+    # the digest, and the same reason: the banner that says dry_run is on is on
+    # a terminal, and this message is on a phone.
+    title = "✓ WOULD HAVE DONE" if view.dry_run else "✓ DONE"
+    # Actions, not threads, because that is what the button the owner just
+    # pressed promised: the digest counts "13 archive · 8 label" and its button
+    # says "Show the 21 done". Opening that on "(13)" - the thread count, since
+    # a label-then-archive is one thread and two actions - is two true numbers
+    # disagreeing in public, which is the same defect as a section heading
+    # counting only its page. So the headline matches the button, and then says
+    # how many threads that was.
+    actions = sum(len(item.actions) for item in items)
+    head = [f"{title} ({actions})"
+            + (f" · {len(items)} threads" if len(items) != actions else "")]
+    if pages > 1:
+        head[0] += f"  (page {page + 1}/{pages})"
+
+    # Counted over every item, not this page: the point of a summary is to save
+    # the owner from paging through to find out that everything went to one
+    # label, and a per-page count would be the same subtotal-as-total mistake
+    # the section headings were just fixed for.
+    labels: dict[str, int] = {}
+    for item in items:
+        for kind, label in item.actions:
+            if kind == "label" and label:
+                labels[label] = labels.get(label, 0) + 1
+    if labels:
+        head.append("labels: " + " · ".join(
+            f"{name} {count}" for name, count in sorted(labels.items())))
+
+    if not items:
+        head.append("")
+        head.append("This run executed nothing.")
+
+    lines = list(head)
+    if window:
+        lines.append("")
+    shown = 0
+    budget = TG_MAX_TEXT - len("\n".join(head)) - len(_OVERFLOW % 999) - 2
+    used = 0
+    for offset, item in enumerate(window, start=page * DONE_PAGE_SIZE + 1):
+        # Two lines and no blank between them: this is a list to scan, not a
+        # queue to work through, and the sender starting the second line is
+        # already enough to separate one entry from the next. The rule mark goes
+        # on the action line because that is the claim it qualifies.
+        block = (f"{offset}. {_oneline(item.subject, _SUBJECT_CAP)}\n"
+                 f"{_oneline(item.sender, _SENDER_CAP)} → {_done_actions(item)}"
+                 f"{'  · rule' if item.from_rule else ''}")
+        if used + len(block) + 1 > budget:
+            break
+        used += len(block) + 1
+        shown += 1
+        lines.append(block)
+    if shown < len(window):
+        lines.append("")
+        lines.append(_OVERFLOW % (len(window) - shown))
+
+    text = "\n".join(lines)[:TG_MAX_TEXT]
+
+    keyboard: list[list[tuple[str, str]]] = []
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        nav.append(("◀ Prev", encode("prev", digest_id=view.digest_id)))
+    if page < pages - 1:
+        nav.append(("Next ▶", encode("next", digest_id=view.digest_id)))
+    if nav:
+        keyboard.append(nav)
+    # Always last, always present: a screen with no way out is a trap on a
+    # phone, where there is no Escape key.
+    keyboard.append([("↩ Back to the digest",
+                      encode("list", digest_id=view.digest_id))])
     return text, keyboard
 
 

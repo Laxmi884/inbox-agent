@@ -25,7 +25,7 @@ from ..config import Settings
 from ..models import ReviewRequest
 from ..store import HeldQueue
 from .callbacks import DIGEST_ID_LEN, Intent, decode, to_response
-from .render_tg import DigestView, digest
+from .render_tg import DigestView, DoneItem, digest, done_panel
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -57,6 +57,14 @@ class Bot:
         # message re-renders it, and the DONE block must not reappear on page 2
         # of a message that never claimed a run in the first place.
         self._run_report = True
+        # Which screen the message is currently showing: the digest, or the
+        # done panel behind its button. State rather than an argument because
+        # paging re-renders whatever is on screen, and page 2 of the panel must
+        # not come back as page 2 of the queue.
+        self._panel = "digest"
+        # The panel's own page, so opening the panel and coming back does not
+        # move the owner to page one of a queue they were part way through.
+        self._done_page = 0
         # Counts runs actually started, so a test can assert that /held ran none.
         self._runs_started = 0
         self._last_run: Optional[dict] = None   # the graph result for the digest
@@ -158,8 +166,54 @@ class Bot:
             run_report=run_report,
         )
 
+    def _done_items(self) -> list[DoneItem]:
+        """What the run did, per thread, for the panel behind the button.
+
+        Two sources, deliberately. The audit records say what actually went
+        through the chokepoint - the only honest answer to "what did you do" -
+        but they know a thread by id, which is not something the owner can read.
+        The proposals in `auto` carry the subject and the sender. A record whose
+        thread is missing from `auto` still gets a row, named by its id: an
+        action with no visible subject is strange, and hiding it would be worse.
+
+        .get() throughout, like _view, and for the same reason: this runs after
+        the graph executed, so an exception here costs the owner the report for
+        work that already happened.
+        """
+        result = self._last_run or {}
+        known: dict[str, dict] = {}
+        for raw in result.get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id"):
+                known[raw["thread_id"]] = raw
+
+        rows: dict[str, DoneItem] = {}
+        for record in result.get("executed", []):
+            kind = record.get("action")
+            thread_id = record.get("thread_id")
+            if not kind or not thread_id:
+                continue
+            label = (record.get("params") or {}).get("label")
+            if kind == "label" and label == self.settings.triaged_label:
+                continue    # bookkeeping on every thread, not work to report
+            item = rows.get(thread_id)
+            if item is None:
+                proposal = known.get(thread_id, {})
+                item = DoneItem(thread_id=thread_id,
+                                subject=proposal.get("subject") or thread_id,
+                                sender=proposal.get("sender") or "")
+                rows[thread_id] = item
+            item.actions.append((kind, label))
+            if str(record.get("actor", "")).startswith("rule:"):
+                item.from_rule = True
+        return list(rows.values())
+
     def _show(self, *, edit: bool) -> None:
-        text, keyboard = digest(self._view(run_report=self._run_report), self._page)
+        view = self._view(run_report=self._run_report)
+        if self._panel == "done":
+            view.done = self._done_items()
+            text, keyboard = done_panel(view, self._done_page)
+        else:
+            text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
             self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
         else:
@@ -194,6 +248,7 @@ class Bot:
             self._message_id = None
             self._digest_id = self._new_digest_id()
             self._run_report = False
+            self._panel = "digest"
             self._show(edit=False)
         elif command == "/status":
             self._status()
@@ -212,6 +267,8 @@ class Bot:
         self._message_id = None
         self._digest_id = self._new_digest_id()
         self._run_report = True
+        self._panel = "digest"
+        self._done_page = 0
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
@@ -276,9 +333,19 @@ class Bot:
             self.chat_id, "Cancelled. Buttons on the last digest are no longer active.")
 
     def _on_callback(self, query: dict) -> None:
+        """Every path answers the callback, and says something when it refuses.
+
+        Telegram spins the button until answerCallbackQuery arrives, and an
+        empty answer clears the spinner without saying anything. Both refusals
+        below - a stale digest, and a button whose behaviour is not built yet -
+        used to be silent, which is indistinguishable from a broken bot: the
+        owner taps again, and again, and then asks what the button is for.
+        """
         intent = decode(query.get("data", ""))
-        self.transport.answer_callback(query.get("id", ""))
+        answer = query.get("id", "")
         if intent.kind == "noop":
+            self.transport.answer_callback(
+                answer, "That button came from an older message.")
             return
         if not self._digest_id or intent.digest_id != self._digest_id:
             # A tap on a superseded digest. Positions have shifted since that
@@ -291,16 +358,40 @@ class Bot:
             # moments when no digest exists.
             log.info("ignored a callback from digest %r (current %r)",
                      intent.digest_id, self._digest_id)
+            self.transport.answer_callback(
+                answer, "That digest is out of date - send /triage or /held "
+                        "for a current one.")
             return
 
+        self.transport.answer_callback(answer)
+
         if intent.kind in ("next", "prev"):
-            self._page = max(0, self._page + (1 if intent.kind == "next" else -1))
+            step = 1 if intent.kind == "next" else -1
+            if self._panel == "done":
+                self._done_page = max(0, self._done_page + step)
+            else:
+                self._page = max(0, self._page + step)
             self._show(edit=True)
             return
-        if intent.kind in ("open", "done", "approve_attention"):
-            # Plan 2 gives these their real behaviour. Re-rendering keeps the
-            # message live rather than silently doing nothing.
+        if intent.kind == "done":
+            # The report half of act-then-report. The counts say a label
+            # happened; this says which one, which is the part a correction
+            # would be about.
+            self._panel = "done"
+            self._done_page = 0
             self._show(edit=True)
+            return
+        if intent.kind == "list":
+            self._panel = "digest"
+            self._show(edit=True)
+            return
+        if intent.kind in ("open", "approve_attention"):
+            # Plan 2 gives these their real behaviour. Say so rather than
+            # re-rendering an unchanged message, which Telegram rejects as
+            # unmodified and which therefore looks like nothing at all.
+            self.transport.answer_callback(
+                answer, "Not built yet - opening an item and approving the "
+                        "attention tier land in the next step.")
             return
 
     # --- the interrupt path -------------------------------------------------

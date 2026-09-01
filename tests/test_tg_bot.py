@@ -276,6 +276,123 @@ def test_paging_a_held_digest_does_not_bring_the_run_report_back(bot):
     assert "DONE" not in t.edited[-1]["text"]
 
 
+# --- the done panel ---------------------------------------------------------
+# The digest says "3 label" and cannot say which label. The button that claims
+# to expand that was wired to a re-render of the same message, which Telegram
+# rejects as unmodified - so on a real phone it did nothing at all.
+
+def test_tapping_show_the_done_opens_a_panel_listing_the_threads(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert "Sale 0" not in t.sent[-1]["text"], "the digest already listed them"
+
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    assert t.edited, "the done button did not render anything"
+    assert "Sale 0" in t.edited[-1]["text"]
+
+
+def test_the_panel_names_the_label_a_thread_was_given(bot):
+    """The question the panel exists to answer, end to end through the bot: an
+    audit record knows the thread by id, and the owner does not."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = {
+        "thread_ids": ["t0"],
+        "auto": [review_item("t0", action="archive").model_dump(mode="json")],
+        "executed": [
+            {"thread_id": "t0", "action": "label",
+             "params": {"label": "recruiter"}, "actor": "agent"},
+            {"thread_id": "t0", "action": "archive", "params": {},
+             "actor": "agent"},
+        ],
+    }
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    assert "label(recruiter)" in text
+    assert "Subject t0" in text, "the panel showed an id instead of a subject"
+
+
+def test_the_panel_credits_a_rule_that_decided_a_thread(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = {
+        "thread_ids": ["t0"],
+        "auto": [review_item("t0").model_dump(mode="json")],
+        "executed": [{"thread_id": "t0", "action": "archive", "params": {},
+                      "actor": "rule:r-123"}],
+    }
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    assert "rule" in t.edited[-1]["text"].lower()
+
+
+def test_the_triaged_label_is_bookkeeping_and_stays_out_of_the_panel(bot):
+    """Same exclusion the counts already make. Every thread gets this label;
+    listing it would bury the work the owner actually cares about."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = {
+        "thread_ids": ["t0"],
+        "auto": [review_item("t0").model_dump(mode="json")],
+        "executed": [{"thread_id": "t0", "action": "label",
+                      "params": {"label": "agent/triaged"}, "actor": "agent"},
+                     {"thread_id": "t0", "action": "archive", "params": {},
+                      "actor": "agent"}],
+    }
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    assert "agent/triaged" not in t.edited[-1]["text"]
+
+
+def test_back_from_the_panel_returns_to_the_digest(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    digest_text = t.sent[-1]["text"]
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    assert t.edited[-1]["text"] == digest_text
+
+
+def test_the_digest_page_survives_a_trip_through_the_panel(bot):
+    """Paging is shared state. Opening the panel and coming back must not
+    silently move the owner to page one of a queue they were reading."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    for item in [review_item(f"q{i}") for i in range(12)]:
+        b.held.add(item, run_id="r1", reason="trash")
+    b.handle_update(cb(encode("next", digest_id=b._digest_id)))
+    assert b._page == 1
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    assert b._page == 1
+
+
+def test_a_new_triage_leaves_the_panel(bot):
+    """Otherwise the next run's digest renders into a screen the owner opened
+    for the last one."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(msg("/triage 4"))
+    assert "waiting" in t.sent[-1]["text"], "a digest did not come back"
+
+
+def test_a_stale_tap_says_so_instead_of_doing_nothing(bot):
+    """The guard is right to drop it. Dropping it in silence is what makes the
+    owner tap three more times and then ask what the button is for."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(cb(encode("done", digest_id="dead")))
+    assert t.edited == [], "a stale tap was acted on"
+    assert "/triage" in t.answered[-1]["text"]
+
+
+def test_a_button_with_no_behaviour_yet_says_that_too(bot):
+    """`open` lands in Plan 2. Until then it must not look broken."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    assert t.answered[-1]["text"], "an inert button answered with silence"
+
+
 def test_held_is_offered_in_the_help_text(bot):
     b, t, _ = bot
     b.handle_update(msg("/nonsense"))
@@ -326,9 +443,15 @@ def test_a_callback_from_a_previous_digest_is_ignored(bot):
 
 
 def test_a_callback_from_the_current_digest_is_honoured(bot):
+    """The other half of the digest id: a current tap must get through.
+
+    Asserted on `done`, which now renders the panel, rather than on `open`,
+    which is still waiting on Plan 2 and proves acceptance only by the toast it
+    answers with - see test_a_button_with_no_behaviour_yet_says_that_too.
+    """
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     assert t.edited
 
 
