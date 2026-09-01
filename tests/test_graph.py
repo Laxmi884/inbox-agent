@@ -363,3 +363,19 @@ def test_a_recent_needs_reply_still_stays_in_the_inbox(tmp_path):
     result = graph.invoke({"limit": 5}, {"configurable": {"thread_id": "fresh-1"}})
     item = result["__interrupt__"][0].value["items"][0]
     assert [a["kind"] for a in item["proposed"]] == ["none"]
+
+
+def test_a_bare_reject_now_teaches_a_rule(wiring):
+    """Skip used to teach nothing: learn_from_response required an edit, so
+    correcting the agent by skipping never made it better."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "reject-learns"}}
+    graph.invoke({"limit": 5}, cfg)
+    final = graph.invoke(Command(resume={
+        "decisions": {"t1": "reject"}, "edits": {}, "instructions": []}), cfg)
+
+    assert final["learned"], "a bare reject taught nothing"
+    rule = wiring["prefs"].rules()[0]
+    assert rule.rejected_action == "archive", "did not record WHAT was rejected"
+    assert rule.action == "none"

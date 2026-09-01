@@ -17,6 +17,12 @@ from .policy import Policy
 # One thread must never eat the window. Gemma runs at num_ctx=8192.
 MAX_BODY_CHARS = 4000
 
+# Every instruction ever given, appended forever, is an unbounded prompt - the
+# exact context-growth problem Stage A avoids everywhere else. Newest win: a
+# later instruction is more likely to reflect what the owner currently wants.
+MAX_INSTRUCTIONS = 12
+MAX_INSTRUCTION_CHARS = 200
+
 
 def _require_every_field(schema: dict) -> None:
     """Mark every property required in the JSON Schema handed to the runner.
@@ -213,10 +219,28 @@ def _fence(body: str) -> str:
     return clipped
 
 
-def build_prompt(thread: Thread, policy: Policy) -> list[BaseMessage]:
+def _instruction_block(instructions) -> str:
+    """Owner instructions, newest-last, capped, and fence-escaped.
+
+    Typed by the owner and therefore trusted for CONTENT - but still escaped,
+    because trusted text that can close the email fence would let a careless
+    paste forge instruction context. Trust is about authority, not about
+    skipping input hygiene.
+    """
+    if not instructions:
+        return ""
+    kept = [str(t)[:MAX_INSTRUCTION_CHARS] for t in instructions][-MAX_INSTRUCTIONS:]
+    lines = "\n".join(f"- {_fence(t)}" for t in kept)
+    return ("\n\nStanding instructions from the mailbox owner. These outrank "
+            "your own judgement and the guidance above:\n" + lines + "\n")
+
+
+def build_prompt(thread: Thread, policy: Policy,
+                 instructions=None) -> list[BaseMessage]:
     # Policy states the judgement; OUTPUT_CONTRACT states the format the runner
     # will not enforce for us. See the note above OUTPUT_CONTRACT.
-    system = SystemMessage(content=policy.text + OUTPUT_CONTRACT)
+    system = SystemMessage(
+        content=policy.text + _instruction_block(instructions) + OUTPUT_CONTRACT)
     human = HumanMessage(content=(
         "Classify this email thread.\n\n"
         f"From: {thread.sender}\n"
@@ -244,11 +268,12 @@ def _to_actions(judgment: ThreadJudgment, thread_id: str) -> list[Action]:
     return [Action(kind=judgment.action, thread_id=thread_id)]
 
 
-def classify_thread(thread: Thread, llm, policy: Policy) -> Decision:
+def classify_thread(thread: Thread, llm, policy: Policy,
+                    instructions=None) -> Decision:
     """Judge one thread. Never raises: a model failure becomes a visible no-op."""
     try:
         judgment = llm.with_structured_output(ThreadJudgment).invoke(
-            build_prompt(thread, policy))
+            build_prompt(thread, policy, instructions))
     except Exception as exc:
         return Decision(
             thread_id=thread.id, category="unknown",
@@ -267,6 +292,7 @@ def classify_thread(thread: Thread, llm, policy: Policy) -> Decision:
     )
 
 
-def classify_batch(threads: list[Thread], llm, policy: Policy) -> list[Decision]:
+def classify_batch(threads: list[Thread], llm, policy: Policy,
+                   instructions=None) -> list[Decision]:
     """Sequential by design: one thread per call keeps context small for Gemma."""
-    return [classify_thread(t, llm, policy) for t in threads]
+    return [classify_thread(t, llm, policy, instructions) for t in threads]
