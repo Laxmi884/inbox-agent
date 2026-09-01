@@ -174,3 +174,36 @@ def test_garbage_is_still_a_noop():
 def test_a_digest_id_that_is_not_hex_is_rejected():
     """Bounds what we will parse at all, the same reasoning as _MAX_PARSED_INDEX."""
     assert decode("a:3:zz//").kind == "noop"
+
+
+# --- correction verdicts ----------------------------------------------------
+# A verdict names a position, like everything else here. The thread id never
+# travels, so no callback string can name a thread the owner was not shown.
+
+def test_the_new_verdict_kinds_round_trip():
+    for kind in ("keep", "relabel", "teach_trash", "scope_narrow", "scope_wide"):
+        intent = decode(encode(kind, 3, digest_id="7f2a"))
+        assert intent.kind == kind
+        assert intent.index == 3
+        assert intent.digest_id == "7f2a"
+
+
+def test_every_new_kind_fits_the_byte_cap():
+    """64 bytes is protocol. An index reaches three digits on a backlog."""
+    for kind in ("keep", "relabel", "teach_trash", "scope_narrow", "scope_wide"):
+        assert len(encode(kind, 999, digest_id="7f2a").encode()) <= CB_MAX_BYTES
+
+
+def test_a_relabel_carries_the_category_it_names():
+    """Label as … is two taps: pick the item, then pick the label. The second
+    has to carry which label without a thread id ever travelling."""
+    intent = decode(encode("relabel", 3, 2, digest_id="7f2a"))
+    assert intent.kind == "relabel"
+    assert intent.index == 3
+    assert intent.label_index == 2
+
+
+def test_a_verdict_without_a_digest_id_is_refused():
+    """Same staleness rule as every other kind: positions shift between
+    digests, so a verdict from an older message must not resolve."""
+    assert decode(encode("keep", 3)).digest_id == ""
