@@ -16,7 +16,7 @@ from ..config import get_embeddings, load_settings, mask, use_model
 from ..gmail import SnapshotGmailClient
 from ..graph import build_graph
 from ..policy import load_policy
-from ..store import PreferenceStore, build_store
+from ..store import HeldQueue, PreferenceStore, build_store
 from .bot import Bot, HttpTransport, run_polling
 
 
@@ -50,6 +50,10 @@ def main() -> int:
     client = SnapshotGmailClient(settings.snapshot_dir / "threads.json")
     log = AuditLog(settings.audit_log)
     prefs = PreferenceStore(build_store(get_embeddings()))
+    # Own namespace, own store: a held item is work in flight, not durable
+    # preference knowledge, and build_graph now requires the queue explicitly
+    # (task 4) rather than building one for itself.
+    held = HeldQueue(build_store())
     llm = use_model("gemma") if settings.backend == "ollama" else None
     if llm is None:
         from ..config import get_llm
@@ -59,7 +63,8 @@ def main() -> int:
     checkpointer = cm.__enter__()
 
     graph = build_graph(client=client, prefs=prefs, policy=policy, llm=llm,
-                        settings=settings, log=log, checkpointer=checkpointer)
+                        settings=settings, log=log, held=held,
+                        checkpointer=checkpointer)
 
     categories = policy_categories(policy)
     transport = HttpTransport(settings.tg_token)

@@ -14,7 +14,7 @@ from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph
 from inbox_agent.policy import Policy
-from inbox_agent.store import PreferenceStore, build_store
+from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 from inbox_agent.telegram.bot import Bot
 from inbox_agent.telegram.callbacks import encode
 
@@ -62,6 +62,7 @@ def bot(tmp_path, snapshot_file):
                         prefs=PreferenceStore(build_store()),
                         policy=Policy(text="P", version="local:t", source="local"),
                         llm=FakeLLM(), settings=settings, log=log,
+                        held=HeldQueue(build_store()),
                         checkpointer=InMemorySaver())
     t = FakeTransport()
     return Bot(transport=t, graph=graph, settings=settings,

@@ -1,9 +1,13 @@
 """Stage A pipeline (spec section 4.2).
 
-    fetch -> prefilter -> classify -> propose -> <interrupt> -> execute -> learn
+    fetch -> prefilter -> classify -> propose -> partition -+-> auto_execute -> enqueue_held -+-> learn
+                                                             +-> <interrupt> -> execute -------+
 
-The graph owns control flow; the model only judges individual threads. The
-interrupt is durable, so a run can be resumed hours later from a different UI.
+partition splits the batch by the autonomy ladder (inbox_agent/partition.py).
+Confident, reversible actions act then report (auto_execute); everything else
+either queues for later (enqueue_held, incremental mode) or waits on the
+human right now (<interrupt>, backlog mode). The interrupt is durable, so a
+backlog run can be resumed hours later from a different UI.
 """
 from __future__ import annotations
 
@@ -22,10 +26,11 @@ from .config import Settings
 from .models import (
     Action, ActionKind, Decision, ReviewItem, ReviewRequest, ReviewResponse, Thread,
 )
+from .partition import partition
 from .policy import Policy
 from .prefilter import prefilter
 from .recency import demote_stale
-from .store import PreferenceStore, rule_from_correction
+from .store import HeldQueue, PreferenceStore, rule_from_correction
 
 # Derived from the Literal itself, not a hand-copied list, so this can't
 # silently drift from ActionKind if it's ever extended.
@@ -53,6 +58,13 @@ class TriageState(TypedDict, total=False):
     # direction that loses data, so the framework enforces it now.
     skipped: Annotated[list[dict], operator.add]
     learned: list[str]
+    # "incremental" (default) or "backlog". Selects the edge out of partition:
+    # incremental acts then reports, backlog previews then commits. The two
+    # differ in risk, not in classification - a bad rule applied across 500
+    # historical threads is not something per-item undo repairs comfortably.
+    mode: str
+    auto: list[dict]
+    held: list[dict]
 
 
 def learn_from_response(
@@ -119,6 +131,31 @@ def learn_from_response(
     return learned, skipped
 
 
+def _run_actions(actions, *, decision, verdict, client, settings, log, context):
+    """Push one item's actions through the chokepoint. Returns (executed, refused).
+
+    Lifted out of execute() so auto_execute and the interrupt path cannot drift
+    apart. There must be exactly one place where an Action reaches Gmail.
+    """
+    executed, refused = [], []
+    for action in actions:
+        if action.kind == "none":
+            continue
+        try:
+            record = execute_action(
+                action, client=client, settings=settings, log=log,
+                actor="human" if verdict == "edit" else (
+                    f"rule:{decision.rule_id}" if decision.rule_id else "agent"),
+                context=context,
+                rule_provenance=decision.reason if decision.rule_id else None,
+            )
+            executed.append(record.model_dump(mode="json"))
+        except ForbiddenActionError as exc:
+            refused.append({"thread_id": decision.thread_id,
+                            "kind": action.kind, "error": str(exc)})
+    return executed, refused
+
+
 def build_graph(
     *,
     client,
@@ -127,8 +164,43 @@ def build_graph(
     llm,
     settings: Settings,
     log: AuditLog,
+    held: HeldQueue,
     checkpointer=None,
 ):
+    def _context(config: Optional[RunnableConfig]) -> ExecutionContext:
+        """Per-invocation, not per-graph: checkpoint_id and langsmith_run_id are
+        run-scoped and only exist once a run is actually underway.
+
+        Accepts None so nodes without a RunnableConfig can still build one.
+
+        checkpoint_id: verified against a real config dict at runtime (langgraph
+        1.2.11) - config["configurable"]["checkpoint_id"] exists as a key but is
+        None on both the initial and the resumed invocation of a node; it is not
+        populated by ordinary forward execution in this version. thread_id IS
+        reliably present on every invocation, so that is what gets recorded
+        (field left named checkpoint_id per the audit schema).
+        """
+        configurable = config.get("configurable", {}) if config else {}
+
+        # Only present when tracing is actually active. Tracing is OFF by
+        # default locally, so this must never raise or add latency when
+        # LangSmith is not configured.
+        langsmith_run_id = None
+        try:
+            run_tree = get_current_run_tree()
+            if run_tree is not None:
+                langsmith_run_id = str(run_tree.id)
+        except Exception:
+            langsmith_run_id = None
+
+        return ExecutionContext(
+            model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
+            backend=settings.backend,
+            policy_version=policy.version,
+            checkpoint_id=configurable.get("thread_id"),
+            langsmith_run_id=langsmith_run_id,
+        )
+
     def _threads(state: TriageState) -> list[Thread]:
         """Re-read from the client. State carries ids only (see TriageState)."""
         return [client.get_thread(i) for i in state["thread_ids"]]
@@ -171,44 +243,50 @@ def build_graph(
             run_id=uuid.uuid4().hex[:8], policy_version=policy.version, items=items)
         return {"review": request.model_dump(mode="json")}
 
+    def partition_node(state: TriageState) -> dict:
+        request = ReviewRequest.model_validate(state["review"])
+        auto, held_pairs = partition(request.items)
+        return {
+            "auto": [i.model_dump(mode="json") for i in auto],
+            "held": [{"item": i.model_dump(mode="json"), "reason": r}
+                     for i, r in held_pairs],
+        }
+
+    def route_after_partition(state: TriageState) -> str:
+        # Backlog previews before committing; everything else acts then reports.
+        return "review" if state.get("mode") == "backlog" else "auto_execute"
+
+    def auto_execute(state: TriageState, config: RunnableConfig) -> dict:
+        context = _context(config)
+        decisions = {d["thread_id"]: Decision.model_validate(d)
+                     for d in state["decisions"]}
+        executed, refused = [], []
+        for raw in state.get("auto", []):
+            item = ReviewItem.model_validate(raw)
+            decision = decisions.get(item.thread_id)
+            if decision is None:
+                continue
+            ran, refused_here = _run_actions(
+                decision.actions, decision=decision, verdict="approve",
+                client=client, settings=settings, log=log, context=context)
+            executed += ran
+            refused += refused_here
+        return {"executed": executed, "refused": refused}
+
+    def enqueue_held(state: TriageState) -> dict:
+        run_id = ReviewRequest.model_validate(state["review"]).run_id
+        for raw in state.get("held", []):
+            held.add(ReviewItem.model_validate(raw["item"]),
+                     run_id=run_id, reason=raw["reason"])
+        return {}
+
     def review(state: TriageState) -> dict:
         """Suspend for the human. Durable: resume from any UI, any time."""
         answer = interrupt(state["review"])
         return {"response": answer}
 
     def execute(state: TriageState, config: RunnableConfig) -> dict:
-        # ExecutionContext is built here, per invocation, rather than once in
-        # build_graph: checkpoint_id/langsmith_run_id are run-scoped, not
-        # graph-scoped, and only exist once a run is actually underway.
-        #
-        # checkpoint_id: verified against a real config dict at runtime
-        # (langgraph 1.2.11) - config["configurable"]["checkpoint_id"] exists
-        # as a key but is None on both the initial and the resumed invocation
-        # of a node; it is not populated by ordinary forward execution in
-        # this version. thread_id IS reliably present on every invocation, so
-        # that is what gets recorded here (field left named checkpoint_id per
-        # the audit schema; see the fix report for the runtime evidence).
-        configurable = config.get("configurable", {}) if config else {}
-        checkpoint_id = configurable.get("thread_id")
-
-        # langsmith_run_id: only present when tracing is actually active.
-        # Tracing is OFF by default locally, so this must never raise or add
-        # latency when LangSmith isn't configured.
-        langsmith_run_id = None
-        try:
-            run_tree = get_current_run_tree()
-            if run_tree is not None:
-                langsmith_run_id = str(run_tree.id)
-        except Exception:
-            langsmith_run_id = None
-
-        context = ExecutionContext(
-            model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
-            backend=settings.backend,
-            policy_version=policy.version,
-            checkpoint_id=checkpoint_id,
-            langsmith_run_id=langsmith_run_id,
-        )
+        context = _context(config)
 
         response = ReviewResponse.model_validate(state.get("response") or {})
         decisions = {d["thread_id"]: Decision.model_validate(d)
@@ -223,39 +301,22 @@ def build_graph(
 
             # The interrupt's whole purpose is a trust boundary: the executed
             # set must be a subset of what the human was actually shown. A
-            # resume payload naming a thread that never appeared in this
-            # batch - stale, replayed, or forged - must be skipped before any
-            # indexing happens, on every verdict branch (approve AND edit),
-            # not just guarded where a crash would otherwise be obvious.
+            # resume payload naming a thread that never appeared in this batch -
+            # stale, replayed, or forged - must be skipped before any indexing
+            # happens, on every verdict branch.
             decision = decisions.get(thread_id)
             if decision is None:
                 skipped.append({"thread_id": thread_id, "verdict": verdict,
-                                 "reason": "not part of the reviewed batch"})
+                                "reason": "not part of the reviewed batch"})
                 continue
 
             actions = (response.edits.get(thread_id)
                        if verdict == "edit" else decision.actions) or []
-            for action in actions:
-                if action.kind == "none":
-                    continue
-                try:
-                    rec = execute_action(
-                        action, client=client, settings=settings, log=log,
-                        actor="human" if verdict == "edit" else (
-                            f"rule:{decision.rule_id}" if decision.rule_id
-                            else "agent"),
-                        context=context,
-                        rule_provenance=decision.reason if decision.rule_id else None,
-                    )
-                    executed.append(rec.model_dump(mode="json"))
-                except ForbiddenActionError as exc:
-                    # execute_action already wrote the durable refusal record;
-                    # this makes the refusal visible to whatever UI is holding
-                    # the state too (a notebook, a future Telegram bot), since
-                    # print() reaches neither and the JSONL file is not
-                    # something either renders by default.
-                    refused.append({"thread_id": thread_id, "kind": action.kind,
-                                     "error": str(exc)})
+            ran, refused_here = _run_actions(
+                actions, decision=decision, verdict=verdict,
+                client=client, settings=settings, log=log, context=context)
+            executed += ran
+            refused += refused_here
 
         return {"executed": executed, "refused": refused, "skipped": skipped}
 
@@ -275,13 +336,19 @@ def build_graph(
 
     builder = StateGraph(TriageState)
     for name, fn in (("fetch", fetch), ("triage", triage), ("propose", propose),
+                     ("partition", partition_node), ("auto_execute", auto_execute),
+                     ("enqueue_held", enqueue_held),
                      ("review", review), ("execute", execute), ("learn", learn)):
         builder.add_node(name, fn)
 
     builder.add_edge(START, "fetch")
     builder.add_edge("fetch", "triage")
     builder.add_edge("triage", "propose")
-    builder.add_edge("propose", "review")
+    builder.add_edge("propose", "partition")
+    builder.add_conditional_edges("partition", route_after_partition,
+                                  {"auto_execute": "auto_execute", "review": "review"})
+    builder.add_edge("auto_execute", "enqueue_held")
+    builder.add_edge("enqueue_held", "learn")
     builder.add_edge("review", "execute")
     builder.add_edge("execute", "learn")
     builder.add_edge("learn", END)

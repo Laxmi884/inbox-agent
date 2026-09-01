@@ -10,7 +10,7 @@ from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph, learn_from_response
 from inbox_agent.models import Action, ReviewResponse, Thread
 from inbox_agent.policy import Policy
-from inbox_agent.store import PreferenceStore, build_store
+from inbox_agent.store import HeldQueue, PreferenceStore, build_store
 
 
 class FakeLLM:
@@ -42,6 +42,7 @@ def wiring(tmp_path, snapshot_file):
         prefs=PreferenceStore(build_store()),
         policy=Policy(text="TEST", version="local:test", source="local"),
         llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
+        held=HeldQueue(build_store()),
     )
 
 
@@ -49,7 +50,7 @@ def test_graph_suspends_at_the_review_interrupt(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-1"}}
-    result = graph.invoke({"limit": 10}, config)
+    result = graph.invoke({"limit": 10, "mode": "backlog"}, config)
     assert "__interrupt__" in result
 
 
@@ -58,7 +59,7 @@ def test_interrupt_payload_is_json_serialisable(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-2"}}
-    result = graph.invoke({"limit": 10}, config)
+    result = graph.invoke({"limit": 10, "mode": "backlog"}, config)
     payload = result["__interrupt__"][0].value
     json.dumps(payload)  # must not raise
     assert payload["items"][0]["thread_id"] == "t1"
@@ -69,7 +70,7 @@ def test_approving_executes_the_action(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-3"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"t1": "approve"}, "edits": {}, "instructions": []}),
         config)
@@ -86,7 +87,7 @@ def test_executed_action_carries_a_traceable_checkpoint_identifier(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-checkpoint"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"t1": "approve"}, "edits": {}, "instructions": []}),
         config)
@@ -100,7 +101,7 @@ def test_rejecting_executes_nothing(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-4"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"t1": "reject"}, "edits": {}, "instructions": []}),
         config)
@@ -112,7 +113,7 @@ def test_rejection_becomes_a_learned_rule(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-5"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     graph.invoke(
         Command(resume={"decisions": {"t1": "reject"},
                         "edits": {"t1": [{"kind": "label", "thread_id": "t1",
@@ -152,7 +153,8 @@ def test_rule_matched_threads_skip_the_model(wiring):
         def invoke(self, messages): raise AssertionError("model must not be called")
 
     graph = build_graph(**{**wiring, "llm": ExplodingLLM()}, checkpointer=InMemorySaver())
-    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-6"}})
+    result = graph.invoke({"limit": 10, "mode": "backlog"},
+                          {"configurable": {"thread_id": "run-6"}})
     assert result["__interrupt__"][0].value["items"][0]["source"] == "rule"
 
 
@@ -161,7 +163,7 @@ def test_approve_unknown_thread_id_does_not_crash(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-7"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"ghost-thread": "approve"},
                         "edits": {}, "instructions": []}),
@@ -176,7 +178,7 @@ def test_edit_unknown_thread_id_executes_nothing(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-8"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"ghost-thread-2": "edit"},
                         "edits": {"ghost-thread-2": [
@@ -206,7 +208,7 @@ def test_forbidden_action_is_visible_in_state(wiring):
                         | frozenset({"archive"}))
     graph = build_graph(**{**wiring, "settings": settings}, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-9"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"t1": "edit"},
                         "edits": {"t1": [{"kind": "archive", "thread_id": "t1"}]},
@@ -227,7 +229,7 @@ def test_edit_naming_forbidden_kind_is_refused_and_not_learned(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "run-10"}}
-    graph.invoke({"limit": 10}, config)
+    graph.invoke({"limit": 10, "mode": "backlog"}, config)
     final = graph.invoke(
         Command(resume={"decisions": {"t1": "edit"},
                         "edits": {"t1": [{"kind": "send_message", "thread_id": "t1"}]},
@@ -278,7 +280,7 @@ def test_execute_skip_survives_the_learn_node(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "bounded-2"}}
-    graph.invoke({"limit": 5}, cfg)
+    graph.invoke({"limit": 5, "mode": "backlog"}, cfg)
     final = graph.invoke(Command(resume={
         "decisions": {"t1": "approve", "ghost": "approve"},
         "edits": {}, "instructions": [],
@@ -317,8 +319,10 @@ def test_stale_threads_are_demoted_inside_the_pipeline(tmp_path):
                         policy=Policy(text="P", version="v", source="local"),
                         llm=NeedsReply(), settings=settings,
                         log=AuditLog(settings.audit_log),
+                        held=HeldQueue(build_store()),
                         checkpointer=InMemorySaver())
-    result = graph.invoke({"limit": 5}, {"configurable": {"thread_id": "stale-1"}})
+    result = graph.invoke({"limit": 5, "mode": "backlog"},
+                          {"configurable": {"thread_id": "stale-1"}})
     item = result["__interrupt__"][0].value["items"][0]
 
     # NOTE: ReviewItem carries no `category` - it is dropped when Decision is
@@ -359,8 +363,10 @@ def test_a_recent_needs_reply_still_stays_in_the_inbox(tmp_path):
                         policy=Policy(text="P", version="v", source="local"),
                         llm=NeedsReply(), settings=settings,
                         log=AuditLog(settings.audit_log),
+                        held=HeldQueue(build_store()),
                         checkpointer=InMemorySaver())
-    result = graph.invoke({"limit": 5}, {"configurable": {"thread_id": "fresh-1"}})
+    result = graph.invoke({"limit": 5, "mode": "backlog"},
+                          {"configurable": {"thread_id": "fresh-1"}})
     item = result["__interrupt__"][0].value["items"][0]
     assert [a["kind"] for a in item["proposed"]] == ["none"]
 
@@ -371,7 +377,7 @@ def test_a_bare_reject_now_teaches_a_rule(wiring):
     from langgraph.checkpoint.memory import InMemorySaver
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "reject-learns"}}
-    graph.invoke({"limit": 5}, cfg)
+    graph.invoke({"limit": 5, "mode": "backlog"}, cfg)
     final = graph.invoke(Command(resume={
         "decisions": {"t1": "reject"}, "edits": {}, "instructions": []}), cfg)
 
@@ -379,3 +385,106 @@ def test_a_bare_reject_now_teaches_a_rule(wiring):
     rule = wiring["prefs"].rules()[0]
     assert rule.rejected_action == "archive", "did not record WHAT was rejected"
     assert rule.action == "none"
+
+
+# --- the autonomy split ------------------------------------------------------
+# partition() sends confident, reversible actions straight to Gmail and holds
+# the rest. interrupt() survives, but only mode="backlog" reaches it - the one
+# job that genuinely waits is a future bulk sweep of historical threads, which
+# must be previewed before it commits.
+
+
+def _snapshot(tmp_path, threads):
+    p = tmp_path / "threads.json"
+    p.write_text(json.dumps(threads))
+    return p
+
+
+def _row(tid, subject="Sale", sender="deals@shop.com"):
+    return {"id": tid, "subject": subject, "sender": sender, "to": [],
+            "date": "2026-08-26T10:00:00Z", "snippet": "s", "body": "",
+            "label_ids": ["INBOX", "UNREAD"]}
+
+
+def test_incremental_run_completes_without_an_interrupt(wiring):
+    """Act-then-report: the run does not wait. It acts and finishes."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-a"}})
+    assert "__interrupt__" not in result
+
+
+def test_incremental_run_executes_the_auto_tier(wiring):
+    """FakeLLM proposes archive at 0.9, which is 'always' authority."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-b"}})
+    assert len(result["executed"]) == 1
+    assert result["executed"][0]["action"] == "archive"
+
+
+def test_incremental_run_holds_trash_instead_of_executing_it(tmp_path, wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring = dict(wiring)
+    wiring["llm"] = FakeLLM(ThreadJudgment(
+        category="newsletter_noise", action="trash", label=None,
+        reason="junk", confidence=0.9))
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-c"}})
+    assert result["executed"] == []
+    assert [h.hold_reason for h in wiring["held"].all()] == ["trash"]
+
+
+def test_held_items_reach_the_queue_with_the_run_id(wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    wiring = dict(wiring)
+    wiring["llm"] = FakeLLM(ThreadJudgment(
+        category="other", action="archive", label=None,
+        reason="not sure", confidence=0.2))
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-d"}})
+    queued = wiring["held"].all()
+    assert len(queued) == 1
+    assert queued[0].hold_reason == "low_confidence"
+    assert queued[0].run_id
+
+
+def test_two_runs_accumulate_held_items_rather_than_replacing_them(tmp_path):
+    """Carryover. The evening digest must still show the morning's held items."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    settings = Settings(backend="offline", dry_run=True, snapshot_dir=tmp_path,
+                        snapshot_size=50, audit_log=tmp_path / "audit.jsonl",
+                        forbidden_actions=ALWAYS_FORBIDDEN,
+                        context_hub_skill="s", context_hub_tag="dev")
+    snap = _snapshot(tmp_path, [_row("t1"), _row("t2")])
+    held = HeldQueue(build_store())
+    graph = build_graph(
+        client=SnapshotGmailClient(snap), prefs=PreferenceStore(build_store()),
+        policy=Policy(text="T", version="local:test", source="local"),
+        llm=FakeLLM(ThreadJudgment(category="other", action="archive", label=None,
+                                   reason="unsure", confidence=0.2)),
+        settings=settings, log=AuditLog(settings.audit_log), held=held,
+        checkpointer=InMemorySaver())
+
+    graph.invoke({"limit": 1}, {"configurable": {"thread_id": "run-1"}})
+    assert len(held.all()) == 1
+    graph.invoke({"limit": 2}, {"configurable": {"thread_id": "run-2"}})
+    assert len(held.all()) == 2
+
+
+def test_backlog_mode_still_suspends_at_the_interrupt(wiring):
+    """interrupt() survives, scoped to the one job that genuinely waits."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 10, "mode": "backlog"},
+                          {"configurable": {"thread_id": "run-e"}})
+    assert "__interrupt__" in result
+
+
+def test_backlog_mode_executes_nothing_before_approval(wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    graph.invoke({"limit": 10, "mode": "backlog"},
+                 {"configurable": {"thread_id": "run-f"}})
+    assert wiring["log"].records() == []
+    assert wiring["held"].all() == []

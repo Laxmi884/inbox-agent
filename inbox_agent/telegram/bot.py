@@ -148,7 +148,13 @@ class Bot:
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
-        self.graph.invoke({"limit": limit}, self._config)
+        # mode="backlog": the bot's whole review flow (digest/paged rendering,
+        # approve_all, per-item reject/edit) is built on the graph parking at
+        # the interrupt and being resumed later. The auto-execute/held-queue
+        # split (task 8) is not wired into this UI yet, so /triage must still
+        # get everything in front of the human rather than have some of it
+        # silently act and vanish before _request() ever reads the checkpoint.
+        self.graph.invoke({"limit": limit, "mode": "backlog"}, self._config)
         elapsed = time.monotonic() - started
 
         request = self._request()
