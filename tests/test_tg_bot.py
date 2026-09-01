@@ -78,14 +78,16 @@ def bot(tmp_path, snapshot_file):
     # One store, shared by the graph that reads rules and the bot that writes
     # them - two instances would let a correction land where nothing reads it.
     prefs = PreferenceStore(build_store())
-    graph = build_graph(client=SnapshotGmailClient(snapshot_file),
+    client = SnapshotGmailClient(snapshot_file)
+    graph = build_graph(client=client,
                         prefs=prefs,
                         policy=Policy(text="P", version="local:t", source="local"),
                         llm=FakeLLM(), settings=settings, log=log, held=held,
                         checkpointer=InMemorySaver())
     t = FakeTransport()
     return Bot(transport=t, graph=graph, settings=settings, held=held,
-               prefs=prefs, categories=["recruiter", "promotion"]), t, log
+               prefs=prefs, client=client, log=log,
+               categories=["recruiter", "promotion"]), t, log
 
 
 def msg(text, chat_id=42):
@@ -655,3 +657,73 @@ def test_relabel_offers_the_policys_categories(bot):
     b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
     labels = [l for row in t.edited[-1]["keyboard"] for (l, _) in row]
     assert any("recruiter" in l for l in labels)
+
+
+# --- held verdicts do something ---------------------------------------------
+# The item view shipped with Approve and Not this and no handler behind either.
+# A button that renders and does nothing is the defect this whole branch has
+# been removing; it got through because the tests asserted the keyboard and
+# never pressed it.
+
+def _open_held(b, index=0):
+    b.handle_update(msg("/triage 4"))
+    for item in [review_item(f"h{i}") for i in range(2)]:
+        b.held.add(item, run_id="r1", reason="trash")
+    b.handle_update(cb(encode("open", index, digest_id=b._digest_id)))
+
+
+def test_approving_a_held_item_executes_it(bot):
+    b, t, log = bot
+    _open_held(b)
+    before = len(log.records())
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    after = [r for r in log.records()[before:] if r.action == "trash"]
+    assert after, "approve did not push the action through the chokepoint"
+    assert after[0].actor == "human"
+
+
+def test_approving_a_held_item_drains_it_from_the_queue(bot):
+    """Otherwise the owner authorises the same trash every morning forever."""
+    b, t, _ = bot
+    _open_held(b)
+    assert len(b.held.all()) == 2
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert [h.thread_id for h in b.held.all()] == ["h1"]
+
+
+def test_not_this_drains_the_queue_without_executing(bot):
+    b, t, log = bot
+    _open_held(b)
+    before = len(log.records())
+    b.handle_update(cb(encode("reject", 0, digest_id=b._digest_id)))
+    assert not [r for r in log.records()[before:] if r.action == "trash"]
+    assert [h.thread_id for h in b.held.all()] == ["h1"]
+
+
+def test_not_this_teaches_that_the_action_was_wrong(bot):
+    """A bare reject is signal. The digest design counts every reject as a
+    candidate rule, and requiring an edit is why skipping never taught
+    anything."""
+    b, t, _ = bot
+    _open_held(b)
+    b.handle_update(cb(encode("reject", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert rule.rejected_action == "trash"
+    assert [a.kind for a in rule.actions] == ["none"]
+
+
+def test_a_held_verdict_says_what_it_did(bot):
+    b, t, _ = bot
+    _open_held(b)
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert t.edited[-1]["text"], "approve answered with an empty screen"
+    assert "1 left" in t.edited[-1]["text"] or "waiting" in t.edited[-1]["text"].lower()
+
+
+def test_a_dry_run_approval_does_not_claim_it_reached_gmail(bot):
+    """settings.dry_run is True in this fixture. Same rule as the digest: never
+    the word done for something that did not happen."""
+    b, t, _ = bot
+    _open_held(b)
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert "would have" in t.edited[-1]["text"].lower()

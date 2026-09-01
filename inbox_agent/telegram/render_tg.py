@@ -444,7 +444,22 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
 
     text = "\n".join(lines)[:TG_MAX_TEXT]
 
+    # A button per item shown, numbered absolutely, exactly as the digest does
+    # it. Without these the correction verdicts are unreachable - the item view
+    # is the only place they live and this panel is the only route to it. They
+    # were missing on the first cut because the flow was checked by calling
+    # encode() directly instead of by pressing what is on the screen.
     keyboard: list[list[tuple[str, str]]] = []
+    row: list[tuple[str, str]] = []
+    for offset, _item in enumerate(window, start=page * DONE_PAGE_SIZE):
+        row.append((str(offset + 1),
+                    encode("open", offset, digest_id=view.digest_id)))
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
     nav: list[tuple[str, str]] = []
     if page > 0:
         nav.append(("◀ Prev", encode("prev", digest_id=view.digest_id)))

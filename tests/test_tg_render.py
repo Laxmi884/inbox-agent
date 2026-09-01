@@ -587,3 +587,26 @@ def test_the_number_shown_matches_the_number_tapped():
     """The owner tapped "3" on a list; the screen that opens has to say 3."""
     text, _ = item_view(**view_args(index=2))
     assert text.startswith("3. ")
+
+
+def test_the_done_panel_offers_a_button_per_item():
+    """Without these the correction verdicts are unreachable: the item view is
+    the only place they live, and this panel is the only route to it. Shipped
+    without them once, because the flow was verified by calling encode()
+    directly rather than by pressing what is on the screen."""
+    items = [done(f"t{i}") for i in range(3)]
+    _, kb = done_panel(done_view(items))
+    opens = [(l, decode(d)) for row in kb for (l, d) in row
+             if decode(d).kind == "open"]
+    assert [l for l, _ in opens] == ["1", "2", "3"]
+    assert [i.index for _, i in opens] == [0, 1, 2]
+
+
+def test_the_done_panel_numbers_buttons_by_absolute_position():
+    """Page two's first item is item 9, and its button has to say 9 and open 9."""
+    items = [done(f"t{i:02d}") for i in range(DONE_PAGE_SIZE + 2)]
+    _, kb = done_panel(done_view(items), page=1)
+    opens = [(l, decode(d)) for row in kb for (l, d) in row
+             if decode(d).kind == "open"]
+    assert [l for l, _ in opens] == [str(DONE_PAGE_SIZE + 1), str(DONE_PAGE_SIZE + 2)]
+    assert [i.index for _, i in opens] == [DONE_PAGE_SIZE, DONE_PAGE_SIZE + 1]

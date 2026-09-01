@@ -21,6 +21,7 @@ from typing import Optional, Sequence
 
 from langgraph.types import Command
 
+from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from ..config import Settings
 from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
@@ -30,11 +31,22 @@ from .render_tg import DigestView, DoneItem, digest, done_panel, item_view
 log = logging.getLogger("inbox_agent.telegram")
 
 
+def _short(text: str, cap: int = 60) -> str:
+    """Cap a subject for a confirmation line, saying so when it is cut.
+
+    Same rule as the renderer: a hard slice ends mid-word and reads as a
+    corrupted message rather than as a subject that continues.
+    """
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= cap else flat[:cap - 1].rstrip() + "…"
+
+
 class Bot:
     """Owns the graph, the checkpointer and the conversation with one human."""
 
     def __init__(self, *, transport, graph, settings: Settings,
-                 held: HeldQueue, prefs: PreferenceStore,
+                 held: HeldQueue, prefs: PreferenceStore, client=None,
+                 log: Optional[AuditLog] = None,
                  categories: Sequence[str] = (), mode: Optional[str] = None):
         self.transport = transport
         self.graph = graph
@@ -47,6 +59,12 @@ class Bot:
         # write, not a message through graph state, which is what makes the
         # learning loop independent of whether any run is parked.
         self.prefs = prefs
+        # Needed to act on a held item the owner approves. The action still goes
+        # through execute_action - the one chokepoint, with its deny-list, its
+        # dry-run skip and its audit record - so this adds a caller, not a
+        # second route to Gmail.
+        self.client = client
+        self.log = log
         self.categories = list(categories)
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
@@ -292,6 +310,78 @@ class Bot:
             [("↩ Back", encode("list", digest_id=self._digest_id))],
         ]
         self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
+
+    def _held_verdict(self, intent) -> None:
+        """Approve or refuse one held item, and drain it from the queue.
+
+        Both drain. The queue is work in flight, and an item the owner has
+        ruled on is no longer in flight: leaving it would ask them to authorise
+        the same trash tomorrow morning, and the morning after that.
+
+        Approve executes through execute_action - the same chokepoint, the same
+        deny-list, the same dry-run skip, the same audit record - with the actor
+        recorded as `human`, because it was. Not this executes nothing and
+        teaches instead: a bare reject is signal, and the digest design counts
+        every reject as a candidate rule. Requiring an edit is exactly why
+        skipping something never taught this agent anything.
+        """
+        queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
+        index = intent.index or 0
+        if not (0 <= index < len(queue)):
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        item = queue[index]
+
+        if intent.kind == "approve":
+            done = self._execute_held(item)
+            # Never the word "done" for something that did not reach Gmail -
+            # the same rule the digest's block title follows.
+            verb = "Would have run" if self.settings.dry_run else "Ran"
+            summary = f"{verb}: {done}." if done else "Nothing to do."
+        else:
+            proposed = item.item.proposed[0].kind if item.item.proposed else "none"
+            rule = rule_from_correction(
+                self._thread_for(DoneItem(thread_id=item.thread_id,
+                                          subject=item.item.subject,
+                                          sender=item.item.sender)),
+                [ActionTemplate(kind="none")],
+                f"owner refused {proposed} on {item.item.subject[:50]!r}",
+                rejected=proposed)
+            self.prefs.add_rule(rule)
+            summary = (f"Left alone. Learned: {rule.scope} {rule.pattern} "
+                       f"→ {rule.summary}.")
+
+        self.held.remove(item.thread_id)
+        self._panel = self._panel_before_item
+        remaining = len(self.held.all())
+        self.transport.edit_message(
+            self.chat_id, self._message_id,
+            f"{_short(item.item.subject)}\n{summary}\n\n{remaining} left waiting.",
+            [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _execute_held(self, item) -> str:
+        """Push one held item's proposed actions through the chokepoint.
+
+        Returns what it did, in the digest's vocabulary, for the confirmation.
+        A refusal is reported rather than raised: the deny-list saying no is an
+        answer the owner needs to see, not a crash.
+        """
+        if self.client is None or self.log is None:
+            return ""
+        context = ExecutionContext(policy_version=None, model=None, backend=None)
+        did = []
+        for action in item.item.proposed:
+            if action.kind == "none":
+                continue
+            try:
+                execute_action(action, client=self.client, settings=self.settings,
+                               log=self.log, actor="human", context=context)
+                label = (action.params or {}).get("label")
+                did.append(f"{action.kind}({label})" if label else action.kind)
+            except ForbiddenActionError as exc:
+                did.append(f"refused {action.kind} ({exc})")
+        return ", ".join(did)
 
     def _verdict(self, intent) -> None:
         """Turn a tapped verdict into the action sequence it stands for.
@@ -602,6 +692,9 @@ class Bot:
             self._panel = "item"
             self._open_index = intent.index or 0
             self._show(edit=True)
+            return
+        if intent.kind in ("approve", "reject"):
+            self._held_verdict(intent)
             return
         if intent.kind in ("keep", "relabel", "teach_trash"):
             self._verdict(intent)
