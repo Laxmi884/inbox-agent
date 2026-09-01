@@ -9,7 +9,12 @@ import pytest
 
 from inbox_agent.telegram.bot import HttpTransport, TelegramError
 
-TOKEN = "1234567890:AAHfakeTokenForTestsOnly0123456789A"
+# Obviously fake, but the right SHAPE - Telegram tokens are <digits>:<35 chars>,
+# and the redaction tests need something token-like to prove it gets replaced.
+# The first version of this file used the real bot token, in the very commit
+# that fixed the token leaking into httpx logs. A test fixture is a committed
+# file; a live credential must never be one.
+TOKEN = "0000000000:" + "A" * 35
 
 
 def test_none_values_are_omitted_not_sent_as_null():
@@ -48,7 +53,7 @@ def test_error_message_never_contains_the_token():
         f"Client error '400 Bad Request' for url "
         f"'https://api.telegram.org/bot{TOKEN}/sendMessage'", TOKEN)
     assert TOKEN not in msg
-    assert "AAFfKkv" not in msg
+    assert "AAAAA" not in msg, "the token body survived redaction"
     assert "sendMessage" in msg, "redaction should keep the useful part"
 
 
