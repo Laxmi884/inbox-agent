@@ -74,10 +74,35 @@ class Rule(BaseModel):
     created_at: datetime
     hit_count: int = 0
     overridden: bool = False
+    # A bare reject says "not this" without saying what instead. That is real
+    # signal - the spec's "how it learns" counts every reject OR edit as a
+    # candidate rule - so it is recorded rather than thrown away.
+    rejected_action: Optional[ActionKind] = None
+    # A rule that fires 40 times and is undone 12 times is a bad rule. The old
+    # `overridden` boolean could only say "someone disagreed once", which is not
+    # enough to tell a slightly-wrong rule from a broken one.
+    override_count: int = 0
+
+    @property
+    def precision(self) -> Optional[float]:
+        """Share of firings that were NOT overridden, or None if untested.
+
+        None rather than 1.0 at zero hits: an untested rule is unknown, and
+        reporting perfect precision would rank it above a rule that has actually
+        been proven.
+        """
+        if self.hit_count == 0:
+            return None
+        return max(0.0, (self.hit_count - self.override_count) / self.hit_count)
 
 
 class ReviewItem(BaseModel):
     thread_id: str
+    # What the model thinks the mail IS, not just what it will do about it.
+    # Dropped when Decision became ReviewItem, so the review UI could show the
+    # action but never the classification behind it - which is the more useful
+    # of the two when you are deciding whether the judgement is right.
+    category: str = ""
     subject: str
     sender: str
     snippet: str
@@ -102,6 +127,12 @@ class ReviewResponse(BaseModel):
 
 
 class AuditRecord(BaseModel):
+    # Identity, so a record can be referenced later - by an undo, or by a UI
+    # offering one. Defaults to "" rather than a generated uuid: records written
+    # before this field existed have no id, and minting one on every read would
+    # invent an identity that changes each time the log is parsed. No id means
+    # "cannot be undone", which is honest.
+    id: str = ""
     ts: datetime
     thread_id: str
     action: str
@@ -117,3 +148,7 @@ class AuditRecord(BaseModel):
     result: str = ""
     reversible: bool = True
     undo_token: dict[str, Any] = Field(default_factory=dict)
+    # Set on an undo record, naming the record it reversed. The original is
+    # never mutated - append-only means the evidence that the action happened
+    # survives alongside the evidence that it was taken back.
+    undoes: Optional[str] = None

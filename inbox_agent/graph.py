@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import operator
 import uuid
-from typing import Annotated, TypedDict, get_args
+from typing import Annotated, Optional, TypedDict, get_args
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -56,7 +56,8 @@ class TriageState(TypedDict, total=False):
 
 
 def learn_from_response(
-    response: ReviewResponse, threads: list[Thread], prefs: PreferenceStore
+    response: ReviewResponse, threads: list[Thread], prefs: PreferenceStore,
+    proposals: Optional[list[dict]] = None,
 ) -> tuple[list[str], list[dict]]:
     """Turn corrections into durable rules (spec section 2, mechanism 2).
 
@@ -72,6 +73,10 @@ def learn_from_response(
     crashing the graph's final node after mutations have already run.
     """
     by_id = {t.id: t for t in threads}
+    # What was PROPOSED for each thread, so a bare reject can record what was
+    # rejected rather than just that something was.
+    by_decision = {d.get("thread_id"): (d.get("actions") or [{}])[0].get("kind")
+                   for d in (proposals or [])}
     learned: list[str] = []
     skipped: list[dict] = []
 
@@ -79,10 +84,19 @@ def learn_from_response(
         if verdict == "approve" or thread_id not in by_id:
             continue
         edits = response.edits.get(thread_id, [])
+        # A bare reject teaches too. The spec counts "every reject or edit at
+        # the review step" as a candidate rule; requiring an edit meant a Skip
+        # taught nothing at all, which is why correcting the agent by skipping
+        # never made it better.
+        rejected = None
         if not edits:
-            continue
-
-        kind = edits[0].kind
+            proposed = by_decision.get(thread_id)
+            if not proposed:
+                continue
+            rejected = proposed
+            kind = "none"
+        else:
+            kind = edits[0].kind
         if kind not in VALID_ACTION_KINDS:
             skipped.append({
                 "thread_id": thread_id, "kind": kind, "stage": "learn",
@@ -95,10 +109,10 @@ def learn_from_response(
         # wanted" - even though execute() will not act on it for this thread.
         # Reject means "do not do this now"; the edit is preference signal for
         # next time. Intended: do not "fix" this into skipping reject+edits.
-        rule = rule_from_correction(
-            by_id[thread_id], kind,
-            f"corrected proposal on thread {thread_id}: owner chose {kind}",
-        )
+        note = (f"owner rejected {rejected} on thread {thread_id}" if rejected
+                else f"corrected proposal on thread {thread_id}: owner chose {kind}")
+        rule = rule_from_correction(by_id[thread_id], kind, note,
+                                    rejected=rejected, corpus=threads)
         prefs.add_rule(rule)
         learned.append(rule.id)
 
@@ -127,7 +141,7 @@ def build_graph(
         """Prefilter first, model only on what is left."""
         threads = _threads(state)
         decided, undecided = prefilter(threads, prefs)
-        decided += classify_batch(undecided, llm, policy)
+        decided += classify_batch(undecided, llm, policy, prefs.instructions())
 
         # Age is decided here, deterministically, rather than asked of the
         # model. A two-year-old needs_reply is not a needs-reply, and the model
@@ -148,7 +162,8 @@ def build_graph(
             d = Decision.model_validate(raw)
             t = threads[d.thread_id]
             items.append(ReviewItem(
-                thread_id=d.thread_id, subject=t.subject, sender=t.sender,
+                thread_id=d.thread_id, category=d.category,
+                subject=t.subject, sender=t.sender,
                 snippet=t.snippet, proposed=d.actions, reason=d.reason,
                 confidence=d.confidence, source=d.source, rule_id=d.rule_id,
             ))
@@ -247,7 +262,12 @@ def build_graph(
     def learn(state: TriageState) -> dict:
         response = ReviewResponse.model_validate(state.get("response") or {})
         threads = _threads(state)
-        learned, learn_skips = learn_from_response(response, threads, prefs)
+        # Mechanism 1: the owner speaking directly. Recorded before the
+        # derived rules below, because it outranks them.
+        for text in response.instructions:
+            prefs.add_instruction(text)
+        learned, learn_skips = learn_from_response(response, threads, prefs,
+                                                   state.get("decisions"))
         # `skipped` carries an operator.add reducer, so returning only this
         # node's skips appends rather than overwrites. The manual merge this
         # replaces was correct but easy to lose in a refactor.
