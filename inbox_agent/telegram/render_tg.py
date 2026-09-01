@@ -459,6 +459,47 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
     return text, keyboard
 
 
+_WHY_CAP = 300
+
+
+def item_view(subject: str, sender: str, actions_text: str, why: str, *,
+              digest_id: str, index: int, kind: str = "done",
+              categories: Sequence[str] = ()) -> tuple[str, list]:
+    """One item, opened. The screen the numbered buttons have always implied.
+
+    Serves both lists with different verbs, because the two differ in tense. A
+    held item has not happened and asks approve-or-not; a done item has happened
+    and asks was-that-right. Offering "Keep in inbox" on a thread that was never
+    archived would describe work that does not exist.
+
+    The number is the position the owner tapped, so the screen that opens says
+    the number they pressed rather than a different one.
+    """
+    lines = [f"{index + 1}. {_oneline(subject, _SUBJECT_CAP)}",
+             _oneline(sender, _SENDER_CAP),
+             f"→ {_oneline(actions_text, _ACTION_CAP)}"]
+    if why.strip():
+        # Omitted rather than filled with a placeholder: the reason is the only
+        # record of a judgement the owner ever sees, and inventing one here
+        # would be inventing evidence.
+        lines += ["", f"Why: {_oneline(why, _WHY_CAP)}"]
+    text = "\n".join(lines)[:TG_MAX_TEXT]
+
+    if kind == "held":
+        keyboard: list[list[tuple[str, str]]] = [[
+            ("✅ Approve", encode("approve", index, digest_id=digest_id)),
+            ("✖ Not this", encode("reject", index, digest_id=digest_id))]]
+    else:
+        keyboard = [
+            [("📥 Keep in inbox", encode("keep", index, digest_id=digest_id)),
+             ("🏷 Label as …", encode("relabel", index, digest_id=digest_id))],
+            [("🗑 Trash these instead",
+              encode("teach_trash", index, digest_id=digest_id))],
+        ]
+    keyboard.append([("↩ Back", encode("list", digest_id=digest_id))])
+    return text, keyboard
+
+
 def paged(request: ReviewRequest, index: int,
           categories: Sequence[str] = ()) -> tuple[str, list]:
     """One item at a time, in a message that edits itself in place.

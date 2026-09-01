@@ -11,7 +11,7 @@ from inbox_agent.telegram import render_tg
 from inbox_agent.telegram.callbacks import decode
 from inbox_agent.telegram.render_tg import (
     DigestView, DONE_PAGE_SIZE, DoneItem, HELD_PAGE_SIZE, TG_MAX_TEXT, digest,
-    done_panel, header, paged, rule_decided_count,
+    done_panel, header, item_view, paged, rule_decided_count,
 )
 
 NOW = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
@@ -518,3 +518,72 @@ def test_every_rendered_callback_is_within_the_byte_cap():
         for row in kb:
             for _, data in row:
                 assert len(data.encode()) <= 64, data
+
+
+# --- the item view ----------------------------------------------------------
+# What the numbered buttons have always implied and never did. One screen for
+# both lists, with different verbs, because the two differ in tense.
+
+def view_args(**kw):
+    base = dict(subject="Data Scientist, Fraud at Stripe",
+                sender="jobalerts-noreply@linkedin.com",
+                actions_text="label(recruiter), archive",
+                why="job alert from a no-reply address",
+                digest_id="7f2a", index=2, kind="done",
+                categories=["recruiter", "promotion"])
+    return base | kw
+
+
+def test_the_item_view_shows_what_happened_and_why():
+    text, _ = item_view(**view_args())
+    assert "Data Scientist, Fraud at Stripe" in text
+    assert "jobalerts-noreply@linkedin.com" in text
+    assert "label(recruiter), archive" in text
+    assert "job alert from a no-reply address" in text
+
+
+def test_a_done_item_offers_the_correction_verdicts():
+    _, kb = item_view(**view_args(kind="done"))
+    kinds = [decode(d).kind for row in kb for (_, d) in row]
+    assert {"keep", "relabel", "teach_trash"} <= set(kinds)
+    assert "approve" not in kinds, "a done action is not pending approval"
+
+
+def test_a_held_item_offers_verdicts_not_corrections():
+    """A held item has not happened yet, so the question is approve or not. The
+    past-tense verdicts would describe work that does not exist."""
+    _, kb = item_view(**view_args(kind="held"))
+    kinds = [decode(d).kind for row in kb for (_, d) in row]
+    assert {"approve", "reject"} <= set(kinds)
+    assert "keep" not in kinds
+
+
+def test_every_button_carries_the_digest_id():
+    _, kb = item_view(**view_args())
+    for row in kb:
+        for _label, data in row:
+            assert decode(data).digest_id == "7f2a"
+
+
+def test_the_view_always_offers_a_way_back():
+    """A screen with no exit is a trap on a phone, where there is no Escape."""
+    for kind in ("done", "held"):
+        _, kb = item_view(**view_args(kind=kind))
+        assert "list" in [decode(d).kind for row in kb for (_, d) in row]
+
+
+def test_the_item_view_never_exceeds_the_telegram_cap():
+    text, _ = item_view(**view_args(subject="x" * 500, sender="s" * 500,
+                                    why="y" * 3000, actions_text="a" * 500))
+    assert len(text) <= TG_MAX_TEXT
+
+
+def test_a_missing_reason_is_omitted_rather_than_invented():
+    text, _ = item_view(**view_args(why=""))
+    assert "Why:" not in text
+
+
+def test_the_number_shown_matches_the_number_tapped():
+    """The owner tapped "3" on a list; the screen that opens has to say 3."""
+    text, _ = item_view(**view_args(index=2))
+    assert text.startswith("3. ")
