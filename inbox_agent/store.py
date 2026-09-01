@@ -15,10 +15,11 @@ from typing import Optional
 
 from langgraph.store.memory import InMemoryStore
 
-from .models import ActionKind, Rule, Thread
+from .models import ActionKind, HeldItem, ReviewItem, Rule, Thread
 
 RULES_NS = ("prefs", "rules")
 INSTRUCTIONS_NS = ("prefs", "instructions")
+HELD_NS = ("held", "items")
 
 # BaseStore.search() defaults to limit=10. rules() pages through with an
 # explicit limit and offset until a page comes back short, so the rule set is
@@ -242,3 +243,63 @@ class PreferenceStore:
              "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")}
             for r in sorted(self.rules(), key=lambda r: r.created_at)
         ]
+
+
+class HeldQueue:
+    """Proposals waiting on the owner, across runs.
+
+    Separate from PreferenceStore because the lifetimes differ: a rule is
+    permanent knowledge, a held item is a piece of work in flight. Same backing
+    BaseStore, different namespace, so there is still exactly one thing to
+    persist later.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def add(self, item: ReviewItem, *, run_id: str, reason: str,
+            now: Optional[datetime] = None) -> HeldItem:
+        """Hold `item`, preserving the original wait time if already held.
+
+        Idempotent on thread_id: a thread the agent holds twice is one item that
+        has been waiting since the first time, not two items. The content and
+        the reason ARE refreshed, so a re-classified thread shows its current
+        proposal.
+        """
+        existing = self.get(item.thread_id)
+        held = HeldItem(
+            thread_id=item.thread_id,
+            run_id=run_id,
+            first_held_at=existing.first_held_at if existing
+            else (now or datetime.now(timezone.utc)),
+            hold_reason=reason,
+            item=item,
+        )
+        self._store.put(HELD_NS, held.thread_id,
+                        {"held": held.model_dump(mode="json")})
+        return held
+
+    def get(self, thread_id: str) -> Optional[HeldItem]:
+        entry = self._store.get(HELD_NS, thread_id)
+        return HeldItem.model_validate(entry.value["held"]) if entry else None
+
+    def remove(self, thread_id: str) -> None:
+        """Absent is not an error: a double-tap must not raise at the transport."""
+        self._store.delete(HELD_NS, thread_id)
+
+    def all(self) -> list[HeldItem]:
+        """Everything held, oldest first.
+
+        Paginates for the same reason rules() does: BaseStore.search() defaults
+        to limit=10, and a silently truncated queue would hide work the owner is
+        waiting to do - the exact invisible failure this system is built against.
+        """
+        out: list[HeldItem] = []
+        offset = 0
+        while True:
+            page = self._store.search(HELD_NS, limit=_SEARCH_PAGE_SIZE, offset=offset)
+            out.extend(HeldItem.model_validate(entry.value["held"]) for entry in page)
+            if len(page) < _SEARCH_PAGE_SIZE:
+                break
+            offset += _SEARCH_PAGE_SIZE
+        return sorted(out, key=lambda h: h.first_held_at)

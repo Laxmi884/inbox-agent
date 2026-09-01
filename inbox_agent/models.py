@@ -120,6 +120,25 @@ class ReviewRequest(BaseModel):
     items: list[ReviewItem]
 
 
+class HeldItem(BaseModel):
+    """One proposal waiting on the owner, persisted outside any single run.
+
+    `first_held_at` is what lets the digest say "waiting since Tue 8:00". It is
+    set once and never refreshed, so an item held this morning and still held
+    this evening reads as ten hours old rather than brand new - the ageing IS
+    the pressure to deal with the queue.
+
+    Embeds the whole ReviewItem rather than flattening its fields: ReviewItem is
+    already the renderer's contract, and re-declaring it here would give the
+    digest two shapes to render instead of one.
+    """
+    thread_id: str
+    run_id: str
+    first_held_at: datetime
+    hold_reason: str
+    item: ReviewItem
+
+
 class ReviewResponse(BaseModel):
     decisions: dict[str, Verdict] = Field(default_factory=dict)
     edits: dict[str, list[Action]] = Field(default_factory=dict)
