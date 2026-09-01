@@ -24,6 +24,7 @@ from .models import (
 )
 from .policy import Policy
 from .prefilter import prefilter
+from .recency import demote_stale
 from .store import PreferenceStore, rule_from_correction
 
 # Derived from the Literal itself, not a hand-copied list, so this can't
@@ -127,6 +128,15 @@ def build_graph(
         threads = _threads(state)
         decided, undecided = prefilter(threads, prefs)
         decided += classify_batch(undecided, llm, policy)
+
+        # Age is decided here, deterministically, rather than asked of the
+        # model. A two-year-old needs_reply is not a needs-reply, and the model
+        # is unreliable at date arithmetic. Rule-decided threads are exempt
+        # inside demote_stale - an explicit instruction outranks an inference.
+        by_id = {t.id: t for t in threads}
+        decided = [demote_stale(d, by_id[d.thread_id], settings.stale_after_days)
+                   for d in decided]
+
         order = {t.id: i for i, t in enumerate(threads)}
         decided.sort(key=lambda d: order[d.thread_id])
         return {"decisions": [d.model_dump() for d in decided]}
