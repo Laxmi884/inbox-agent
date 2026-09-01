@@ -1,7 +1,7 @@
 # tests/test_store.py
 from datetime import datetime, timezone
 
-from inbox_agent.models import ActionTemplate, Thread
+from inbox_agent.models import ActionTemplate, Rule, Thread
 from inbox_agent.store import PreferenceStore, build_store, rule_from_correction
 
 
@@ -101,3 +101,45 @@ def test_rules_returns_all_rules_beyond_the_default_search_limit():
     for i in range(25):
         s.add_rule(rule_from_correction(thread(sender=f"sender{i}@shop.com"), [ActionTemplate(kind="archive")], f"note {i}"))
     assert len(s.rules()) == 25
+
+
+# --- category rules ---------------------------------------------------------
+# A category is not a property of a thread, it is the model's conclusion about
+# one, so these can never be matched by matching() - which runs before the model.
+
+def category_rule(category="newsletter_valuable", rid="r-cat"):
+    return Rule(id=rid, scope="category", pattern=category,
+                actions=[ActionTemplate(kind="label", params={"label": category})],
+                provenance="owner said keep it in the inbox",
+                created_at=datetime.now(timezone.utc))
+
+
+def test_a_category_rule_is_found_by_its_category():
+    s = store()
+    s.add_rule(category_rule())
+    assert [r.id for r in s.matching_category("newsletter_valuable")] == ["r-cat"]
+
+
+def test_a_category_rule_does_not_match_another_category():
+    s = store()
+    s.add_rule(category_rule())
+    assert s.matching_category("promotion") == []
+
+
+def test_a_category_rule_never_matches_a_thread():
+    """It cannot be applied before the model has run, so it must not be found
+    by the lookup that runs before the model."""
+    s = store()
+    s.add_rule(category_rule())
+    assert s.matching(thread()) == []
+
+
+def test_a_demoted_category_rule_stops_matching():
+    """Same precision discipline as any other rule. A category rule reaches
+    every thread of that category, so a bad one is worse here than anywhere."""
+    s = store()
+    r = s.add_rule(category_rule())
+    for _ in range(4):
+        s.record_hit(r.id)
+        s.record_override(r.id)
+    assert s.matching_category("newsletter_valuable") == []

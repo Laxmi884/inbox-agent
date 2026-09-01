@@ -217,19 +217,30 @@ class PreferenceStore:
         item = self._store.get(RULES_NS, rule_id)
         return Rule.model_validate(item.value["rule"]) if item else None
 
+    def _live_rules(self) -> list[Rule]:
+        """Rules still entitled to decide anything.
+
+        Overridden rules never match, and neither do rules proven unreliable: a
+        rule below MIN_PRECISION after enough firings is worse than no rule,
+        because it produces confident and citable wrong decisions. Factored out
+        so the thread lookup and the category lookup cannot drift apart on the
+        one question that has nothing to do with which kind of rule it is.
+        """
+        return [r for r in self.rules()
+                if not r.overridden
+                and not (r.hit_count >= MIN_HITS_BEFORE_DEMOTION
+                         and (r.precision or 0.0) < MIN_PRECISION)]
+
     def matching(self, thread: Thread) -> list[Rule]:
         """Active rules that apply to this thread.
 
-        Overridden rules never match, and neither do rules that have been proven
-        unreliable: a rule below MIN_PRECISION after enough firings is worse than
-        no rule, because it produces confident and citable wrong decisions.
+        Category-scoped rules are excluded structurally, not by omission: a
+        category is the model's conclusion, and this runs before the model. See
+        matching_category.
         """
         out = []
-        for rule in self.rules():
-            if rule.overridden:
-                continue
-            if (rule.hit_count >= MIN_HITS_BEFORE_DEMOTION
-                    and (rule.precision or 0.0) < MIN_PRECISION):
+        for rule in self._live_rules():
+            if rule.scope == "category":
                 continue
             if rule.scope == "sender" and rule.pattern == thread.sender.lower():
                 out.append(rule)
@@ -240,6 +251,18 @@ class PreferenceStore:
             elif rule.scope == "subject" and rule.pattern.lower() in thread.subject.lower():
                 out.append(rule)
         return out
+
+    def matching_category(self, category: str) -> list[Rule]:
+        """Rules about a conclusion rather than about a thread.
+
+        Separate from matching() because the input differs in kind: a category
+        is what the model decided, so this cannot run until it has. Same
+        demotion filter - a category rule reaches every thread of that category,
+        so a rule that is wrong half the time does more damage here than a
+        sender rule ever could.
+        """
+        return [r for r in self._live_rules()
+                if r.scope == "category" and r.pattern == category]
 
     def record_hit(self, rule_id: str) -> None:
         rule = self._get(rule_id)
