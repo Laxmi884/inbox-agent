@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ActionKind = Literal["label", "unlabel", "archive", "trash", "draft", "none"]
 Verdict = Literal["approve", "reject", "edit"]
@@ -22,6 +22,18 @@ REVERSIBLE_ACTIONS = frozenset({"label", "unlabel", "archive", "trash", "draft",
 class Action(BaseModel):
     kind: str  # Widened from ActionKind to allow testing deny-list at chokepoint
     thread_id: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionTemplate(BaseModel):
+    """An action with no thread attached: what a rule stores.
+
+    `Action` requires a thread_id, correctly - an action is always about one
+    thread, and the chokepoint audits it that way. A rule is the shape of an
+    action the owner wants taken on mail it has not seen yet, so it carries
+    everything except the thread, and `prefilter` binds the two together.
+    """
+    kind: str
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -67,9 +79,17 @@ class Decision(BaseModel):
 
 class Rule(BaseModel):
     id: str
-    scope: Literal["sender", "domain", "fingerprint", "subject"]
+    # `category` is not a property of a thread: it is what the model concluded
+    # about one. So a category rule cannot be matched in prefilter, which runs
+    # before the model - it is applied afterwards, by the apply_rules node.
+    scope: Literal["sender", "domain", "fingerprint", "subject", "category"]
     pattern: str
-    action: ActionKind
+    # A sequence, not a kind. One kind could not say WHICH label, so a learned
+    # label rule produced Action(kind="label", params={}) and _dispatch raised
+    # KeyError against a live mailbox while reporting "simulated" under dry-run.
+    # A list also makes "label it and archive it" and "label it and leave it in
+    # the inbox" the same kind of statement, which is what a correction needs.
+    actions: list[ActionTemplate]
     provenance: str
     created_at: datetime
     hit_count: int = 0
@@ -82,6 +102,28 @@ class Rule(BaseModel):
     # `overridden` boolean could only say "someone disagreed once", which is not
     # enough to tell a slightly-wrong rule from a broken one.
     override_count: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_action(cls, data):
+        """Rules written before `actions` existed are on disk and must load.
+
+        Converted, not repaired: a legacy `label` rule has no label to recover,
+        so it becomes an empty-params template and is refused at bind time with
+        a message naming the rule. Dropping it silently would delete something
+        the owner taught; executing it silently is the KeyError.
+        """
+        if isinstance(data, dict) and "action" in data and "actions" not in data:
+            data = dict(data)
+            data["actions"] = [{"kind": data.pop("action"), "params": {}}]
+        return data
+
+    @property
+    def summary(self) -> str:
+        """The digest's own vocabulary: `label(recruiter), archive`."""
+        return ", ".join(
+            f"{a.kind}({a.params['label']})" if a.params.get("label") else a.kind
+            for a in self.actions) or "none"
 
     @property
     def precision(self) -> Optional[float]:
@@ -118,6 +160,25 @@ class ReviewRequest(BaseModel):
     run_id: str
     policy_version: str
     items: list[ReviewItem]
+
+
+class HeldItem(BaseModel):
+    """One proposal waiting on the owner, persisted outside any single run.
+
+    `first_held_at` is what lets the digest say "waiting since Tue 8:00". It is
+    set once and never refreshed, so an item held this morning and still held
+    this evening reads as ten hours old rather than brand new - the ageing IS
+    the pressure to deal with the queue.
+
+    Embeds the whole ReviewItem rather than flattening its fields: ReviewItem is
+    already the renderer's contract, and re-declaring it here would give the
+    digest two shapes to render instead of one.
+    """
+    thread_id: str
+    run_id: str
+    first_held_at: datetime
+    hold_reason: str
+    item: ReviewItem
 
 
 class ReviewResponse(BaseModel):

@@ -15,35 +15,89 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from langgraph.types import Command
 
+from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from ..config import Settings
-from ..models import ReviewRequest
-from .callbacks import Intent, decode, to_response
-from .render_tg import digest, paged
+from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
+from ..store import HeldQueue, PreferenceStore, rule_from_correction
+from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
+from .render_tg import DigestView, DoneItem, digest, done_panel, item_view
 
 log = logging.getLogger("inbox_agent.telegram")
+
+
+def _short(text: str, cap: int = 60) -> str:
+    """Cap a subject for a confirmation line, saying so when it is cut.
+
+    Same rule as the renderer: a hard slice ends mid-word and reads as a
+    corrupted message rather than as a subject that continues.
+    """
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= cap else flat[:cap - 1].rstrip() + "…"
 
 
 class Bot:
     """Owns the graph, the checkpointer and the conversation with one human."""
 
     def __init__(self, *, transport, graph, settings: Settings,
+                 held: HeldQueue, prefs: PreferenceStore, client=None,
+                 log: Optional[AuditLog] = None,
                  categories: Sequence[str] = (), mode: Optional[str] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
+        # The queue the graph fills. Injected rather than built here so both
+        # sides are looking at the same one - two instances over two stores
+        # would let the bot show an empty queue while the graph filled another.
+        self.held = held
+        # The same store the graph reads rules from. A correction is a store
+        # write, not a message through graph state, which is what makes the
+        # learning loop independent of whether any run is parked.
+        self.prefs = prefs
+        # Needed to act on a held item the owner approves. The action still goes
+        # through execute_action - the one chokepoint, with its deny-list, its
+        # dry-run skip and its audit record - so this adds a caller, not a
+        # second route to Gmail.
+        self.client = client
+        self.log = log
         self.categories = list(categories)
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
 
-        # Per-review UI state. Deliberately NOT the source of truth for what was
-        # proposed - that is read back from the checkpoint (see _request).
+        # Per-digest UI state. Deliberately NOT the source of truth for what is
+        # outstanding - that is the queue, which outlives every run.
         self._message_id: Optional[int] = None
-        self._page = 0            # digest page, or item index in paged view
-        self._view = self.mode    # "digest" | "paged"; `open` switches at runtime
+        self._page = 0
+        self._digest_id = ""
+        # Whether the CURRENT message reports a run. False for a /held digest,
+        # and it has to be state rather than an argument to _show: paging that
+        # message re-renders it, and the DONE block must not reappear on page 2
+        # of a message that never claimed a run in the first place.
+        self._run_report = True
+        # Which screen the message is currently showing: the digest, or the
+        # done panel behind its button. State rather than an argument because
+        # paging re-renders whatever is on screen, and page 2 of the panel must
+        # not come back as page 2 of the queue.
+        self._panel = "digest"
+        # The panel's own page, so opening the panel and coming back does not
+        # move the owner to page one of a queue they were part way through.
+        self._done_page = 0
+        # Which item is open, and the verdict waiting on a scope answer. The
+        # verdict is held rather than applied because writing on the first tap
+        # would pick a blast radius the owner never chose.
+        self._open_index = 0
+        self._pending: Optional[dict] = None
+        # Which list the item was opened from, so Back returns there rather
+        # than to whichever screen happens to be default.
+        self._panel_before_item = "digest"
+        # Counts runs actually started, so a test can assert that /held ran none.
+        self._runs_started = 0
+        self._last_run: Optional[dict] = None   # the graph result for the digest
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
@@ -97,13 +151,109 @@ class Bot:
 
     # --- rendering ----------------------------------------------------------
 
-    def _render(self, request: ReviewRequest) -> tuple[str, list]:
-        if self._view == "paged":
-            return paged(request, self._page, self.categories)
-        return digest(request, self._page, self.categories)
+    def _new_digest_id(self) -> str:
+        return uuid.uuid4().hex[:DIGEST_ID_LEN]
 
-    def _show(self, request: ReviewRequest, *, edit: bool) -> None:
-        text, keyboard = self._render(request)
+    def _view(self, *, run_report: bool = True) -> DigestView:
+        """Assemble what the digest renders: this run's work plus the queue.
+
+        The done counts come from the audit records the run wrote, not from
+        graph state: the audit log is the durable record of what actually
+        reached Gmail, and it is the same source the undo path will read.
+
+        `run_report=False` is /held, which ran nothing. `_last_run` still holds
+        the LAST run's result, and reporting it would stamp 08:00's counts with
+        the current clock - and again on every later /held. So /held reports no
+        run at all rather than someone else's.
+        """
+        result = self._last_run if run_report else None
+        done_by_kind: dict[str, int] = {}
+        rule_decided = 0
+        for record in (result or {}).get("executed", []):
+            # .get() throughout: a malformed record must not raise here. This
+            # runs AFTER the graph executed, so an exception costs the owner the
+            # digest for work that already reached Gmail - the one moment a
+            # crash is most expensive and least recoverable.
+            kind = record.get("action")
+            if not kind:
+                continue
+            if kind == "label" and (record.get("params") or {}).get(
+                    "label") == self.settings.triaged_label:
+                continue  # bookkeeping, not work the owner cares about
+            done_by_kind[kind] = done_by_kind.get(kind, 0) + 1
+            if str(record.get("actor", "")).startswith("rule:"):
+                rule_decided += 1
+        return DigestView(
+            run_at=datetime.now(timezone.utc),
+            total=len((result or {}).get("thread_ids", [])),
+            done_by_kind=done_by_kind,
+            rule_decided=rule_decided,
+            held=self.held.all(),
+            digest_id=self._digest_id,
+            # Dry-run actions were audited but never reached Gmail. The banner
+            # that says so is on the terminal; the digest is on the phone.
+            dry_run=bool(self.settings.dry_run),
+            run_report=run_report,
+        )
+
+    def _done_items(self) -> list[DoneItem]:
+        """What the run did, per thread, for the panel behind the button.
+
+        Two sources, deliberately. The audit records say what actually went
+        through the chokepoint - the only honest answer to "what did you do" -
+        but they know a thread by id, which is not something the owner can read.
+        The proposals in `auto` carry the subject and the sender. A record whose
+        thread is missing from `auto` still gets a row, named by its id: an
+        action with no visible subject is strange, and hiding it would be worse.
+
+        .get() throughout, like _view, and for the same reason: this runs after
+        the graph executed, so an exception here costs the owner the report for
+        work that already happened.
+        """
+        result = self._last_run or {}
+        known: dict[str, dict] = {}
+        for raw in result.get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id"):
+                known[raw["thread_id"]] = raw
+
+        rows: dict[str, DoneItem] = {}
+        for record in result.get("executed", []):
+            kind = record.get("action")
+            thread_id = record.get("thread_id")
+            if not kind or not thread_id:
+                continue
+            label = (record.get("params") or {}).get("label")
+            if kind == "label" and label == self.settings.triaged_label:
+                continue    # bookkeeping on every thread, not work to report
+            item = rows.get(thread_id)
+            if item is None:
+                proposal = known.get(thread_id, {})
+                item = DoneItem(thread_id=thread_id,
+                                subject=proposal.get("subject") or thread_id,
+                                sender=proposal.get("sender") or "")
+                rows[thread_id] = item
+            item.actions.append((kind, label))
+            actor = str(record.get("actor", ""))
+            if actor.startswith("rule:"):
+                item.from_rule = True
+                item.rule_id = actor.split(":", 1)[1]
+                # In the rule's own terms rather than the audit sentence: the
+                # rule may have been corrected since, and what the owner needs
+                # to judge is what it says NOW.
+                rule = self._rule(item.rule_id)
+                item.rule_note = (f"{rule.scope} {rule.pattern} → {rule.summary}"
+                                  if rule else "")
+        return list(rows.values())
+
+    def _show(self, *, edit: bool) -> None:
+        view = self._view(run_report=self._run_report)
+        if self._panel == "item":
+            text, keyboard = self._item_screen()
+        elif self._panel == "done":
+            view.done = self._done_items()
+            text, keyboard = done_panel(view, self._done_page)
+        else:
+            text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
             self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
         else:
@@ -111,6 +261,299 @@ class Bot:
             self._message_id = (sent or {}).get("message_id")
 
     # --- dispatch -----------------------------------------------------------
+
+    def _open_item(self) -> Optional[tuple[str, DoneItem]]:
+        """The item the owner tapped, and which list it came from.
+
+        Resolved against the list that was rendered, never from the callback -
+        the callback carries a position precisely so a thread id cannot travel
+        in it.
+        """
+        if self._panel_before_item == "done":
+            items = self._done_items()
+            if 0 <= self._open_index < len(items):
+                return "done", items[self._open_index]
+            return None
+        queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
+        if 0 <= self._open_index < len(queue):
+            held = queue[self._open_index]
+            return "held", DoneItem(
+                thread_id=held.thread_id, subject=held.item.subject,
+                sender=held.item.sender,
+                actions=[(a.kind, (a.params or {}).get("label"))
+                         for a in held.item.proposed])
+        return None
+
+    def _item_screen(self) -> tuple[str, list]:
+        opened = self._open_item()
+        if opened is None:
+            # The list moved under the callback. Falling back to the list is
+            # the honest answer; guessing at a neighbouring item is not.
+            self._panel = self._panel_before_item
+            return digest(self._view(run_report=self._run_report), self._page)
+        kind, item = opened
+        why = ""
+        for raw in (self._last_run or {}).get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id") == item.thread_id:
+                why = raw.get("reason") or ""
+        actions_text = ", ".join(f"{k}({v})" if v else k for k, v in item.actions)
+        return item_view(item.subject, item.sender, actions_text, why,
+                         digest_id=self._digest_id, index=self._open_index,
+                         kind=kind, rule_detail=self._rule_detail(item),
+                         categories=self.categories)
+
+    def _ask_scope(self, verdict: str, item: DoneItem, category: str) -> None:
+        """Verdict first, scope second.
+
+        "Never archive this sender" and "never archive any valuable newsletter"
+        are different instructions behind the same tap, and only the owner knows
+        which was meant. Asking costs one tap; guessing costs a rule that
+        reaches mail they never meant to include.
+        """
+        text = (f"{item.subject}\n\nTeach this for…")
+        keyboard = [
+            [(f"Just {item.sender[:28]}",
+              encode("scope_narrow", self._open_index, digest_id=self._digest_id))],
+            [(f"Every {category}",
+              encode("scope_wide", self._open_index, digest_id=self._digest_id))],
+            [("↩ Back", encode("list", digest_id=self._digest_id))],
+        ]
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
+
+    def _held_verdict(self, intent) -> None:
+        """Approve or refuse one held item, and drain it from the queue.
+
+        Both drain. The queue is work in flight, and an item the owner has
+        ruled on is no longer in flight: leaving it would ask them to authorise
+        the same trash tomorrow morning, and the morning after that.
+
+        Approve executes through execute_action - the same chokepoint, the same
+        deny-list, the same dry-run skip, the same audit record - with the actor
+        recorded as `human`, because it was. Not this executes nothing and
+        teaches instead: a bare reject is signal, and the digest design counts
+        every reject as a candidate rule. Requiring an edit is exactly why
+        skipping something never taught this agent anything.
+        """
+        queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
+        index = intent.index or 0
+        if not (0 <= index < len(queue)):
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        item = queue[index]
+
+        if intent.kind == "approve":
+            done = self._execute_held(item)
+            # Never the word "done" for something that did not reach Gmail -
+            # the same rule the digest's block title follows.
+            verb = "Would have run" if self.settings.dry_run else "Ran"
+            summary = f"{verb}: {done}." if done else "Nothing to do."
+        else:
+            proposed = item.item.proposed[0].kind if item.item.proposed else "none"
+            rule = rule_from_correction(
+                self._thread_for(DoneItem(thread_id=item.thread_id,
+                                          subject=item.item.subject,
+                                          sender=item.item.sender)),
+                [ActionTemplate(kind="none")],
+                f"owner refused {proposed} on {item.item.subject[:50]!r}",
+                rejected=proposed)
+            self.prefs.add_rule(rule)
+            summary = (f"Left alone. Learned: {rule.scope} {rule.pattern} "
+                       f"→ {rule.summary}.")
+
+        self.held.remove(item.thread_id)
+        self._panel = self._panel_before_item
+        remaining = len(self.held.all())
+        self.transport.edit_message(
+            self.chat_id, self._message_id,
+            f"{_short(item.item.subject)}\n{summary}\n\n{remaining} left waiting.",
+            [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _execute_held(self, item) -> str:
+        """Push one held item's proposed actions through the chokepoint.
+
+        Returns what it did, in the digest's vocabulary, for the confirmation.
+        A refusal is reported rather than raised: the deny-list saying no is an
+        answer the owner needs to see, not a crash.
+        """
+        if self.client is None or self.log is None:
+            return ""
+        context = ExecutionContext(policy_version=None, model=None, backend=None)
+        did = []
+        for action in item.item.proposed:
+            if action.kind == "none":
+                continue
+            try:
+                execute_action(action, client=self.client, settings=self.settings,
+                               log=self.log, actor="human", context=context)
+                label = (action.params or {}).get("label")
+                did.append(f"{action.kind}({label})" if label else action.kind)
+            except ForbiddenActionError as exc:
+                did.append(f"refused {action.kind} ({exc})")
+        return ", ".join(did)
+
+    def _verdict(self, intent) -> None:
+        """Turn a tapped verdict into the action sequence it stands for.
+
+        Each verdict maps to exactly one sequence, so what gets taught is what
+        the button said - the reason the vocabulary is buttons and not free
+        text. Nothing is written here: the scope question comes first, except
+        for trash, which is sender-only by design.
+        """
+        opened = self._open_item()
+        if opened is None:
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        _kind, item = opened
+        category = self._category_of(item.thread_id)
+
+        if intent.kind == "relabel" and intent.label_index is None:
+            # First tap: which label? Second tap arrives as relabel with one.
+            rows, row = [], []
+            for i, name in enumerate(self.categories):
+                row.append((name, encode("relabel", self._open_index, i,
+                                         digest_id=self._digest_id)))
+                if len(row) == 3:
+                    rows.append(row); row = []
+            if row:
+                rows.append(row)
+            rows.append([("↩ Back", encode("list", digest_id=self._digest_id))])
+            self.transport.edit_message(self.chat_id, self._message_id,
+                                        f"{item.subject}\n\nLabel it as…", rows)
+            return
+
+        if intent.kind == "keep":
+            # Keep the label, drop everything that removes it from the inbox.
+            # Built from what actually happened rather than from a template, so
+            # a thread that was only labelled teaches only a label.
+            actions = [ActionTemplate(kind=k, params={"label": v} if v else {})
+                       for k, v in item.actions if k not in ("archive", "trash")]
+            if not actions:
+                actions = [ActionTemplate(kind="label", params={"label": category})]
+        elif intent.kind == "relabel":
+            chosen = self.categories[intent.label_index] \
+                if 0 <= (intent.label_index or 0) < len(self.categories) else category
+            # The original sequence with the label swapped: correcting the
+            # label should not silently also change whether it was archived.
+            actions = [ActionTemplate(kind=k, params={"label": chosen} if k == "label"
+                                      else ({"label": v} if v else {}))
+                       for k, v in item.actions] or \
+                      [ActionTemplate(kind="label", params={"label": chosen})]
+            category = chosen
+        else:
+            actions = [ActionTemplate(kind="trash")]
+
+        self._pending = {"verdict": intent.kind, "actions": actions,
+                         "category": category, "rule_id": self._rule_id_of(item)}
+        if intent.kind == "teach_trash":
+            # Sender-only, and not asked: a category-wide trash rule would
+            # auto-execute trash across a whole class of future mail on one tap
+            # (Plan 1's partition decision), which is a blast radius no single
+            # correction should be able to reach.
+            self._teach(wide=False)
+            return
+        self._ask_scope(intent.kind, item, category)
+
+    def _category_of(self, thread_id: str) -> str:
+        for raw in (self._last_run or {}).get("auto", []):
+            if isinstance(raw, dict) and raw.get("thread_id") == thread_id:
+                return raw.get("category") or "other"
+        held = self.held.get(thread_id)
+        return (held.item.category if held else "other") or "other"
+
+    def _rule(self, rule_id: str):
+        """One rule by id, or None. Absent is not an error: a rule can be
+        demoted, replaced or lost between acting and being asked about, and the
+        record of what happened has to survive its own rule."""
+        return {r.id: r for r in self.prefs.rules()}.get(rule_id)
+
+    def _rule_detail(self, item: DoneItem) -> str:
+        """What decided this, when it was taught, and how it has done since.
+
+        The owner opening a rule-decided item is being asked to judge the rule,
+        not just this thread, so precision belongs here: a rule they have
+        overridden twice out of three firings is one they should be replacing.
+        """
+        rule = self._rule(item.rule_id) if item.rule_id else None
+        if rule is None:
+            return ""
+        taught = rule.created_at.astimezone().strftime("%-d %b")
+        hits = f"{rule.hit_count} hit" + ("" if rule.hit_count == 1 else "s")
+        overs = (f"{rule.override_count} override"
+                 + ("" if rule.override_count == 1 else "s"))
+        return (f"Rule: {rule.scope} {rule.pattern} → {rule.summary}\n"
+                f"Taught {taught} · {hits}, {overs}")
+
+    def _rule_id_of(self, item: DoneItem) -> Optional[str]:
+        for record in (self._last_run or {}).get("executed", []):
+            if record.get("thread_id") == item.thread_id:
+                actor = str(record.get("actor", ""))
+                if actor.startswith("rule:"):
+                    return actor.split(":", 1)[1]
+        return None
+
+    def _teach(self, *, wide: bool) -> None:
+        """Write the rule the pending verdict describes, and say what it says.
+
+        The confirmation names the rule in the digest's own vocabulary, because
+        a rule the owner cannot read is one they cannot correct. It never
+        mentions undo: nothing here reverses anything, and under dry-run there
+        was nothing to reverse in the first place.
+        """
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        opened = self._open_item()
+        if opened is None:
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        _kind, item = opened
+        category = pending["category"]
+        actions = pending["actions"]
+
+        if wide:
+            rule = Rule(id=f"r-{uuid.uuid4().hex[:8]}", scope="category",
+                        pattern=category, actions=actions,
+                        provenance=f"owner corrected {item.subject[:60]!r}",
+                        created_at=datetime.now(timezone.utc))
+            self.prefs.add_rule(rule)
+            reach = f"every {category}"
+        else:
+            thread = self._thread_for(item)
+            rule = rule_from_correction(
+                thread, actions, f"owner corrected {item.subject[:60]!r}")
+            self.prefs.add_rule(rule)
+            reach = f"{rule.scope} {rule.pattern}"
+
+        # A correction of what a rule proposed IS an override of that rule.
+        # This is the caller record_override has been waiting for since it was
+        # written; without it precision never moves and a bad rule is never
+        # demoted, however often it is corrected.
+        if item.from_rule and pending.get("rule_id"):
+            self.prefs.record_override(pending["rule_id"])
+
+        extra = (" I will do that without asking again, because a rule you "
+                 "taught is your own instruction." if pending["verdict"] == "teach_trash"
+                 else "")
+        self._panel = self._panel_before_item
+        self.transport.edit_message(
+            self.chat_id, self._message_id,
+            f"Learned: {reach} → {rule.summary}.{extra}\n\n"
+            f"That is for next time; this run is already done.",
+            [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _thread_for(self, item: DoneItem) -> Thread:
+        """The Thread choose_scope picks a scope from.
+
+        Built from what the item already carries rather than re-fetched: the
+        only fields choose_scope reads are sender and subject, and both are on
+        screen in front of the owner at the moment they press the button. The
+        rest of a Thread is not part of the decision.
+        """
+        return Thread(id=item.thread_id, subject=item.subject, sender=item.sender,
+                      to=[], date="", snippet="", body="", label_ids=[])
 
     def handle_update(self, update: dict) -> None:
         if not self._authorised(update):
@@ -130,6 +573,16 @@ class Bot:
         if command == "/triage":
             limit = int(arg) if arg.strip().isdigit() else self.settings.snapshot_size
             self._start(limit)
+        elif command == "/held":
+            # Shows the queue without running anything: the queue outlives runs,
+            # so looking at it must not require producing more work. And with no
+            # run, no run report - see _view's run_report.
+            self._page = 0
+            self._message_id = None
+            self._digest_id = self._new_digest_id()
+            self._run_report = False
+            self._panel = "digest"
+            self._show(edit=False)
         elif command == "/status":
             self._status()
         elif command == "/cancel":
@@ -137,30 +590,46 @@ class Bot:
         else:
             self.transport.send_message(
                 self.chat_id,
-                "Commands: /triage [n] · /status · /cancel")
+                "Commands: /triage [n] · /held · /status · /cancel")
 
     def _start(self, limit: int) -> None:
         self._run += 1
+        self._runs_started += 1
         self._page = 0
-        self._view = self.mode
         self._intents = {}
         self._message_id = None
+        self._digest_id = self._new_digest_id()
+        self._run_report = True
+        self._panel = "digest"
+        self._done_page = 0
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
-        self.graph.invoke({"limit": limit}, self._config)
-        elapsed = time.monotonic() - started
-
-        request = self._request()
-        if request is None:
-            log.warning("triage produced nothing to review (%.1fs)", elapsed)
-            self.transport.send_message(self.chat_id, "Nothing to review.")
+        # mode="incremental": /triage ACTS. The confident, reversible majority
+        # is executed and only what genuinely needs the owner goes to the queue,
+        # which is what this whole design is for. It ran in backlog mode while
+        # the bot rendered from a parked checkpoint - that transitional hack is
+        # what the queue and the digest replace.
+        try:
+            self._last_run = self.graph.invoke(
+                {"limit": limit, "mode": "incremental"}, self._config)
+        except Exception as exc:
+            # Silence is indistinguishable from an empty inbox, which is a
+            # failure the owner would trust for days without noticing. Say so.
+            log.exception("triage failed")
+            # NOT "nothing was executed" - the same falsehood /cancel used to
+            # tell. The run can raise anywhere, including after auto_execute
+            # has already pushed actions through the chokepoint, so the honest
+            # claim is that it did not finish. /held shows what survived.
+            self.transport.send_message(
+                self.chat_id, f"Triage failed: {type(exc).__name__}. "
+                              f"The run did not finish; some actions may already "
+                              f"have run. /held to see the queue, /triage to retry.")
             return
-        n = len(request.items)
-        log.info("triage done: %s threads in %.1fs (%.2fs/thread), %s rule-decided",
-                 n, elapsed, elapsed / max(n, 1),
-                 sum(1 for i in request.items if i.source == "rule"))
-        self._show(request, edit=False)
+        elapsed = time.monotonic() - started
+        log.info("triage done in %.1fs: %s executed, %s held", elapsed,
+                 len(self._last_run.get("executed", [])), len(self.held.all()))
+        self._show(edit=False)
 
     def _status(self) -> None:
         request = self._request()
@@ -181,57 +650,138 @@ class Bot:
         """
         self._run += 1
         self._page = 0
-        self._view = self.mode
         self._intents = {}
         self._message_id = None
+        # Drop the digest id too, so the message still on the owner's screen
+        # stops being tappable. Cancelling the conversation has to cancel the
+        # buttons it drew, or a stale tap re-renders a run that was abandoned.
+        self._digest_id = ""
         log.info("run cancelled; moved to run=%s", self._run)
-        self.transport.send_message(self.chat_id, "Cancelled. Nothing was executed.")
+        # NOT "nothing was executed": /triage is incremental now and has already
+        # acted by the time this can be typed. Saying otherwise would tell the
+        # owner their mail is untouched when the agent has archived half of it.
+        # What cancelling actually does is retire the buttons, so that is what
+        # it says. /cancel's real subject - abandoning a parked run - is Plan 3.
+        self.transport.send_message(
+            self.chat_id, "Cancelled. Buttons on the last digest are no longer active.")
+
+    def _ack(self, callback_id: str, text: str = "") -> None:
+        """Clear the spinner. Never let failing to do so cost the tap.
+
+        answerCallbackQuery is cosmetic - it stops Telegram spinning the button
+        and optionally shows a toast. The query id expires in seconds, so any
+        tap that queued while the bot was down comes back as
+        "query is too old and response timeout expired or query ID is invalid",
+        and this used to be called BEFORE the work, unguarded: the 400 aborted
+        the handler and the action was silently lost. Seen live as eleven
+        tracebacks and nothing acted on.
+
+        Swallowed at info, not warning: an expired ack is the normal
+        consequence of a restart, not a fault to investigate.
+        """
+        try:
+            self.transport.answer_callback(callback_id, text)
+        except Exception as exc:
+            log.info("could not acknowledge callback %s: %s", callback_id, exc)
 
     def _on_callback(self, query: dict) -> None:
+        """Every path answers the callback, and says something when it refuses.
+
+        Telegram spins the button until answerCallbackQuery arrives, and an
+        empty answer clears the spinner without saying anything. Both refusals
+        below - a stale digest, and a button whose behaviour is not built yet -
+        used to be silent, which is indistinguishable from a broken bot: the
+        owner taps again, and again, and then asks what the button is for.
+        """
         intent = decode(query.get("data", ""))
-        self.transport.answer_callback(query.get("id", ""))
-
-        request = self._request()
-        if request is None:
-            # Finished, cancelled, or never started. A replayed callback lands
-            # here and must do nothing at all.
-            return
-
+        answer = query.get("id", "")
         if intent.kind == "noop":
+            self._ack(answer, "That button came from an older message.")
+            return
+        if not self._digest_id or intent.digest_id != self._digest_id:
+            # A tap on a superseded digest. Positions have shifted since that
+            # message was drawn, so acting on it would act on the wrong thread.
+            #
+            # The empty-id check is not redundant: decode() reports an id-less
+            # callback as digest_id="", which is also this object's state before
+            # the first digest and after /cancel. Comparing alone would let ""
+            # match "" and make an id-less callback valid in exactly the two
+            # moments when no digest exists.
+            log.info("ignored a callback from digest %r (current %r)",
+                     intent.digest_id, self._digest_id)
+            self._ack(answer, "That digest is out of date - send /triage or "
+                             "/held for a current one.")
             return
 
-        if intent.kind == "open":
-            if intent.index is not None:
-                self._view = "paged"
-                self._page = intent.index
-                self._show(request, edit=True)
-            return
-
-        if intent.kind == "list":
-            self._view = "digest"
-            self._page = 0
-            self._show(request, edit=True)
-            return
+        self._ack(answer)
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
-            self._page = max(0, self._page + step)
-            self._show(request, edit=True)
+            if self._panel == "done":
+                self._done_page = max(0, self._done_page + step)
+            else:
+                self._page = max(0, self._page + step)
+            self._show(edit=True)
+            return
+        if intent.kind == "done":
+            # The report half of act-then-report. The counts say a label
+            # happened; this says which one, which is the part a correction
+            # would be about.
+            self._panel = "done"
+            self._done_page = 0
+            self._show(edit=True)
+            return
+        if intent.kind == "list":
+            self._panel = "digest"
+            self._show(edit=True)
+            return
+        if intent.kind == "open":
+            # The screen the numbered buttons have always implied.
+            self._panel_before_item = self._panel
+            self._panel = "item"
+            self._open_index = intent.index or 0
+            self._show(edit=True)
+            return
+        if intent.kind in ("approve", "reject"):
+            self._held_verdict(intent)
+            return
+        if intent.kind in ("keep", "relabel", "teach_trash"):
+            self._verdict(intent)
+            return
+        if intent.kind in ("scope_narrow", "scope_wide"):
+            self._teach(wide=intent.kind == "scope_wide")
+            return
+        if intent.kind in ("approve_attention",):
+            # Plan 2 gives these their real behaviour. Say so rather than
+            # re-rendering an unchanged message, which Telegram rejects as
+            # unmodified and which therefore looks like nothing at all.
+            self._ack(answer, "Not built yet - approving the attention tier "
+                             "lands in the next step.")
             return
 
-        if intent.kind in ("approve", "reject", "label"):
-            if intent.index is not None:
-                self._intents[intent.index] = intent
-                log.info("verdict: item %s -> %s", intent.index, intent.kind)
-                # After deciding one item, advance - reviewing is a flow, and
-                # stopping on the item you just handled makes it feel stuck.
-                if self._view == "paged" and intent.index < len(request.items) - 1:
-                    self._page = intent.index + 1
-            self._show(request, edit=True)
-            return
-
-        if intent.kind == "approve_all":
-            self._resume(request)
+    # --- the interrupt path -------------------------------------------------
+    #
+    # WARNING TO WHOEVER WIRES /backlog: _resume IS NOT READY TO BE CALLED.
+    #
+    # It is unreached today - /triage no longer parks - and it is not intact.
+    # The half that collected verdicts went with the interrupt UI: the
+    # approve/reject/label callback branch that wrote into `self._intents` was
+    # deleted, because no digest button emits those kinds any more. `_intents`
+    # now has three writers, every one of them `= {}`, and a single reader here.
+    #
+    # to_response() defaults every thread the intents do not name to "approve".
+    # So calling _resume as it stands resumes with an empty mapping, which is a
+    # blanket approval of the entire parked batch with no route to reject a
+    # single item - on /backlog, a 500-thread historical sweep, which is the
+    # precise outcome previewing that sweep exists to prevent.
+    #
+    # Plan 3 must rebuild verdict collection (a detail view, its buttons, and
+    # the callback branch that records them) BEFORE connecting anything to this.
+    # Restoring the deleted branch now would be untriggerable code pinned by a
+    # synthetic test, against a contract Plan 3 is going to redesign anyway.
+    #
+    # Execution of a resume payload is covered meanwhile at the graph level in
+    # tests/test_graph.py; nothing covers this method.
 
     def _resume(self, request: ReviewRequest) -> None:
         response = to_response(request, self._intents, self.categories)

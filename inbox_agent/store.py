@@ -9,16 +9,20 @@ Stage A. The interface is deliberately narrow so Mem0 can sit behind it later.
 """
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from langgraph.store.memory import InMemoryStore
+from langgraph.store.sqlite import SqliteStore
 
-from .models import ActionKind, Rule, Thread
+from .models import ActionKind, ActionTemplate, HeldItem, ReviewItem, Rule, Thread
 
 RULES_NS = ("prefs", "rules")
 INSTRUCTIONS_NS = ("prefs", "instructions")
+HELD_NS = ("held", "items")
 
 # BaseStore.search() defaults to limit=10. rules() pages through with an
 # explicit limit and offset until a page comes back short, so the rule set is
@@ -27,6 +31,27 @@ INSTRUCTIONS_NS = ("prefs", "instructions")
 # drop rules 11+ with no error, which is exactly the failure this system's
 # audit design exists to prevent.
 _SEARCH_PAGE_SIZE = 1000
+
+
+def _search_all(store, namespace: tuple[str, ...]) -> list:
+    """Every entry in a namespace, not just the first page.
+
+    BaseStore.search() defaults to limit=10. Both stores in this module read
+    collections that grow past that, and a silently truncated read would drop
+    rules 11+ or hide queued work the owner is waiting on - exactly the
+    invisible failure this system's audit design exists to prevent. Paginate
+    with an explicit limit/offset until a page comes back short, which is the
+    correct end-of-results signal for any count.
+    """
+    out: list = []
+    offset = 0
+    while True:
+        page = store.search(namespace, limit=_SEARCH_PAGE_SIZE, offset=offset)
+        out.extend(page)
+        if len(page) < _SEARCH_PAGE_SIZE:
+            break
+        offset += _SEARCH_PAGE_SIZE
+    return out
 
 
 def build_store(embeddings=None, dims: int = 768) -> InMemoryStore:
@@ -38,7 +63,50 @@ def build_store(embeddings=None, dims: int = 768) -> InMemoryStore:
     """
     if embeddings is None:
         return InMemoryStore()
-    return InMemoryStore(index={"embed": embeddings, "dims": dims, "fields": ["text"]})
+    return InMemoryStore(index=_index(embeddings, dims))
+
+
+def _index(embeddings, dims: int) -> Optional[dict]:
+    """Index config, or None when there is nothing to embed with.
+
+    Shared by both builders so an in-memory store and a SQLite one are indexed
+    on the same terms - otherwise a rule found by semantic search in the
+    notebook could be missed by the bot, and the difference would be invisible.
+    """
+    if embeddings is None:
+        return None
+    return {"embed": embeddings, "dims": dims, "fields": ["text"]}
+
+
+def open_store(path: Path | str, embeddings=None, dims: int = 768) -> SqliteStore:
+    """A store that outlives the process, at `path`.
+
+    `build_store` is memory: right for the suite, for the notebook, and for
+    anything whose lifetime is one run. It is wrong for the bot, and became
+    dangerous rather than merely lossy when `mark_triaged` landed. Every thread
+    a run processes leaves the fetch query, held ones included, and `fetch` uses
+    `settings.inbox_query` in both modes - so an item lost from the queue is not
+    re-fetched by `/triage`, and `/backlog` will not find it either. On a
+    restart the owner would not see a shorter digest; they would have threads
+    that no longer exist as far as the agent is concerned, recoverable only by
+    searching `label:agent/triaged` in Gmail by hand.
+
+    SQLite rather than a service for the same reason the audit log is a file:
+    it is one path, it is inspectable with tools the owner already has, and it
+    has no operational story to get wrong. Same BaseStore interface either way,
+    so `PreferenceStore` and `HeldQueue` are untouched by which one they get -
+    which is the whole reason they were written against the interface.
+
+    Autocommit (`isolation_level=None`) because SqliteStore opens its own
+    transactions; the default would nest them and every write would raise
+    `cannot start a transaction within a transaction`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn, index=_index(embeddings, dims))
+    store.setup()   # migrations, idempotent
+    return store
 
 
 # A rule that is wrong this often is worse than no rule: it produces confident,
@@ -99,10 +167,15 @@ def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None
     return "sender", "unknown"
 
 
-def rule_from_correction(thread: Thread, action: ActionKind, note: str,
+def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: str,
                          *, rejected: Optional[ActionKind] = None,
                          corpus: Optional[list[Thread]] = None) -> Rule:
     """Turn one human correction into a durable, attributable rule.
+
+    `actions` is the sequence to take next time, not a single kind: the
+    correction the owner most wants to teach - "label it, but leave it in the
+    inbox" - is a statement about a sequence, and a single kind could not even
+    say which label to apply.
 
     `rejected` records a bare "not this" - a reject with no replacement. The
     spec counts every reject OR edit as a candidate rule; only edits used to
@@ -113,7 +186,7 @@ def rule_from_correction(thread: Thread, action: ActionKind, note: str,
         id=f"r-{uuid.uuid4().hex[:8]}",
         scope=scope,
         pattern=pattern,
-        action=action,
+        actions=list(actions),
         rejected_action=rejected,
         provenance=note,
         created_at=datetime.now(timezone.utc),
@@ -129,47 +202,45 @@ class PreferenceStore:
         return rule
 
     def rules(self) -> list[Rule]:
-        """All stored rules, regardless of how many there are.
-
-        `InMemoryStore.search()` defaults to limit=10, which would otherwise
-        silently truncate the rule set as it grows past that default. Paginate
-        with an explicit limit/offset until a page comes back short of a full
-        page, which is the correct end-of-results signal for any rule count.
-        """
-        out: list[Rule] = []
-        offset = 0
-        while True:
-            page = self._store.search(RULES_NS, limit=_SEARCH_PAGE_SIZE, offset=offset)
-            out.extend(Rule.model_validate(item.value["rule"]) for item in page)
-            if len(page) < _SEARCH_PAGE_SIZE:
-                break
-            offset += _SEARCH_PAGE_SIZE
-        return out
+        """All stored rules, regardless of how many there are."""
+        page = _search_all(self._store, RULES_NS)
+        return [Rule.model_validate(item.value["rule"]) for item in page]
 
     def _put(self, rule: Rule) -> None:
         self._store.put(
             RULES_NS, rule.id,
             {"rule": rule.model_dump(mode="json"),
-             "text": f"{rule.scope} {rule.pattern} -> {rule.action}. {rule.provenance}"},
+             "text": f"{rule.scope} {rule.pattern} -> {rule.summary}. {rule.provenance}"},
         )
 
     def _get(self, rule_id: str) -> Optional[Rule]:
         item = self._store.get(RULES_NS, rule_id)
         return Rule.model_validate(item.value["rule"]) if item else None
 
+    def _live_rules(self) -> list[Rule]:
+        """Rules still entitled to decide anything.
+
+        Overridden rules never match, and neither do rules proven unreliable: a
+        rule below MIN_PRECISION after enough firings is worse than no rule,
+        because it produces confident and citable wrong decisions. Factored out
+        so the thread lookup and the category lookup cannot drift apart on the
+        one question that has nothing to do with which kind of rule it is.
+        """
+        return [r for r in self.rules()
+                if not r.overridden
+                and not (r.hit_count >= MIN_HITS_BEFORE_DEMOTION
+                         and (r.precision or 0.0) < MIN_PRECISION)]
+
     def matching(self, thread: Thread) -> list[Rule]:
         """Active rules that apply to this thread.
 
-        Overridden rules never match, and neither do rules that have been proven
-        unreliable: a rule below MIN_PRECISION after enough firings is worse than
-        no rule, because it produces confident and citable wrong decisions.
+        Category-scoped rules are excluded structurally, not by omission: a
+        category is the model's conclusion, and this runs before the model. See
+        matching_category.
         """
         out = []
-        for rule in self.rules():
-            if rule.overridden:
-                continue
-            if (rule.hit_count >= MIN_HITS_BEFORE_DEMOTION
-                    and (rule.precision or 0.0) < MIN_PRECISION):
+        for rule in self._live_rules():
+            if rule.scope == "category":
                 continue
             if rule.scope == "sender" and rule.pattern == thread.sender.lower():
                 out.append(rule)
@@ -180,6 +251,18 @@ class PreferenceStore:
             elif rule.scope == "subject" and rule.pattern.lower() in thread.subject.lower():
                 out.append(rule)
         return out
+
+    def matching_category(self, category: str) -> list[Rule]:
+        """Rules about a conclusion rather than about a thread.
+
+        Separate from matching() because the input differs in kind: a category
+        is what the model decided, so this cannot run until it has. Same
+        demotion filter - a category rule reaches every thread of that category,
+        so a rule that is wrong half the time does more damage here than a
+        sender rule ever could.
+        """
+        return [r for r in self._live_rules()
+                if r.scope == "category" and r.pattern == category]
 
     def record_hit(self, rule_id: str) -> None:
         rule = self._get(rule_id)
@@ -234,7 +317,7 @@ class PreferenceStore:
 
     def as_table(self) -> list[dict]:
         return [
-            {"id": r.id, "scope": r.scope, "pattern": r.pattern, "action": r.action,
+            {"id": r.id, "scope": r.scope, "pattern": r.pattern, "action": r.summary,
              "hit_count": r.hit_count, "overrides": r.override_count,
              "precision": ("-" if r.precision is None else f"{r.precision:.2f}"),
              "overridden": r.overridden,
@@ -242,3 +325,61 @@ class PreferenceStore:
              "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S")}
             for r in sorted(self.rules(), key=lambda r: r.created_at)
         ]
+
+
+class HeldQueue:
+    """Proposals waiting on the owner, across runs.
+
+    Separate from PreferenceStore because the lifetimes differ: a rule is
+    permanent knowledge, a held item is a piece of work in flight. The class
+    itself is store-agnostic - any BaseStore, its own namespace - so the two
+    could in principle share one store the way they already share one kind of
+    backend.
+
+    Callers wire them with two separate store instances instead. Rules go in
+    a store built with embeddings (`build_store(get_embeddings())`) so rule
+    text is semantically searchable; a held item's payload has no `text`
+    field for that index to key off, so sharing that store would spend real
+    embedding calls on a payload the index has nothing to do with. One
+    interface, one persistence mechanism to reason about later - just not one
+    instance in practice.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def add(self, item: ReviewItem, *, run_id: str, reason: str,
+            now: Optional[datetime] = None) -> HeldItem:
+        """Hold `item`, preserving the original wait time if already held.
+
+        Idempotent on thread_id: a thread the agent holds twice is one item that
+        has been waiting since the first time, not two items. The content and
+        the reason ARE refreshed, so a re-classified thread shows its current
+        proposal.
+        """
+        existing = self.get(item.thread_id)
+        held = HeldItem(
+            thread_id=item.thread_id,
+            run_id=run_id,
+            first_held_at=existing.first_held_at if existing
+            else (now or datetime.now(timezone.utc)),
+            hold_reason=reason,
+            item=item,
+        )
+        self._store.put(HELD_NS, held.thread_id,
+                        {"held": held.model_dump(mode="json")})
+        return held
+
+    def get(self, thread_id: str) -> Optional[HeldItem]:
+        entry = self._store.get(HELD_NS, thread_id)
+        return HeldItem.model_validate(entry.value["held"]) if entry else None
+
+    def remove(self, thread_id: str) -> None:
+        """Absent is not an error: a double-tap must not raise at the transport."""
+        self._store.delete(HELD_NS, thread_id)
+
+    def all(self) -> list[HeldItem]:
+        """Everything held, oldest first."""
+        page = _search_all(self._store, HELD_NS)
+        items = [HeldItem.model_validate(entry.value["held"]) for entry in page]
+        return sorted(items, key=lambda h: h.first_held_at)

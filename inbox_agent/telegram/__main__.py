@@ -16,7 +16,7 @@ from ..config import get_embeddings, load_settings, mask, use_model
 from ..gmail import SnapshotGmailClient
 from ..graph import build_graph
 from ..policy import load_policy
-from ..store import PreferenceStore, build_store
+from ..store import HeldQueue, PreferenceStore, open_store
 from .bot import Bot, HttpTransport, run_polling
 
 
@@ -49,7 +49,20 @@ def main() -> int:
     policy = load_policy(settings)
     client = SnapshotGmailClient(settings.snapshot_dir / "threads.json")
     log = AuditLog(settings.audit_log)
-    prefs = PreferenceStore(build_store(get_embeddings()))
+    # On disk, not in memory. The bot is the one caller whose lifetime is not
+    # the run: it is restarted for a code change, a laptop lid, a crash. Rules
+    # were merely lost that way; held items became unreachable, because
+    # mark_triaged takes every processed thread out of the fetch query and
+    # `/backlog` uses the same query. See open_store.
+    prefs = PreferenceStore(open_store(settings.store_dir / "prefs.sqlite",
+                                       get_embeddings()))
+    # Own namespace, own file: a held item is work in flight, not durable
+    # preference knowledge, and build_graph now requires the queue explicitly
+    # (task 4) rather than building one for itself. Separate files rather than
+    # one, because only the rules want the embedding index - pointing it at a
+    # held payload with no `text` field would cost embedding calls to index
+    # nothing.
+    held = HeldQueue(open_store(settings.store_dir / "held.sqlite"))
     llm = use_model("gemma") if settings.backend == "ollama" else None
     if llm is None:
         from ..config import get_llm
@@ -59,12 +72,17 @@ def main() -> int:
     checkpointer = cm.__enter__()
 
     graph = build_graph(client=client, prefs=prefs, policy=policy, llm=llm,
-                        settings=settings, log=log, checkpointer=checkpointer)
+                        settings=settings, log=log, held=held,
+                        checkpointer=checkpointer)
 
     categories = policy_categories(policy)
     transport = HttpTransport(settings.tg_token)
-    bot = Bot(transport=transport, graph=graph, settings=settings,
-              categories=categories)
+    # The same queue the graph fills: one instance, so the digest renders what
+    # the run actually held rather than a second, permanently empty store.
+    # The same PreferenceStore the graph reads rules from: a correction is a
+    # store write, and two instances would let one land where nothing reads it.
+    bot = Bot(transport=transport, graph=graph, settings=settings, held=held,
+              prefs=prefs, client=client, log=log, categories=categories)
 
     print(f"backend   : {settings.backend}")
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
@@ -73,6 +91,8 @@ def main() -> int:
     print(f"chat id   : {settings.tg_chat_id}  (the only authorised sender)")
     print(f"token     : {mask(settings.tg_token)}")
     print(f"categories: {categories}")
+    print(f"store     : {settings.store_dir}  ({len(held.all())} held, "
+          f"{len(prefs.rules())} rules carried over)")
     print("\nSend /triage in Telegram. Ctrl-C to stop.")
 
     try:

@@ -19,6 +19,18 @@ def test_settings_read_from_environment(monkeypatch):
     assert s.forbidden_actions == frozenset({"send_message", "delete_forever"})
 
 
+def test_store_dir_defaults_to_a_path_beside_the_audit_log(monkeypatch):
+    """Where the queue and the learned rules live. Defaulted rather than
+    required so a first run on a new machine starts, and gitignored already."""
+    monkeypatch.delenv("INBOX_STORE_DIR", raising=False)
+    assert load_settings().store_dir == Path("inbox_agent/store")
+
+
+def test_store_dir_is_configurable(monkeypatch):
+    monkeypatch.setenv("INBOX_STORE_DIR", "/tmp/inbox-store")
+    assert load_settings().store_dir == Path("/tmp/inbox-store")
+
+
 def test_dry_run_defaults_to_true_when_unset(monkeypatch):
     monkeypatch.delenv("INBOX_DRY_RUN", raising=False)
     assert load_settings().dry_run is True
@@ -62,3 +74,18 @@ def test_mask_does_not_reveal_short_secrets(monkeypatch):
     assert short_secret not in result
     assert "8 chars" in result
     assert "<redacted>" in result
+
+
+def test_triaged_label_defaults_and_is_overridable(monkeypatch):
+    from inbox_agent.config import load_settings
+    monkeypatch.delenv("INBOX_TRIAGED_LABEL", raising=False)
+    assert load_settings().triaged_label == "agent/triaged"
+    monkeypatch.setenv("INBOX_TRIAGED_LABEL", "bot/seen")
+    assert load_settings().triaged_label == "bot/seen"
+
+
+def test_inbox_query_excludes_read_and_already_triaged_mail(monkeypatch):
+    from inbox_agent.config import load_settings
+    monkeypatch.setenv("INBOX_TRIAGED_LABEL", "agent/triaged")
+    q = load_settings().inbox_query
+    assert "in:inbox" in q and "is:unread" in q and "-label:agent/triaged" in q

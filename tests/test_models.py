@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone
 
 from inbox_agent.models import (
-    Action, Thread, Decision, Rule, ReviewItem, ReviewRequest,
+    Action, ActionTemplate, Thread, Decision, Rule, ReviewItem, ReviewRequest,
     ReviewResponse, AuditRecord, REVERSIBLE_ACTIONS,
 )
 
@@ -96,3 +96,60 @@ def test_audit_record_serialises_every_spec_field():
                   "model", "backend", "langsmith_run_id", "checkpoint_id",
                   "policy_version", "dry_run", "result", "reversible", "undo_token"):
         assert field in d
+
+
+# --- rules carry action sequences -------------------------------------------
+# A single ActionKind could not say WHICH label, so a learned label rule
+# produced Action(kind="label", params={}) and _dispatch raised KeyError against
+# a live mailbox while reporting "simulated" under dry-run.
+
+RULE_NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def a_rule(**kw):
+    base = dict(id="r-1", scope="sender", pattern="a@b.com",
+                actions=[ActionTemplate(kind="archive")],
+                provenance="user archived it", created_at=RULE_NOW)
+    return Rule(**(base | kw))
+
+
+def test_a_rule_carries_a_sequence_of_actions():
+    """label-then-archive is the sequence the model produces most often, and a
+    rule that cannot say it cannot teach the correction the owner makes."""
+    r = a_rule(actions=[ActionTemplate(kind="label", params={"label": "recruiter"}),
+                        ActionTemplate(kind="archive")])
+    assert [a.kind for a in r.actions] == ["label", "archive"]
+    assert r.actions[0].params["label"] == "recruiter"
+
+
+def test_a_label_template_carries_its_label():
+    r = a_rule(actions=[ActionTemplate(kind="label", params={"label": "receipt"})])
+    assert r.actions[0].params == {"label": "receipt"}
+
+
+def test_a_legacy_action_rule_still_loads():
+    """Rules are on disk as of this branch. One written before this change must
+    not become unreadable, or the store fails to open at all."""
+    r = Rule.model_validate({"id": "r-old", "scope": "sender", "pattern": "a@b.com",
+                             "action": "archive", "provenance": "p",
+                             "created_at": RULE_NOW})
+    assert [a.kind for a in r.actions] == ["archive"]
+
+
+def test_a_legacy_label_rule_loads_without_a_label():
+    """It converts, and it is broken - which is the bug being fixed. Visible
+    here, refused at bind time; never a KeyError halfway through a run."""
+    r = Rule.model_validate({"id": "r-old", "scope": "sender", "pattern": "a@b.com",
+                             "action": "label", "provenance": "p",
+                             "created_at": RULE_NOW})
+    assert r.actions == [ActionTemplate(kind="label", params={})]
+
+
+def test_summary_reads_like_the_digest():
+    r = a_rule(actions=[ActionTemplate(kind="label", params={"label": "recruiter"}),
+                        ActionTemplate(kind="archive")])
+    assert r.summary == "label(recruiter), archive"
+
+
+def test_category_is_a_scope():
+    assert a_rule(scope="category", pattern="newsletter_valuable").scope == "category"
