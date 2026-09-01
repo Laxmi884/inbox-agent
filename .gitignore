@@ -27,3 +27,4 @@ inbox_agent/checkpoints.sqlite*
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.superpowers/
