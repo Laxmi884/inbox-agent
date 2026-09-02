@@ -2145,7 +2145,7 @@ which mailbox is in play is the thing to be certain of before a live run."
 
 ---
 
-### Task 8: Cross-client contract tests
+### Task 8: Cross-client contract tests  ✅ DONE
 
 The `gmail.py:17-21` comment claims both clients answer the same query string. Until now that has been a comment. This makes it a test.
 
@@ -2156,7 +2156,7 @@ The `gmail.py:17-21` comment claims both clients answer the same query string. U
 - Consumes: `SnapshotGmailClient`, `LiveGmailClient`, `FakeGmailApi` from `tests/test_live_gmail.py`.
 - Produces: nothing consumed by later tasks.
 
-- [ ] **Step 1: Write the contract tests**
+- [x] **Step 1: Write the contract tests**
 
 Create `tests/test_client_contract.py`:
 
@@ -2278,7 +2278,7 @@ def test_only_the_snapshot_client_marks_writes_simulated(
     assert live_client.archive("t0").get("simulated") is not True
 ```
 
-- [ ] **Step 2: Make the cross-test import work**
+- [x] **Step 2: Make the cross-test import work**
 
 `test_client_contract.py` imports from `test_live_gmail`. `pytest.ini` sets `testpaths = tests` but adds nothing to `sys.path`, and `tests/__init__.py` exists, so the import needs help. Add `conftest.py` support by appending to `tests/conftest.py`:
 
@@ -2292,19 +2292,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 ```
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 Run: `python -m pytest tests/test_client_contract.py -q`
 Expected: PASS (7 tests)
 
 If the import of `test_live_gmail` still fails, run with `python -m pytest tests/test_client_contract.py -q -p no:cacheprovider` and confirm `tests/` is on the path; the `conftest.py` insertion above is the fix and runs before collection.
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `python -m pytest -q --ignore=tests/test_learning.py`
 Expected: 245 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/test_client_contract.py tests/conftest.py
