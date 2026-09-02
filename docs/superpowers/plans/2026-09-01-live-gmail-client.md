@@ -811,7 +811,7 @@ created elsewhere from being duplicated."
 
 ---
 
-### Task 4: MIME body extraction
+### Task 4: MIME body extraction  ✅ DONE
 
 Also isolated: it is pure, has no API surface, and has the most edge cases of anything here.
 
@@ -823,7 +823,7 @@ Also isolated: it is pure, has no API surface, and has the most edge cases of an
 - Consumes: nothing.
 - Produces: `_extract_body(payload: dict) -> str`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_mime.py`:
 
@@ -946,12 +946,12 @@ def test_attachments_are_never_treated_as_the_body():
     assert _extract_body(payload) == "real body"
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_mime.py -q`
 Expected: FAIL with `ImportError: cannot import name '_extract_body'`
 
-- [ ] **Step 3: Implement the extractors**
+- [x] **Step 3: Implement the extractors**
 
 Add to the imports at the top of `inbox_agent/gmail.py` (which currently imports `json`, `Path`, `Any`/`Protocol`):
 
@@ -1048,12 +1048,12 @@ def _extract_body(payload: dict) -> str:
     return ""
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_mime.py -q`
 Expected: PASS (10 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add inbox_agent/gmail.py tests/test_mime.py

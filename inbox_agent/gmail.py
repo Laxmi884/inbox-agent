@@ -7,7 +7,10 @@ scope; nothing above this module changes when it does.
 """
 from __future__ import annotations
 
+import base64
+import html as html_mod
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any, Protocol
@@ -232,3 +235,135 @@ class _LabelMap:
             self._by_id = self._by_id | {created["id"]: created["name"]}
             self._by_name = self._by_name | {created["name"]: created["id"]}
             return created["id"]
+
+
+# Everything between these tags is markup or code, never prose. Removed
+# wholesale rather than untagged, because stripping only the tags leaves CSS
+# and JS in the prompt - pure token cost, and confusing input for a classifier.
+_DROP_ELEMENTS = re.compile(r"<(script|style|head)\b[^>]*>.*?</\1>", re.I | re.S)
+# Block-level boundaries become newlines BEFORE the general tag strip. Without
+# this the whole mail collapses to a single line, so _fence's 4000-char cut
+# lands mid-sentence with no structure to orient on, and _BLANK_LINES below
+# never has anything to normalise.
+_BLOCK_BREAK = re.compile(
+    r"</?(p|div|br|tr|li|h[1-6]|table|blockquote)\b[^>]*>", re.I)
+_TAG = re.compile(r"<[^>]+>")
+# Zero-width filler that bulk senders inject in bulk to pad the inbox preview
+# line. It carries no meaning and cannot be seen, but it is charged for: on a
+# real Strava mail it was 22.4% of the first 4000 characters, which is the slice
+# _fence actually hands the model. Deleted outright rather than collapsed - a
+# space would be just as wrong, only shorter.
+# U+034F COMBINING GRAPHEME JOINER is in here because a real Strava mail used
+# 448 of them - found by counting what survived a first pass, not by guessing
+# at the set. Bulk senders reach for whatever their ESP offers, so this list is
+# empirical and will grow.
+_INVISIBLE = re.compile(
+    "[\u200b\u200c\u200d\ufeff\u00ad\u034f\u115f\u1160\u3164\u2800]+")
+# Exotic spaces normalised into ordinary ones so the collapse below catches
+# them. NBSP and figure-space ARE spaces - unlike the class above they mean
+# something - so they are converted, never dropped.
+_WS = re.compile(r"[ \t\r\f\v\u00a0\u2007\u2009\u200a\u202f\u3000]+")
+_BLANK_LINES = re.compile(r"\n{3,}")
+
+
+def _b64url(data: str) -> str:
+    """Decode Gmail's base64url, restoring the padding it strips.
+
+    Two traps, both routine rather than exotic: Gmail drops the '=' padding, so
+    a plain b64decode raises binascii.Error on roughly three quarters of all
+    messages; and the URL-safe alphabet uses '-' and '_' where standard base64
+    uses '+' and '/'. errors="replace" on the final decode because a mislabelled
+    charset is common and must never take down a run.
+    """
+    if not data:
+        return ""
+    padded = data + "=" * (-len(data) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded)
+    except Exception:
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _strip_invisible(text: str) -> str:
+    """Drop zero-width filler and normalise exotic spaces.
+
+    Applied to plain-text parts too, not only HTML: the padding arrives in
+    whichever alternative the sender wrote it into, and on real mail the
+    text/plain part is where it showed up.
+    """
+    return _INVISIBLE.sub("", text)
+
+
+def _normalise(text: str) -> str:
+    """Drop invisible filler, collapse runs of space, and delete lines that are
+    now empty.
+
+    That last step is not cosmetic. Stripping the filler out of a padded mail
+    leaves the rows it was padding as whitespace-only lines, and a run of
+    "\n \n \n" is charged for exactly like content. Applied to plain-text and
+    HTML alike so the two branches cannot drift.
+    """
+    text = _strip_invisible(text)
+    text = _WS.sub(" ", text)
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    return _BLANK_LINES.sub("\n\n", text).strip()
+
+
+def _html_to_text(html: str) -> str:
+    text = _DROP_ELEMENTS.sub(" ", html)
+    text = _BLOCK_BREAK.sub("\n", text)
+    text = _TAG.sub(" ", text)
+    text = html_mod.unescape(text)
+    return _normalise(text)
+
+
+def _walk_parts(payload: dict):
+    """Depth-first over the MIME tree, skipping attachments.
+
+    A part with a filename is an attachment even when its mimeType is
+    text/plain, so a .txt attachment never becomes the body.
+    """
+    if payload.get("filename"):
+        return
+    parts = payload.get("parts")
+    if parts:
+        for part in parts:
+            yield from _walk_parts(part)
+    else:
+        yield payload
+
+
+def _extract_body(payload: dict) -> str:
+    """Best text for one message payload: text/plain if there is any, else
+    stripped text/html, else empty.
+
+    Empty is a legitimate answer, not an error: a calendar invite or a bare
+    attachment has no text part, and such a thread must still classify on its
+    subject and sender.
+
+    The fallback turns on whether a part yielded TEXT, not on whether a part
+    was present. A multipart/alternative whose plain part is whitespace - or
+    whose data is corrupt, which decodes to "" - would otherwise return "" and
+    never look at the html part carrying the entire message, and the result
+    would be indistinguishable from mail that genuinely had no body.
+    """
+    if not payload:
+        return ""
+    plain, html = [], []
+    for part in _walk_parts(payload):
+        # Gmail reports 'text/plain; charset="UTF-8"', never a bare mime type.
+        mime = (part.get("mimeType") or "").lower()
+        data = (part.get("body") or {}).get("data") or ""
+        if not data:
+            continue
+        if mime.startswith("text/plain"):
+            plain.append(_b64url(data))
+        elif mime.startswith("text/html"):
+            html.append(_b64url(data))
+
+    text = "\n".join(p for p in plain if p.strip())
+    if text.strip():
+        return _normalise(text)
+    text = _html_to_text("\n".join(h for h in html if h.strip()))
+    return text or ""
