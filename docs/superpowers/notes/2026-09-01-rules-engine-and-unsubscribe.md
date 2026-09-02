@@ -293,27 +293,153 @@ outbound request to a stranger. The offer is only worth making for senders that
 are both high-volume and currently active, which is a much shorter list than
 the sweep itself.
 
-## 4. Outstanding
+## 4. What the enterprise RAG notebook contributed
 
-**The NotebookLM review did not happen.** The user's "building enterprise rag"
-notebook (`b7dd23bd-61bc-42af-b390-208ac30b422b`) was to be mined for
-transferable concepts - specifically deterministic pre-retrieval routing as an
-analogue to the stage split in 1.2, any structured metadata-predicate layer,
-filter precedence, and selection provenance.
+Source: the user's own notebook **"Building Baseline Enterprise RAG Pipelines
+brick by brick"** (`b7dd23bd-61bc-42af-b390-208ac30b422b`), 17 Towards Data
+Science PDFs. Five were on-point: *Parse the question before you search*,
+*Dispatching the Parsed RAG Question: Chunk Strategy, Model Tier, Activations,
+Audit*, *Five fields RAG should extract from any question*, *Retrieval Is
+Filtering, Not Search*, and *When RAG Users Ask Vague Questions: Clarify Once,
+Learn the Default*.
 
-Blocked on authentication. `~/.notebooklm/storage_state.json` was rewritten by
-a fresh `notebooklm login` at 21:24 and every RPC still redirected to the Google
-sign-in page minutes later; `notebooklm auth check` reports cookies present and
-`token_fetch: null`. Likely the login completed against an account other than
-the notebook's owner, or the session was invalidated server-side.
+More transferable than expected. The pipeline it describes has a learned-default
+subsystem that is structurally the same problem as our learned rules, and it has
+solved two things we have not.
 
-To resume:
+### 4.1 Validated: typed parse, then pure functions over its fields
 
-```bash
-notebooklm login                                     # must be the user; needs a browser
-notebooklm list --json                               # confirm it actually works now
-notebooklm source list --notebook b7dd23bd-61bc-42af-b390-208ac30b422b --json
+Their dispatcher parses a question once into a typed `ParsedQuestion`, then runs
+pure functions keying on its fields:
+
+```python
+def decide_activations(parsed: ParsedQuestion, doc_profile: DocumentProfile):
+    plan = ExecutionPlan()                      # defaults
+    if parsed.decomposition.pattern == "independent":
+        plan.decompose_compound = True
+    if doc_profile.format == "docx":
+        plan.extract_page_numbers = False
+    if parsed.answer_shape == "listing":
+        plan.iterate_on_feedback = True
+    return plan
 ```
 
-Nothing in sections 1-3 depends on it. Treat it as a possible source of
-refinements, not a blocker.
+This is exactly the shape of `apply_rules` (`graph.py:249`) running over
+`ThreadJudgment` (`classify.py:44`) - a closed typed struct produced by one
+model call, then deterministic dispatch on its fields. 1.2's post-model stage is
+independently arrived at by a production system.
+
+### 4.2 Validated: every dispatch predicate is flat
+
+The dispatcher is described as accumulating **15-30 rules over a deployment's
+lifetime**, and every rule shown across the material is a flat equality or
+boolean check on one typed field. No nesting, no boolean trees, anywhere.
+
+That is independent support for 1.3. A system that reached 30 rules in
+production without needing nesting is better evidence than our argument from the
+learning signal, and it points the same way.
+
+### 4.3 Borrow: a vote distribution, not a scalar override count
+
+The strongest finding. Their `ClarificationDefault` stores `candidate_votes`
+(values mapped to weighted votes), `confidence`, `sample_size` and
+`last_refreshed`. On disagreement, the update **decrements the wrong value and
+credits the alternative**:
+
+```
+votes[wrong] = votes.get(wrong, 0) - 1     # and the alternative gains
+confidence_new = max(0.0, top) / n_new
+```
+
+Ours cannot do this. `record_override` (`store.py:273`) is:
+
+```python
+rule.override_count += 1
+```
+
+It records *that* someone disagreed and never *what they wanted instead*.
+`rejected_action` (`models.py:100`) is a single scalar, not a distribution, so it
+cannot accumulate across corrections either.
+
+The consequence is concrete: a rule that is consistently wrong **in the same
+way** - `sender=X -> archive` where the owner always wants `label(news)` - dies
+by demotion instead of converging on the right answer. The correction signal is
+spent proving the rule bad rather than making it good.
+
+Worth taking. It also composes with the richer schema: with `Rule.when` a
+predicate list and votes over actions, a rule can move its *action* while keeping
+its *match*.
+
+### 4.4 Borrow: losing confidence reverts to "ask", it does not delete
+
+Below `0.60`, their gating "invalidates silent execution and reverts the system
+to ask mode". The rule survives; only its *autonomy* is withdrawn.
+
+That maps precisely onto the autonomy ladder. A rule whose precision falls should
+drop out of the auto-execute tier and back into the held/authorisation tier -
+where the owner sees it again and can correct it, which is the only way it
+recovers. Our threshold is 0.5 and `mark_overridden` (`store.py:281`) already
+insists a rule is "kept, not deleted"; what needs checking when this is picked up
+is whether demotion actually re-gates the action or merely deprioritises the
+rule.
+
+### 4.5 Borrow: record what did *not* fire, and why
+
+Their audit contract carries the negative space:
+
+```python
+class AuditedRetrievalResult(BaseModel):
+    ...
+    methods_run: list
+    methods_skipped: list
+    skipped_reasons: dict
+```
+
+`prefilter` (`prefilter.py:43`) records only the winner. A rule that matched and
+lost to `max(matches, key=created_at)` (`prefilter.py:57`) leaves no trace at
+all, so "why didn't my rule fire?" is unanswerable today. Under 1.5's
+specificity ordering there will be *more* losing matches, not fewer, so this
+becomes load-bearing rather than nice to have.
+
+`TriageState.skipped` (`graph.py:65`) is already `Annotated[list[dict],
+operator.add]`, so the channel exists.
+
+### 4.6 Considered and rejected
+
+- **Their conflict model.** "Conflicts largely avoided by construction because
+  each rule targets a specific activation flag", resolved sequentially as a plan
+  object is mutated. That works because their rules write *different fields*.
+  Ours all write the same thing - an action on a thread - so conflict is
+  structural for us and cannot be designed away. 1.5 stands unchanged; the
+  material offers nothing here.
+- **Stats computed externally rather than stored on the rule.**
+  `ClarificationDefault` deliberately stores no precision; it is computed by
+  joining clarification tables to a `query_log`. We store `hit_count`
+  (`models.py:95`) and `override_count` (`models.py:104`) on the `Rule` itself.
+  A real tension - we do have a query log in `audit.jsonl` - but on-rule counters
+  are what make `precision` (`models.py:129`) a local read with no join on the
+  hot path in `prefilter`. Keep ours.
+- **Model-tier cascade by expected answer type** (`gpt-4.1-nano` for amounts and
+  dates, larger models for text). Genuinely interesting against the measured
+  `MODELS` registry in `config.py`, but it is a routing idea for the
+  *classifier*, not the rules engine. Recorded so it is not lost; out of scope
+  for this doc.
+- Chunking, embeddings, rerankers, TOC anchoring, keyword/BM25 method selection,
+  the LLM arbiter's candidate ranking. Retrieval-shaped with no email analogue.
+
+### 4.7 Verdict on the stage split: half validated, half unaddressed
+
+**Validated:** typed-parse-then-pure-functions is their dispatcher and our
+`apply_rules`. That half of 1.2 is sound.
+
+**Not validated, and not refuted - simply absent.** They have no analogue of
+`prefilter`. `decide_activations(parsed, doc_profile)` mixes model-derived fields
+(`parsed.answer_shape`, `parsed.intent`) with deterministic corpus facts
+(`doc_profile.format`, `doc_has_toc`) **in one function**. They never split by
+stage, because they have no reason to: the question parse always runs, and it is
+one cheap call on one short question.
+
+Our pressure is per-item across 50 to 16,748 threads per run, which is the entire
+reason `prefilter` exists. So the half of 1.2 that actually saves money - a cheap
+tier that skips the model outright - gets no support from this material. It is a
+problem they do not have.
