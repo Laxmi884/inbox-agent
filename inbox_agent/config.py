@@ -176,7 +176,9 @@ def load_settings() -> Settings:
         store_dir=Path(os.getenv("INBOX_STORE_DIR", "inbox_agent/store")),
         forbidden_actions=ALWAYS_FORBIDDEN | frozenset(configured),
         context_hub_skill=os.getenv("CONTEXT_HUB_SKILL", "inbox-triage"),
-        context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
+        # Blank = latest. "dev" was the old default and is not a ref the hub
+        # can resolve; see _pull_from_context_hub.
+        context_hub_tag=os.getenv("CONTEXT_HUB_TAG", ""),
         stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
         triaged_label=_resolve_triaged_label(),
         gmail=_resolve_gmail(),

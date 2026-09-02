@@ -26,10 +26,22 @@ class Policy:
 
 
 def _pull_from_context_hub(settings: Settings) -> Policy:
-    """Pull the policy skill at the configured tag. Raises if unavailable."""
+    """Pull the policy skill at the configured tag. Raises if unavailable.
+
+    A blank tag means the latest commit. Context Hub resolves a commit hash or
+    nothing at all - there is no branch-like ref, so the "dev" this shipped with
+    404'd on every run and load_policy quietly fell back to the local file. That
+    fallback is correct, and it is exactly what hid the misconfiguration: the
+    agent reported `local:...` while looking configured for the hub.
+
+    Not pinning by default costs nothing in reproducibility, because the audit
+    record stores the RESOLVED `hub:<commit>` of whatever actually ran. Set the
+    tag to a commit hash only to force an older policy deliberately.
+    """
     from langsmith import Client
 
-    ctx = Client().pull_skill(settings.context_hub_skill, version=settings.context_hub_tag)
+    ctx = Client().pull_skill(settings.context_hub_skill,
+                              version=settings.context_hub_tag or None)
     files = getattr(ctx, "files", {}) or {}
     for name in ("POLICY.md", "AGENTS.md", "SKILL.md"):
         if name in files:
