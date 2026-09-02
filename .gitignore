@@ -21,6 +21,11 @@ inbox_agent/snapshot/
 inbox_agent/store/
 *.jsonl
 
+# Google OAuth: the client secret and the refresh token it produces. Both are
+# live credentials for the real mailbox. Ignored BEFORE either file exists, on
+# purpose — df1f2da put a bot token in this repo's history exactly once.
+secrets/
+
 # LangGraph checkpoints hold graph state, which includes full thread content.
 # Real email - never commit.
 inbox_agent/checkpoints.sqlite*
