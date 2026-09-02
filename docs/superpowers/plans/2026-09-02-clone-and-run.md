@@ -116,10 +116,10 @@ And in `load_settings()`, beside `body_budget=_resolve_body_budget(),`:
 - [ ] **Step 4: Run the new tests, then the whole suite**
 
 Run: `python3 -m pytest tests/test_config.py -k embeddings -v`
-Expected: PASS (5 tests).
+Expected: PASS (6 tests).
 
 Run: `python3 -m pytest`
-Expected: `589 passed`.
+Expected: `590 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -256,7 +256,7 @@ Run: `python3 -m pytest tests/test_config.py -k "resolution_matrix or pinned_oll
 Expected: PASS (9 tests).
 
 Run: `python3 -m pytest`
-Expected: `598 passed`.
+Expected: `599 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -403,7 +403,7 @@ Run: `python3 -m pytest tests/test_store.py tests/test_tg_banner.py -v`
 Expected: PASS.
 
 Run: `python3 -m pytest`
-Expected: `603 passed`.
+Expected: `604 passed`.
 
 - [ ] **Step 5: Verify the banner by hand**
 
@@ -515,7 +515,7 @@ Run: `python3 -m pytest tests/test_config.py -k source_of -v`
 Expected: PASS (4 tests).
 
 Run: `python3 -m pytest`
-Expected: `607 passed`.
+Expected: `608 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -653,7 +653,7 @@ Run: `python3 -m pytest tests/test_google_auth.py -k consent -v`
 Expected: PASS (3 tests).
 
 Run: `python3 -m pytest`
-Expected: `610 passed`.
+Expected: `611 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -961,7 +961,7 @@ Run: `python3 -m pytest tests/test_doctor.py -v`
 Expected: PASS (9 tests).
 
 Run: `python3 -m pytest`
-Expected: `619 passed`.
+Expected: `620 passed`.
 
 - [ ] **Step 5: Run it against the real configuration**
 
@@ -1129,7 +1129,7 @@ Run: `python3 -m pytest tests/test_cli.py -v`
 Expected: PASS (4 tests).
 
 Run: `python3 -m pytest`
-Expected: `623 passed`.
+Expected: `624 passed`.
 
 - [ ] **Step 6: Verify the package actually installs and the script works**
 
