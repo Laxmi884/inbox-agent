@@ -311,8 +311,44 @@ def _build_openrouter(model: str):
     )
 
 
-def get_embeddings():
-    """Local embeddings for store semantic search. nomic-embed-text is 768-dim."""
+def resolve_embeddings(kind: Optional[str] = None) -> str:
+    """Which embeddings the store will ACTUALLY get: "ollama" or "none".
+
+    Never returns "auto" - that is a request, not an outcome, and doctor has to
+    report what happened rather than what was asked for.
+
+    The probe is the point. OllamaEmbeddings constructs without touching the
+    network, so before this existed the process started happily and raised at
+    the first `put` - which is a correction, in Telegram, hours later, in the
+    one code path this system exists for.
+    """
+    choice = kind if kind is not None else _resolve_embeddings()
+    if choice == "none":
+        return "none"                      # no probe: nothing to check
+    if ollama_available():
+        return "ollama"
+    if choice == "ollama":
+        raise RuntimeError(
+            f"INBOX_EMBEDDINGS=ollama but nothing is listening on "
+            f"{OLLAMA_BASE_URL}. Start `ollama serve`, or set "
+            f"INBOX_EMBEDDINGS=auto to run without the rule index."
+        )
+    print(f"[resolve_embeddings] INBOX_EMBEDDINGS=auto and nothing is listening "
+          f"on {OLLAMA_BASE_URL} - falling back to none. Rules still work; they "
+          f"are matched exactly, not semantically. Start `ollama serve` to index.")
+    return "none"
+
+
+def get_embeddings(kind: Optional[str] = None):
+    """Local embeddings for the rule index, or None. nomic-embed-text is 768-dim.
+
+    `kind` is the configured value (auto|ollama|none); omit it to read the
+    environment. Returns None whenever the resolved mode is "none", which is
+    exactly what _index() already expects (store.py).
+    """
+    if resolve_embeddings(kind) == "none":
+        return None
+
     from langchain_ollama import OllamaEmbeddings
 
     return OllamaEmbeddings(model=DEFAULT_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
