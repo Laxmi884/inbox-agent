@@ -70,6 +70,24 @@ class Settings:
     # no new capability. Marking as READ would have worked too and was rejected -
     # it destroys unread as a signal for the human and is not on the ladder.
     triaged_label: str = "agent/triaged"
+    # Which GmailClient build_gmail_client() returns. "snapshot" or "live".
+    # Defaulted to snapshot deliberately: an unconfigured checkout, and the
+    # whole existing suite, behave exactly as they did before this existed, and
+    # nothing reaches for credentials that are not there. Going live is one
+    # deliberate edit, which is the same shape as INBOX_DRY_RUN.
+    gmail: str = "snapshot"
+    # OAuth client of type "Desktop app", and the token the consent flow writes
+    # beside it. Both live credentials for the real mailbox; `secrets/` is
+    # gitignored. Paths rather than contents so neither is ever held in
+    # Settings, which is printed in places.
+    google_credentials: Path = Path("secrets/credentials.json")
+    google_token: Path = Path("secrets/token.json")
+    # Characters of message body allowed into the classifier prompt. 0 means
+    # snippet only. The snapshot has empty bodies, so 0 reproduces what has
+    # always happened; live mail is where it starts to matter. Kept a knob
+    # rather than a constant so the snippet-vs-body comparison is a config flip
+    # driven from LangSmith traces, not a code edit. See the design spec 2.4.
+    body_budget: int = 0
 
     @property
     def inbox_query(self) -> str:
@@ -106,6 +124,41 @@ def _resolve_triaged_label() -> str:
     return raw
 
 
+VALID_GMAIL_CLIENTS = ("snapshot", "live")
+
+
+def _resolve_gmail() -> str:
+    """Which client to build. An unrecognised value is a misconfiguration, and
+    falling back to "snapshot" would answer a request for the real mailbox with
+    a run that looks successful and touched nothing. Same reasoning as
+    _resolve_triaged_label: name the variable that is wrong, at load time."""
+    raw = os.getenv("INBOX_GMAIL", "snapshot").strip().lower()
+    if raw not in VALID_GMAIL_CLIENTS:
+        raise ValueError(
+            f"INBOX_GMAIL={raw!r} is not one of {VALID_GMAIL_CLIENTS}. "
+            "Use 'snapshot' for the frozen evaluation set, or 'live' for the "
+            "real mailbox (which also needs INBOX_GOOGLE_CREDENTIALS)."
+        )
+    return raw
+
+
+def _resolve_body_budget() -> int:
+    """Characters of body into the prompt. Negative is refused rather than
+    clamped: clamping to 0 would look exactly like "snippet only was chosen",
+    when what actually happened is a misconfiguration nobody was told about."""
+    raw = os.getenv("INBOX_BODY_BUDGET", "0").strip()
+    try:
+        value = int(raw or "0")
+    except ValueError:
+        raise ValueError(
+            f"INBOX_BODY_BUDGET={raw!r} is not an integer. Use 0 for snippet "
+            "only, or a character budget such as 2000.") from None
+    if value < 0:
+        raise ValueError(
+            f"INBOX_BODY_BUDGET={value} is negative. Use 0 for snippet only.")
+    return value
+
+
 def load_settings() -> Settings:
     raw_forbidden = os.getenv("INBOX_FORBIDDEN_ACTIONS", "")
     configured = {a.strip() for a in raw_forbidden.split(",") if a.strip()}
@@ -126,6 +179,11 @@ def load_settings() -> Settings:
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", "dev"),
         stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
         triaged_label=_resolve_triaged_label(),
+        gmail=_resolve_gmail(),
+        google_credentials=Path(
+            os.getenv("INBOX_GOOGLE_CREDENTIALS", "secrets/credentials.json")),
+        google_token=Path(os.getenv("INBOX_GOOGLE_TOKEN", "secrets/token.json")),
+        body_budget=_resolve_body_budget(),
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),

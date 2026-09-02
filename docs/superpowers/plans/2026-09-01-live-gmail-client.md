@@ -33,7 +33,7 @@
 
 ---
 
-### Task 1: Dependencies, gitignore, and settings
+### Task 1: Dependencies, gitignore, and settings  ✅ DONE
 
 Everything downstream needs the libraries importable, `secrets/` ignored, and the four new settings present. Folded into one task because none of them is independently reviewable — a settings field with no library to use it is not a deliverable.
 
@@ -47,7 +47,7 @@ Everything downstream needs the libraries importable, `secrets/` ignored, and th
 - Consumes: nothing.
 - Produces: `Settings.gmail: str`, `Settings.google_credentials: Path`, `Settings.google_token: Path`, `Settings.body_budget: int`. All four defaulted.
 
-- [ ] **Step 1: Install the two new libraries**
+- [x] **Step 1: Install the two new libraries**
 
 Both are confirmed missing; `google.oauth2` is already present via the transitive `google-auth` 2.52.0.
 
@@ -55,7 +55,7 @@ Both are confirmed missing; `google.oauth2` is already present via the transitiv
 pip install google-api-python-client google-auth-oauthlib
 ```
 
-- [ ] **Step 2: Verify they import**
+- [x] **Step 2: Verify they import**
 
 ```bash
 python -c "import googleapiclient.discovery, google_auth_oauthlib.flow; print('ok')"
@@ -63,7 +63,7 @@ python -c "import googleapiclient.discovery, google_auth_oauthlib.flow; print('o
 
 Expected: `ok`
 
-- [ ] **Step 3: Add `secrets/` to .gitignore**
+- [x] **Step 3: Add `secrets/` to .gitignore**
 
 Append to `.gitignore`. The existing file already ends with `.superpowers/`.
 
@@ -73,7 +73,7 @@ Append to `.gitignore`. The existing file already ends with `.superpowers/`.
 secrets/
 ```
 
-- [ ] **Step 4: Write the failing settings tests**
+- [x] **Step 4: Write the failing settings tests**
 
 Append to `tests/test_config.py`:
 
@@ -126,12 +126,12 @@ def test_body_budget_is_configurable(monkeypatch):
     assert load_settings().body_budget == 2000
 ```
 
-- [ ] **Step 5: Run the tests to verify they fail**
+- [x] **Step 5: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_config.py -q`
 Expected: FAIL — `AttributeError: 'Settings' object has no attribute 'gmail'`
 
-- [ ] **Step 6: Add the four fields to the Settings dataclass**
+- [x] **Step 6: Add the four fields to the Settings dataclass**
 
 In `inbox_agent/config.py`, insert after `triaged_label: str = "agent/triaged"` (currently `config.py:72`), before the `inbox_query` property:
 
@@ -157,7 +157,7 @@ In `inbox_agent/config.py`, insert after `triaged_label: str = "agent/triaged"` 
     body_budget: int = 0
 ```
 
-- [ ] **Step 7: Populate them in load_settings**
+- [x] **Step 7: Populate them in load_settings**
 
 In `load_settings()`, add to the `Settings(...)` call (currently ending at `config.py:131`):
 
@@ -169,12 +169,12 @@ In `load_settings()`, add to the `Settings(...)` call (currently ending at `conf
         body_budget=int(os.getenv("INBOX_BODY_BUDGET", "0")),
 ```
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_config.py -q`
 Expected: PASS
 
-- [ ] **Step 9: Document the variables in .env.example**
+- [x] **Step 9: Document the variables in .env.example**
 
 Append to `.env.example`:
 
@@ -196,12 +196,12 @@ INBOX_GOOGLE_TOKEN=secrets/token.json
 INBOX_BODY_BUDGET=0
 ```
 
-- [ ] **Step 10: Run the full suite**
+- [x] **Step 10: Run the full suite**
 
 Run: `python -m pytest -q --ignore=tests/test_learning.py`
 Expected: 180 passed (173 baseline + 7 new)
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add .gitignore .env.example inbox_agent/config.py tests/test_config.py
