@@ -40,6 +40,7 @@ _HEX = set("0123456789abcdef")
 
 Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all",
                "open", "list", "done", "approve_attention",
+               "trash_all", "trash_all_go",
                # Corrections on work already done. Each maps to exactly one
                # action sequence, so what gets taught is what the button said.
                "keep", "relabel", "teach_trash",
@@ -59,6 +60,10 @@ _CODE_TO_KIND: dict[str, Kind] = {
     "L": "list",
     # Opening the run's audit records, and the attention-tier one-tap approve.
     "D": "done", "T": "approve_attention",
+    # Bulk trash, and its confirmation. TWO codes rather than one carrying an
+    # "are you sure" flag: a single kind would let a replayed callback skip the
+    # confirmation, and the confirmation is the whole safeguard.
+    "B": "trash_all", "G": "trash_all_go",
     # Verdicts and their blast radius. Single characters because callback_data
     # is capped at 64 bytes and an index can reach three digits on a backlog.
     "k": "keep", "R": "relabel", "X": "teach_trash",
@@ -133,7 +138,8 @@ def decode(data: str) -> Intent:
         digest_id = rest[-1]
         rest = rest[:-1]
 
-    if kind in ("prev", "next", "approve_all", "list", "done", "approve_attention"):
+    if kind in ("prev", "next", "approve_all", "list", "done",
+                "approve_attention", "trash_all", "trash_all_go"):
         return Intent(kind, digest_id=digest_id) if not rest else Intent("noop")
 
     if kind in ("approve", "reject", "open", "keep", "teach_trash",

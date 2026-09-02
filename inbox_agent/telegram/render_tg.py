@@ -388,11 +388,22 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     attention = [h for h in ordered if h.hold_reason in ATTENTION_REASONS]
     individual = len(ordered) - len(attention)
     if attention:
-        # Attention tier only. A blanket button that could reach trash or a
-        # low-confidence guess would rubber-stamp exactly the set this design
-        # isolated to avoid rubber-stamping.
+        # Attention tier only. A blanket button that ALSO reached trash would
+        # sweep the authorisation tier in with the harmless actions, so it would
+        # be approved unnoticed - which is the rubber-stamping this design
+        # isolated the tiers to prevent.
         keyboard.append([(f"✅ Approve {_attention_phrase(attention)}",
                           encode("approve_attention", digest_id=view.digest_id))])
+
+    # Trash gets its own bulk button, and it is a different thing: it acts on
+    # trash ONLY, and only after a confirmation naming every sender. Approving
+    # six trash proposals the owner has just read one at a time is tedium, not
+    # safety. What the tiers exist to stop is trash being approved WITHOUT being
+    # noticed - which a separate, confirmed, trash-only button does not do.
+    trash_held = [h for h in ordered if h.hold_reason == "trash"]
+    if len(trash_held) > 1:
+        keyboard.append([(f"🗑 Trash all {len(trash_held)}",
+                          encode("trash_all", digest_id=view.digest_id))])
 
     nav: list[tuple[str, str]] = []
     if page > 0:
@@ -539,6 +550,47 @@ _WHY_CAP = 300
 # Two lines on a phone. Gmail's snippets run to ~200 chars, which is three or
 # four lines and starts to bury the entries either side of it.
 _SNIPPET_CAP = 110
+
+
+def confirm_trash_all(items, *, digest_id: str, dry_run: bool
+                      ) -> tuple[str, list]:
+    """The screen between "Trash all 6" and six threads in the bin.
+
+    Names every sender, not just a count: a count is not something the owner can
+    check, and the whole reason this screen exists is to make the second tap a
+    decision rather than a reflex. Truncated to the message limit like every
+    other list here, with the remainder counted rather than silently dropped.
+
+    Cancel returns to the digest and does nothing at all - which is the half of
+    a confirmation that actually matters.
+    """
+    verb = "WOULD trash" if dry_run else "Trash"
+    head = [f"{verb} all {len(items)}?", ""]
+    lines = list(head)
+    shown = 0
+    budget = TG_MAX_TEXT - len("\n".join(head)) - len(_OVERFLOW % 999) - 80
+    used = 0
+    for item in items:
+        block = (f"• {_oneline(item.item.subject, _SUBJECT_CAP)}\n"
+                 f"  {_oneline(item.item.sender, _SENDER_CAP)}")
+        if used + len(block) + 1 > budget:
+            break
+        used += len(block) + 1
+        shown += 1
+        lines.append(block)
+    if shown < len(items):
+        lines.append(_OVERFLOW % (len(items) - shown))
+    lines.append("")
+    # Trash is the reversible end of the ladder and saying so is what makes this
+    # a proportionate confirmation rather than a scary one.
+    lines.append("Gmail keeps trashed mail for 30 days.")
+    text = "\n".join(lines)[:TG_MAX_TEXT]
+    keyboard = [
+        [(f"🗑 Yes, trash {len(items)}",
+          encode("trash_all_go", digest_id=digest_id))],
+        [("↩ Cancel", encode("list", digest_id=digest_id))],
+    ]
+    return text, keyboard
 
 
 def item_view(subject: str, sender: str, actions_text: str, why: str, *,

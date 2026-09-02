@@ -928,3 +928,100 @@ def test_approve_attention_with_nothing_to_approve_says_so(bot):
     b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
     assert "nothing" in t.edited[-1]["text"].lower()
     assert len(b.held.all()) == 1
+
+
+# --- bulk trash -------------------------------------------------------------
+# Asked for after approving six trash items one at a time: "can we have both
+# individual approve for trash as well as bulk approve for trash if i agree all
+# belong to trash". The original objection to a blanket button was that it
+# would rubber-stamp the authorisation tier. That conflated two things: a
+# button that sweeps trash in WITH harmless actions, so it is approved
+# unnoticed, and a button that trashes only trash after the owner has read the
+# list. This is the second, and it is gated by a confirmation naming every
+# sender.
+
+def _trash_queue(b, n=3):
+    b.handle_update(msg("/triage 4"))
+    for i in range(n):
+        _held_of(b, "trash", f"x{i}", kind="trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+
+
+def test_trash_all_asks_before_it_acts(bot):
+    b, t, _ = bot
+    _trash_queue(b, 3)
+    before = len(b.held.all())
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    assert len(b.held.all()) == before, "acted without confirming"
+    text = t.edited[-1]["text"]
+    assert "3" in text
+    kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
+    assert "trash_all_go" in kinds, kinds
+
+
+def test_the_confirmation_names_every_sender_it_will_act_on(bot):
+    """The point of the screen. A count alone is not something you can check."""
+    b, t, _ = bot
+    _trash_queue(b, 3)
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    for i in range(3):
+        assert f"x{i}@x.com" in text, text
+
+
+def test_confirming_trashes_every_one_and_drains_the_queue(bot):
+    b, t, _ = bot
+    _trash_queue(b, 3)
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all_go", digest_id=b._digest_id)))
+    assert [h.hold_reason for h in b.held.all()] == []
+    assert "Would have run" in t.edited[-1]["text"]
+
+
+def test_cancelling_the_confirmation_trashes_nothing(bot):
+    """The half of a confirm screen that actually matters."""
+    b, t, _ = bot
+    _trash_queue(b, 3)
+    before = {h.thread_id for h in b.held.all()}
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    assert {h.thread_id for h in b.held.all()} == before
+
+
+def test_bulk_trash_never_touches_the_attention_tier(bot):
+    """It is a TRASH button. An alert caught by it would be the exact
+    rubber-stamping the two-tier split exists to prevent, in the other
+    direction."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "trash", "x1", kind="trash")
+    _held_of(b, "security_alert", "h1")
+    _held_of(b, "needs_reply", "h2")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all_go", digest_id=b._digest_id)))
+    left = sorted(h.hold_reason for h in b.held.all())
+    assert left == ["needs_reply", "security_alert"], left
+
+
+def test_a_stale_confirmation_cannot_fire(bot):
+    """The confirm screen can sit on a phone for hours. A digest_id that has
+    moved on must not still authorise six threads into the bin."""
+    b, t, _ = bot
+    _trash_queue(b, 3)
+    before = {h.thread_id for h in b.held.all()}
+    b.handle_update(cb(encode("trash_all_go", digest_id="dead")))
+    assert {h.thread_id for h in b.held.all()} == before
+
+
+def test_no_bulk_button_when_there_is_nothing_to_bulk(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "security_alert", "h1")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
+    assert "trash_all" not in kinds

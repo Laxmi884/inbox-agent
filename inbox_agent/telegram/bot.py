@@ -26,8 +26,8 @@ from ..config import Settings
 from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
-from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem, digest,
-                        done_panel, item_view)
+from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
+                        confirm_trash_all, digest, done_panel, item_view)
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -419,6 +419,58 @@ class Bot:
         verb = "Would have run" if self.settings.dry_run else "Ran"
         remaining = len(self.held.all())
         lines = [f"Approved {len(attention)}.", ""]
+        lines += [f"{verb}: {line}" for line in did] or ["Nothing to do."]
+        lines += ["", f"{remaining} left waiting."]
+        self.transport.edit_message(
+            self.chat_id, self._message_id, "\n".join(lines),
+            [[("↩ Back to the digest",
+               encode("list", digest_id=self._digest_id))]])
+
+    def _trash_held(self) -> list:
+        """Every held item proposed for trash, oldest first.
+
+        One definition, used by the offer, the confirmation and the execution,
+        so the count on the button, the list on the confirm screen and the
+        threads actually trashed cannot disagree.
+        """
+        return [h for h in sorted(self.held.all(), key=lambda x: x.first_held_at)
+                if h.hold_reason == "trash"]
+
+    def _offer_trash_all(self) -> None:
+        """Show what would go, and ask. Nothing is executed on this path."""
+        items = self._trash_held()
+        if not items:
+            self._show(edit=True)
+            return
+        text, keyboard = confirm_trash_all(
+            items, digest_id=self._digest_id, dry_run=self.settings.dry_run)
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
+
+    def _trash_all(self) -> None:
+        """The confirmed bulk trash.
+
+        Re-reads the queue rather than trusting anything carried on the
+        callback: the confirm screen can sit on a phone for hours, and the set
+        that is trashed must be the set that is held NOW, not the set that was
+        held when the button was drawn.
+
+        Trash only - an alert or a reply caught here would be exactly the
+        rubber-stamping the two-tier split exists to prevent, in the other
+        direction.
+        """
+        items = self._trash_held()
+        if not items:
+            self._show(edit=True)
+            return
+        did = []
+        for item in items:
+            done = self._execute_held(item)
+            self.held.remove(item.thread_id)
+            if done:
+                did.append(f"{_short(item.item.subject)} → {done}")
+        verb = "Would have run" if self.settings.dry_run else "Ran"
+        remaining = len(self.held.all())
+        lines = [f"Trashed {len(items)}.", ""]
         lines += [f"{verb}: {line}" for line in did] or ["Nothing to do."]
         lines += ["", f"{remaining} left waiting."]
         self.transport.edit_message(
@@ -821,6 +873,12 @@ class Bot:
             return
         if intent.kind in ("approve_attention",):
             self._approve_attention()
+            return
+        if intent.kind == "trash_all":
+            self._offer_trash_all()
+            return
+        if intent.kind == "trash_all_go":
+            self._trash_all()
             return
 
     # --- the interrupt path -------------------------------------------------

@@ -207,3 +207,21 @@ def test_a_verdict_without_a_digest_id_is_refused():
     """Same staleness rule as every other kind: positions shift between
     digests, so a verdict from an older message must not resolve."""
     assert decode(encode("keep", 3)).digest_id == ""
+
+
+# --- bulk trash, and its confirmation ---------------------------------------
+
+def test_trash_all_and_its_confirmation_round_trip():
+    for kind in ("trash_all", "trash_all_go"):
+        i = decode(encode(kind, digest_id="7f2a"))
+        assert i.kind == kind and i.digest_id == "7f2a"
+
+
+def test_the_confirm_step_is_a_separate_kind_from_the_offer():
+    """Two codes, not one with a flag. A single kind carrying 'are you sure'
+    state would let a replayed callback skip the confirmation entirely."""
+    assert encode("trash_all") != encode("trash_all_go")
+
+
+def test_bulk_trash_codes_stay_inside_the_64_byte_callback_limit():
+    assert len(encode("trash_all_go", digest_id="7f2a").encode()) <= 64
