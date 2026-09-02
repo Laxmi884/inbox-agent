@@ -1942,7 +1942,7 @@ stronger cover than before."
 
 ---
 
-### Task 7: The factory and the wiring
+### Task 7: The factory and the wiring  ✅ DONE
 
 **Files:**
 - Modify: `inbox_agent/config.py` (append `build_gmail_client`)
@@ -1953,7 +1953,7 @@ stronger cover than before."
 - Consumes: `Settings` (Task 1), `get_credentials` (Task 2), `LiveGmailClient` (Task 5).
 - Produces: `build_gmail_client(settings: Settings) -> GmailClient`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_gmail_factory.py`:
 
@@ -2012,12 +2012,12 @@ def test_an_unknown_selector_fails_loudly(monkeypatch, snapshot_dir):
         build_gmail_client(load_settings())
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_gmail_factory.py -q`
 Expected: FAIL with `ImportError: cannot import name 'build_gmail_client'`
 
-- [ ] **Step 3: Implement the factory**
+- [x] **Step 3: Implement the factory**
 
 Append to `inbox_agent/config.py`:
 
@@ -2069,12 +2069,12 @@ def build_gmail_client(settings: Settings):
     )
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_gmail_factory.py -q`
 Expected: PASS (3 tests)
 
-- [ ] **Step 5: Wire the bot to the factory**
+- [x] **Step 5: Wire the bot to the factory**
 
 In `inbox_agent/telegram/__main__.py`, change the import at line 16 from:
 
@@ -2101,7 +2101,7 @@ Then replace line 50:
     client = build_gmail_client(settings)
 ```
 
-- [ ] **Step 6: Show which mailbox is in play at startup**
+- [x] **Step 6: Show which mailbox is in play at startup**
 
 The banner at `__main__.py:87-90` already prints `backend` and `dry_run`. Add the client beneath `backend`, because "which mailbox" is the single most important thing to be sure of before a live run:
 
@@ -2111,7 +2111,7 @@ The banner at `__main__.py:87-90` already prints `backend` and `dry_run`. Add th
           + ("   <- THE REAL MAILBOX" if settings.gmail == "live" else ""))
 ```
 
-- [ ] **Step 7: Verify the bot still starts against the snapshot**
+- [x] **Step 7: Verify the bot still starts against the snapshot**
 
 ```bash
 INBOX_GMAIL=snapshot INBOX_TG_TOKEN= INBOX_TG_CHAT_ID= python -m inbox_agent.telegram; echo "exit=$?"
@@ -2119,12 +2119,12 @@ INBOX_GMAIL=snapshot INBOX_TG_TOKEN= INBOX_TG_CHAT_ID= python -m inbox_agent.tel
 
 Expected: the "Refusing to start" message about the missing Telegram vars and `exit=2`. That proves the import graph and the factory resolve — it gets past module import and into `main()`.
 
-- [ ] **Step 8: Run the full suite**
+- [x] **Step 8: Run the full suite**
 
 Run: `python -m pytest -q --ignore=tests/test_learning.py`
 Expected: 238 passed
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add inbox_agent/config.py inbox_agent/telegram/__main__.py tests/test_gmail_factory.py

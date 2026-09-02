@@ -437,3 +437,59 @@ def describe_models() -> list[dict]:
          "cost": c.cost, "note": c.note}
         for n, c in sorted(MODELS.items(), key=lambda kv: (kv[1].cost != "local", kv[0]))
     ]
+
+
+# ---------------------------------------------------------------------------
+# Gmail client construction
+#
+# The one place that decides snapshot vs live. GmailClient is a Protocol, so
+# nothing above this line knows or cares which it got - that is why adding the
+# live mailbox is an addition rather than a migration, and why there was exactly
+# one construction site outside tests to change.
+# ---------------------------------------------------------------------------
+
+
+def _build_live_gmail_client(settings: Settings):
+    """Split out so the factory's branching is testable without google libs."""
+    from googleapiclient.discovery import build
+
+    from .gmail import LiveGmailClient
+    from . import google_auth
+
+    creds = google_auth.get_credentials(
+        client_secrets_path=settings.google_credentials,
+        token_path=settings.google_token,
+        scopes=[google_auth.GMAIL_MODIFY_SCOPE])
+    # cache_discovery=False silences an oauth2client file-cache warning that is
+    # noise on every start and has no bearing on anything here.
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    # http_factory is NOT optional in practice. googleapiclient's service holds
+    # one httplib2.Http, which is not thread-safe, and LiveGmailClient hydrates
+    # a page through a five-worker pool. Without a per-thread transport the
+    # first real run dies with `SSL: WRONG_VERSION_NUMBER`, which names nothing
+    # about threads - and every unit test still passes, because a fake has no
+    # socket. See LiveGmailClient._http.
+    return LiveGmailClient(
+        service, http_factory=lambda: google_auth.authorized_http(creds))
+
+
+def build_gmail_client(settings: Settings):
+    """Snapshot or live, per INBOX_GMAIL.
+
+    An unrecognised value raises rather than defaulting. Falling back to
+    snapshot would look like a successful run against a mailbox that was never
+    touched; falling back to live would touch a mailbox nobody asked it to.
+    Neither is a failure you want to discover from a digest.
+    """
+    from .gmail import SnapshotGmailClient
+
+    choice = (settings.gmail or "snapshot").strip().lower()
+    if choice == "snapshot":
+        return SnapshotGmailClient(settings.snapshot_dir / "threads.json")
+    if choice == "live":
+        return _build_live_gmail_client(settings)
+    raise ValueError(
+        f"INBOX_GMAIL={settings.gmail!r} is not a Gmail client. "
+        f"Use 'snapshot' (the frozen evaluation set) or 'live' (the real "
+        f"mailbox, which needs {settings.google_credentials})."
+    )

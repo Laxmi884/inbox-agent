@@ -12,8 +12,8 @@ import sys
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ..audit import AuditLog
-from ..config import get_embeddings, load_settings, mask, use_model
-from ..gmail import SnapshotGmailClient
+from ..config import (build_gmail_client, get_embeddings, load_settings, mask,
+                      use_model)
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -47,7 +47,7 @@ def main() -> int:
         return 2
 
     policy = load_policy(settings)
-    client = SnapshotGmailClient(settings.snapshot_dir / "threads.json")
+    client = build_gmail_client(settings)
     log = AuditLog(settings.audit_log)
     # On disk, not in memory. The bot is the one caller whose lifetime is not
     # the run: it is restarted for a code change, a laptop lid, a crash. Rules
@@ -85,7 +85,13 @@ def main() -> int:
               prefs=prefs, client=client, log=log, categories=categories)
 
     print(f"backend   : {settings.backend}")
+    # Which mailbox is in play is the single thing to be certain of before a
+    # live run, so it is named here and named loudly when it is the real one.
+    print(f"gmail     : {settings.gmail}"
+          + ("   <- THE REAL MAILBOX" if settings.gmail == "live" else ""))
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
+    print(f"body      : {settings.body_budget} chars into the prompt"
+          + ("  (snippet only)" if settings.body_budget == 0 else ""))
     print(f"policy    : {policy.version}")
     print(f"mode      : {bot.mode}")
     print(f"chat id   : {settings.tg_chat_id}  (the only authorised sender)")
