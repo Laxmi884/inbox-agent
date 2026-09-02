@@ -41,7 +41,7 @@ that the design has to answer rather than discover in production:
 
 ### 1.2 `agent/triaged` does not exist
 
-It is absent from `labels.list`. `mark_triaged` (`graph.py:349`) is the first
+It is absent from `labels.list`. `mark_triaged` (`graph.py:353`) is the first
 thing that will need it, on the first live run, for every thread processed. The
 live client must create it rather than fail.
 
@@ -80,7 +80,7 @@ translation layer.** Only `label_ids` on the way back does.
 `AI Innovations`, `Job Listings`.
 
 This retroactively justifies `_resolve_triaged_label()` raising on whitespace
-(`config.py:75`): `matches_query` splits the query on whitespace term-by-term,
+(`config.py:79`): `matches_query` splits the query on whitespace term-by-term,
 so a spaced label name cannot round-trip. It also means the live label map will
 legitimately contain names this project can never use as a triaged label — the
 guard is on the configured value, not on the mailbox.
@@ -95,9 +95,20 @@ f"<email_body>\n{_fence(thread.body or thread.snippet)}\n</email_body>"
 
 The snapshot has `body == ""` for all 50 threads, so this has always resolved to
 `snippet` and nobody has had to think about it. **The moment the live client
-populates `body`, full email bodies enter the prompt silently** — untruncated,
-against a local model pinned at `num_ctx=8192` (`config.py:_build_ollama`). One
-of the live threads sampled above has `sizeEstimate` 200,571 bytes.
+populates `body`, full email bodies enter the prompt silently.**
+
+**Correction to an earlier draft of this section:** they do *not* arrive
+untruncated. `_fence` clips at `MAX_BODY_CHARS = 4000` (`classify.py:18`,
+applied at `classify.py:216`), so the 200KB `sizeEstimate` sampled above reaches
+the prompt as 4000 characters, roughly 1000 tokens — comfortably inside
+`num_ctx=8192`. There is no context overflow, and this spec should not have
+claimed one.
+
+The real cost is measurement continuity, and it is still decisive: 4000
+characters against a snippet that maxes at 201 is a ~20x change in prompt size.
+Every latency and cost figure in the model registry was measured at the smaller
+one. Switching silently would invalidate the whole registry without anything
+saying so.
 
 "Fetch bodies, keep the prompt on snippets" is therefore not a no-op. It
 requires an explicit change here.
@@ -150,7 +161,7 @@ returns exactly five tools — `GmailCreateDraft`, `GmailSendMessage`,
 trash: it covers three of the seven methods and misses all four that mutate.
 Its module-level `SCOPES = ["https://mail.google.com/"]` requests full mailbox
 access including send and permanent delete, and it ships a `GmailSendMessage`
-tool that is in `ALWAYS_FORBIDDEN` (`config.py:29`).
+tool that is in `ALWAYS_FORBIDDEN` (`config.py:28`).
 
 **A third-party Gmail MCP server is rejected for the digest path.** The
 maintained forks advertise ~19 tools including `send_message`. MCP has no
@@ -204,8 +215,15 @@ and what the digest reports.
 
 `build_prompt` takes a `body_budget: int = 0`. At 0 it uses `snippet`; above 0
 it uses `body` truncated to the budget, falling back to `snippet` when `body` is
-empty. The default reproduces today's behaviour exactly for the snapshot, and
-holds the line at 1.6 for live.
+empty. The default holds the line at 1.6 for live.
+
+It reproduces today's behaviour exactly **for the snapshot**, where `body` is
+`""`. It does NOT for the test fixtures: five tests in `tests/test_classify.py`
+pass `body=` and assert it reaches the prompt, four of them the prompt-injection
+defences. Those must be parametrised over both fields rather than pinned to
+`body` — which is strictly stronger coverage, because at budget 0 it is the
+*snippet* that carries attacker-controlled text, and Gmail derives the snippet
+from the body.
 
 A parameter rather than a hardcoded `thread.snippet` so the snippet-vs-body
 comparison is a config flip driven from LangSmith traces, which is step 5 of the
@@ -265,7 +283,7 @@ Two consequences worth stating, because they change work already budgeted:
 - **`agent/triaged` is not applied to archived threads.** Archiving removes
   INBOX, so they leave `inbox_query` on their own. The 16,748 label writes in
   1.1 do not happen.
-- **This does not need the `_resume` rebuild.** `bot.py:764` warns that
+- **This does not need the `_resume` rebuild.** `bot.py:771` warns that
   `to_response()` defaults unnamed threads to approve, which is a blanket
   approval and catastrophic for a per-item review of a 500-thread sweep. For a
   single cohort-level yes/no, blanket approval of the cohort *is* the intended
@@ -281,7 +299,7 @@ Two consequences worth stating, because they change work already budgeted:
 | `inbox_agent/mcp_server.py` | new | FastMCP surface over a `LiveGmailClient`. |
 | `inbox_agent/config.py` | extended | `build_gmail_client()` + new settings. |
 | `.env.example` | changed | document the four new variables. |
-| `pyproject`/deps | changed | `google-api-python-client`, `google-auth-oauthlib`. |
+| dependencies | installed | `google-api-python-client`, `google-auth-oauthlib`. The repo has **no** `pyproject.toml`, `requirements.txt` or `setup.py`; this spec does not add one. |
 | `inbox_agent/classify.py` | changed | `body_budget` parameter on `build_prompt`. |
 | `inbox_agent/telegram/__main__.py` | changed | one line at `:50`. |
 | `.gitignore` | changed | add `secrets/`. |
@@ -306,7 +324,10 @@ edit.
 
 `google-auth` 2.52.0 is already present as a transitive dependency, but
 **`google-api-python-client` and `google-auth-oauthlib` are new** and must be
-added. `fastmcp` 2.14.7 is already installed and needs no addition.
+installed. There is no dependency manifest in this repo to declare them in, and
+introducing one is out of scope here — it would be the first, and it should be a
+deliberate decision rather than a side effect of adding two packages. `fastmcp`
+2.14.7 is already installed and needs no addition.
 
 ### 3.1 `google_auth.py`
 
@@ -320,7 +341,7 @@ consent and writes the token. Single responsibility: it knows about OAuth and
 nothing about mail.
 
 A missing `credentials.json` raises with the Cloud Console steps in the message,
-in the style `load_snapshot` already uses (`gmail.py:64`) — **including "set
+in the style `load_snapshot` already uses (`gmail.py:61`) — **including "set
 publishing status to In production"**, because an External app left in Testing
 has its refresh token expired by Google after exactly seven days, and that
 failure would otherwise surface a week later as an unexplained re-auth prompt.
