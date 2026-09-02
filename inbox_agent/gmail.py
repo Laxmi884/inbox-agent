@@ -8,6 +8,7 @@ scope; nothing above this module changes when it does.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -117,3 +118,117 @@ class SnapshotGmailClient:
 
     def create_draft(self, thread_id: str, body: str) -> dict[str, Any]:
         return {"simulated": True, "thread_id": thread_id, "draft_chars": len(body)}
+
+
+class _LabelMap:
+    """Two-way map between Gmail label ids and display names.
+
+    `Thread.label_ids` holds NAMES in both client implementations. That is the
+    contract the comment above `matches_query` exists to protect: both clients
+    answering the same query string is the only thing that makes a snapshot
+    test evidence about live behaviour. Storing raw ids live would mean a
+    snapshot test asserting on 'agent/triaged' and a live run asserting on
+    'Label_12' are no longer the same assertion.
+
+    Ids cannot be derived from names and have no reliable shape - `Label_1` and
+    `Label_6111317184412779502` are both in use in one real account - so the map
+    must come from labels.list, never a heuristic. Built once per client,
+    refreshed on a miss.
+
+    Knowingly accepted: a label renamed in Gmail changes identity from this
+    project's point of view. That is correct - the name is what the owner sees
+    and what the digest reports.
+
+    Thread safety. The client hydrates threads through a ThreadPoolExecutor, and
+    every one of those workers calls `to_name`. Two rules keep that sound:
+
+    - Writers hold `_lock`; readers never do. A read is a single dict lookup on
+      an attribute that is only ever REPLACED, never mutated in place, so a
+      reader either sees the whole old map or the whole new one.
+    - `refresh` therefore builds new dicts and rebinds. Clearing and
+      repopulating in place would let a concurrent reader observe a half-built
+      map and surface a raw id where a name was available - an intermittent
+      wrong label in the digest, and close to undiagnosable afterwards.
+    """
+
+    def __init__(self, service):
+        self._service = service
+        self._by_id: dict[str, str] = {}
+        self._by_name: dict[str, str] = {}
+        self._loaded = False
+        self._lock = threading.Lock()
+
+    def _fetch(self) -> None:
+        """Rebuild from labels.list. Caller holds the lock."""
+        result = self._service.users().labels().list(userId="me").execute()
+        by_id, by_name = {}, {}
+        for label in result.get("labels", []):
+            by_id[label["id"]] = label["name"]
+            by_name[label["name"]] = label["id"]
+        # Rebind, never mutate: see the thread-safety note above.
+        self._by_id, self._by_name = by_id, by_name
+        self._loaded = True
+
+    def refresh(self) -> None:
+        with self._lock:
+            self._fetch()
+
+    def _ensure(self) -> None:
+        """Build the map if it has not been built.
+
+        Called explicitly before fanning out across threads, so the initial
+        build happens once rather than being raced for by five workers.
+        """
+        if not self._loaded:
+            with self._lock:
+                if not self._loaded:      # another thread may have won the race
+                    self._fetch()
+
+    def to_name(self, label_id: str) -> str:
+        """Id -> display name.
+
+        A miss means a label created in Gmail since the map was built, so
+        refetch once. If it is still unknown, surface the raw id rather than
+        dropping it: a dropped label is silent data loss into the classifier's
+        `Current labels:` line, and a visibly odd id is far easier to diagnose
+        than a label that quietly vanished.
+        """
+        self._ensure()
+        name = self._by_id.get(label_id)
+        if name is not None:
+            return name
+        self.refresh()
+        return self._by_id.get(label_id, label_id)
+
+    def to_id(self, name: str) -> str:
+        """Display name -> id, creating the label if it does not exist.
+
+        Creation is what makes the live path survivable: `agent/triaged` does
+        not exist in the mailbox - confirmed against it - and `mark_triaged`
+        needs it on the first run, for every thread processed.
+
+        The refetch before creating is not belt-and-braces. Without it, a label
+        created in Gmail (or by another process) after this map was built would
+        be created a second time, leaving two labels sharing one name and a
+        `to_name` lookup that depends on dict ordering.
+        """
+        self._ensure()
+        label_id = self._by_name.get(name)
+        if label_id is not None:
+            return label_id
+
+        # The whole miss path is serialised. Two workers missing the same name
+        # would otherwise both refetch, both still miss, and both create it.
+        with self._lock:
+            self._fetch()
+            label_id = self._by_name.get(name)
+            if label_id is not None:
+                return label_id
+            created = self._service.users().labels().create(
+                userId="me",
+                body={"name": name,
+                      "labelListVisibility": "labelShow",
+                      "messageListVisibility": "show"}).execute()
+            self._by_id = self._by_id | {created["id"]: created["name"]}
+            self._by_name = self._by_name | {created["name"]: created["id"]}
+            return created["id"]

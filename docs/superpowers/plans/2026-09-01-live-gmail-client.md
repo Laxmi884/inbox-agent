@@ -522,7 +522,7 @@ irrelevant, so failing early on a missing secret would be a false alarm."
 
 ---
 
-### Task 3: The label map
+### Task 3: The label map  ✅ DONE
 
 The hard part, isolated so it can be reviewed on its own. Gmail's `modifyThread` takes label **IDs**; `Thread.label_ids` must hold display **names**.
 
@@ -534,7 +534,7 @@ The hard part, isolated so it can be reviewed on its own. Gmail's `modifyThread`
 - Consumes: nothing from earlier tasks.
 - Produces: `_LabelMap(service)` with `.to_name(label_id: str) -> str`, `.to_id(name: str) -> str`, `.refresh() -> None`, and `._ensure() -> None` (builds the map if it has not been built; Task 5 calls it explicitly before fanning out across threads, because the map is not thread-safe).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_label_map.py`:
 
@@ -691,12 +691,12 @@ def test_unknown_name_is_found_after_a_refetch_without_being_created():
     assert fake.created == []
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_label_map.py -q`
 Expected: FAIL with `ImportError: cannot import name '_LabelMap'`
 
-- [ ] **Step 3: Implement _LabelMap**
+- [x] **Step 3: Implement _LabelMap**
 
 Append to `inbox_agent/gmail.py`:
 
@@ -782,12 +782,12 @@ class _LabelMap:
         return created["id"]
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_label_map.py -q`
 Expected: PASS (10 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add inbox_agent/gmail.py tests/test_label_map.py
