@@ -102,6 +102,34 @@ of the live threads sampled above has `sizeEstimate` 200,571 bytes.
 "Fetch bodies, keep the prompt on snippets" is therefore not a no-op. It
 requires an explicit change here.
 
+### 1.8 Backlog senders do not recur, and concentration is weak
+
+Three 50-thread samples of `in:inbox is:unread`, taken today, ~6 months back and
+~2 years back:
+
+| | today | 6 months | 2 years |
+|---|---|---|---|
+| top sender | linkedin jobalerts 12% | impactguru 12% | legeropinion 12% |
+| senders covering half a page | 16 | 11 | 9 |
+| shared senders vs today | - | 5 of 72 | **0 of 75** |
+
+**Zero sender overlap between today's mail and two years ago.** Four shared
+domains out of 63, all aggregators (beehiiv, linkedin, jobs2web) whose actual
+sending addresses differ. These are subscription lifecycles: signed up, flooded,
+drifted away.
+
+This kills the obvious design, which was to triage the backlog head by sender,
+convert each decision to a `Rule`, and let the rule store drain the rest.
+Rules learned from current mail will not match the old backlog, and rules
+learned from the old backlog have no future value.
+
+It also rules out a per-sender approval UI: at 12% for the top sender and 9-16
+senders per half-page, covering 16,748 threads across non-overlapping cohorts
+would take hundreds of approvals.
+
+Sample-size caveat: three samples of 50 from a 16,748 population. The direction
+(0/75, 5/72) is strong enough to design against; the exact percentages are not.
+
 ### 1.7 There is exactly one construction site outside tests
 
 `inbox_agent/telegram/__main__.py:50`. Five test files reference
@@ -202,12 +230,47 @@ Not imported by the digest path. It exists so Stage B has a proven transport,
 and so this mailbox can be driven by an external client under this project's
 policy rather than a generic connector's.
 
-### 2.6 `/backlog` is left disabled against live Gmail
+### 2.6 `/backlog` is a deterministic bulk archive, with no model in it
 
-Given 1.1, `/backlog` against 16,748 threads is not a feature, it is an
-incident. It stays snapshot-only until a separate decision about batching,
-rate limiting and a stopping rule. `/triage` at `snapshot_size` is the only live
-entry point this spec enables.
+Given 1.1, running `/backlog` as a triage sweep over 16,748 threads is not a
+feature, it is an incident: roughly six hours of model time on the best measured
+model to re-derive 16,748 individually-reasoned verdicts. Section 1.8 measures
+why that work would also be worthless. The mode is redesigned rather than
+disabled.
+
+**A thread that is a year old and still unread in the inbox has already been
+judged, by the owner, by not reading it.** `recency.py` states the same
+intuition at 90 days: "whatever was waiting on the owner two years ago happened
+or didn't." `/backlog` acts on that directly.
+
+1. A **deterministic safety sieve** runs first, as a Gmail query and not a
+   judgement: `is:starred`, `IMPORTANT`, any user label, or a thread the owner
+   replied to is excluded and never touched.
+2. Everything else past the cutoff is **archived, never trashed**. Archived mail
+   stays in All Mail and stays searchable. A wrong archive costs nothing, and
+   that is the entire reason a bulk operation is acceptable here.
+3. **One confirmation per band**, not per thread: a true count, the sieve's
+   exclusions, and ten random samples. The preview pages the full id set first
+   (~37 calls) so the number shown is counted, not estimated.
+4. **No rules are written from backlog decisions.** Per 1.8, cohorts do not
+   recur, so such a rule is dead weight evaluated by `prefilter` on every future
+   run forever.
+
+Cutoff: **one year**, reassessed after the first sweep. Not `stale_after_days`'
+90, deliberately - the 2-year cohort is uncontroversially dead by 1.8, while the
+90-day-to-1-year band is not yet evidenced either way.
+
+Two consequences worth stating, because they change work already budgeted:
+
+- **`agent/triaged` is not applied to archived threads.** Archiving removes
+  INBOX, so they leave `inbox_query` on their own. The 16,748 label writes in
+  1.1 do not happen.
+- **This does not need the `_resume` rebuild.** `bot.py:764` warns that
+  `to_response()` defaults unnamed threads to approve, which is a blanket
+  approval and catastrophic for a per-item review of a 500-thread sweep. For a
+  single cohort-level yes/no, blanket approval of the cohort *is* the intended
+  semantics. `_resume` remains unsafe for per-item use and Plan 3 still owes
+  that work; `/backlog` no longer waits on it.
 
 ## 3. Components
 
@@ -321,18 +384,28 @@ together:
 1. **The live client** — `google_auth.py`, `LiveGmailClient`, the label map, the
    `body_budget` parameter, the factory, the wiring, and section 4's tests.
    Ends at section 5 step 4: a real digest, from real mail, on the phone.
-2. **The MCP surface** — `mcp_server.py` over the client from plan 1, routed
+2. **The backlog sweep** — 2.6's sieve, the counted preview, the cohort
+   confirmation, and `messages.batchModify` paging. Needs plan 1's client and
+   nothing else. Roughly 56 API calls and no model, so it is verifiable in one
+   sitting.
+3. **The MCP surface** — `mcp_server.py` over the client from plan 1, routed
    through `execute_action`. Independently verifiable and independently
    revertable.
 
-Plan 1 is on the critical path to the milestone; plan 2 is Stage B enablement.
+Plan 1 is on the critical path to the milestone. Plan 2 is the one-time cleanup
+and should not run until plan 1's rollout has proven the client against live
+mail. Plan 3 is Stage B enablement and blocks nothing.
+
 Splitting them means a problem in the FastMCP surface cannot hold up the live
 mailbox result, and means the rollout in section 5 has one subject at a time.
 
 ## 7. Deliberately not in scope
 
 - `INBOX_DRY_RUN=false`. A separate decision after step 5.
-- `/backlog` against live Gmail. See 2.6.
+- Per-thread triage of the backlog. 2.6 replaces it with a bulk archive; 1.8 is
+  why the per-thread version would be expensive and worthless at once.
+- The 90-day-to-1-year band. The cutoff is one year until the first sweep says
+  otherwise.
 - Bodies in the prompt. The budget defaults to 0; turning it up is step 5's
   outcome, not this spec's.
 - Stage B tool-calling. The MCP server is the transport; the agent that uses it
