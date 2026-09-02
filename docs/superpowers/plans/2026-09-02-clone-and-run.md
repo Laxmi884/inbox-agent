@@ -273,7 +273,7 @@ Two things that must land together: the bot honouring the setting, and evidence 
 
 **Files:**
 - Modify: `inbox_agent/telegram/__main__.py:58`
-- Test: `tests/test_store.py`, `tests/test_config.py`
+- Test: `tests/test_store.py`, `tests/test_tg_banner.py` (new)
 
 **Interfaces:**
 - Consumes: `get_embeddings(kind)` and `Settings.embeddings` from Tasks 1–2.
@@ -313,23 +313,49 @@ def test_rules_written_with_an_index_read_back_without_one(tmp_path):
     assert ids == ["r-keepme"], f"rule lost when the index went away: {ids}"
 ```
 
-Append to `tests/test_config.py`:
+Create `tests/test_tg_banner.py`:
 
 ```python
-def test_settings_embeddings_reaches_get_embeddings(monkeypatch):
-    """The wiring: __main__ must pass settings.embeddings through rather than
-    calling get_embeddings() bare, or the setting is decorative."""
+"""The startup banner is where every safety-relevant decision is stated, so
+the embeddings mode has to appear there too - a degrade nobody can see is the
+failure this spec keeps arguing against."""
+import pytest
+from inbox_agent import config as config_mod
+from inbox_agent.config import load_settings
+from inbox_agent.telegram.__main__ import _embeddings_banner
+
+
+def test_banner_reports_the_resolved_mode_not_the_configured_one(monkeypatch):
+    monkeypatch.setenv("INBOX_EMBEDDINGS", "auto")
+    monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: False)
+    line = _embeddings_banner(load_settings())
+    assert "none" in line
+
+
+def test_banner_says_when_auto_degraded_and_why(monkeypatch):
+    """"none" alone is ambiguous - it could be what the owner asked for. The
+    banner has to distinguish "you turned it off" from "Ollama is not there"."""
+    monkeypatch.setenv("INBOX_EMBEDDINGS", "auto")
+    monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: False)
+    assert "not listening" in _embeddings_banner(load_settings())
+
+
+def test_banner_is_quiet_when_none_was_chosen_deliberately(monkeypatch):
     monkeypatch.setenv("INBOX_EMBEDDINGS", "none")
+    monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: False)
+    assert "not listening" not in _embeddings_banner(load_settings())
+
+
+def test_banner_reports_ollama_when_it_is_available(monkeypatch):
+    monkeypatch.setenv("INBOX_EMBEDDINGS", "auto")
     monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: True)
-    s = load_settings()
-    assert s.embeddings == "none"
-    assert config_mod.get_embeddings(s.embeddings) is None
+    assert "ollama" in _embeddings_banner(load_settings())
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `python3 -m pytest tests/test_store.py::test_rules_written_with_an_index_read_back_without_one tests/test_config.py::test_settings_embeddings_reaches_get_embeddings -v`
-Expected: the `test_config` one FAILS if the field is missing; the `test_store` one should already PASS. **If the store test fails, stop** — that is spec §3.4's risk turning out to be real, and it changes the design. Report it rather than working around it.
+Run: `python3 -m pytest tests/test_tg_banner.py tests/test_store.py::test_rules_written_with_an_index_read_back_without_one -v`
+Expected: the four banner tests FAIL with `ImportError: cannot import name '_embeddings_banner'`. The store test should already PASS — it is characterising existing behaviour, not driving new code. **If the store test fails, stop and report it**: that is spec §3.4's risk turning out to be real, it means learned rules go invisible when the index does, and it changes the design rather than being something to work around.
 
 - [ ] **Step 3: Implement**
 
@@ -347,24 +373,37 @@ to:
                                        get_embeddings(settings.embeddings)))
 ```
 
-Then add the resolved mode to the startup banner, beside the `store` line, so the degrade is visible where every other decision is:
+Add `resolve_embeddings` to the existing `from ..config import (...)` block, then define the banner helper above `main()`:
 
 ```python
-    _embeddings = resolve_embeddings(settings.embeddings)
-    print(f"embeddings: {_embeddings}"
-          + ("   <- configured auto, Ollama not listening"
-             if _embeddings == "none" and settings.embeddings == "auto" else ""))
+def _embeddings_banner(settings) -> str:
+    """The banner's embeddings line, as a string so it can be tested.
+
+    Reports the RESOLVED mode, never the configured one: on a machine whose
+    `ollama serve` has died those differ, and the resolved one is what the
+    store is actually doing. "none" alone would be ambiguous - it is also what
+    a deliberate INBOX_EMBEDDINGS=none looks like - so a degrade says why.
+    """
+    resolved = resolve_embeddings(settings.embeddings)
+    if resolved == "none" and settings.embeddings == "auto":
+        return ("embeddings: none   <- configured auto, but Ollama is not "
+                "listening; rules still match exactly")
+    return f"embeddings: {resolved}"
 ```
 
-Import `resolve_embeddings` alongside `get_embeddings` in the existing `from ..config import (...)` block.
+And call it in `main()`, beside the `store` line:
+
+```python
+    print(_embeddings_banner(settings))
+```
 
 - [ ] **Step 4: Run the tests, then the whole suite**
 
-Run: `python3 -m pytest tests/test_store.py tests/test_config.py -v`
+Run: `python3 -m pytest tests/test_store.py tests/test_tg_banner.py -v`
 Expected: PASS.
 
 Run: `python3 -m pytest`
-Expected: `600 passed`.
+Expected: `603 passed`.
 
 - [ ] **Step 5: Verify the banner by hand**
 
@@ -374,7 +413,7 @@ Expected: an `embeddings: none` line in the banner. It will then fail to poll wi
 - [ ] **Step 6: Commit**
 
 ```bash
-git add inbox_agent/telegram/__main__.py tests/test_store.py tests/test_config.py
+git add inbox_agent/telegram/__main__.py tests/test_store.py tests/test_tg_banner.py
 git commit -m "Honour INBOX_EMBEDDINGS in the bot, and prove rules outlive the index"
 ```
 
@@ -476,7 +515,7 @@ Run: `python3 -m pytest tests/test_config.py -k source_of -v`
 Expected: PASS (4 tests).
 
 Run: `python3 -m pytest`
-Expected: `604 passed`.
+Expected: `607 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -614,7 +653,7 @@ Run: `python3 -m pytest tests/test_google_auth.py -k consent -v`
 Expected: PASS (3 tests).
 
 Run: `python3 -m pytest`
-Expected: `607 passed`.
+Expected: `610 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -646,6 +685,16 @@ import pytest
 from inbox_agent import config as config_mod
 from inbox_agent import doctor
 from inbox_agent.config import load_settings
+
+
+@pytest.fixture(autouse=True)
+def never_reach_context_hub(monkeypatch):
+    """run_checks() calls load_policy(), which pulls from Context Hub whenever
+    LANGSMITH_API_KEY is set. conftest.py disables tracing but does not clear
+    that key, so without this the doctor suite makes a network call - slow,
+    flaky, and dependent on someone else's uptime. The hub path is covered
+    where it belongs, in tests/test_policy.py."""
+    monkeypatch.setenv("LANGSMITH_API_KEY", "")
 
 
 def _checks(monkeypatch, **env):
@@ -912,7 +961,7 @@ Run: `python3 -m pytest tests/test_doctor.py -v`
 Expected: PASS (9 tests).
 
 Run: `python3 -m pytest`
-Expected: `616 passed`.
+Expected: `619 passed`.
 
 - [ ] **Step 5: Run it against the real configuration**
 
@@ -1080,7 +1129,7 @@ Run: `python3 -m pytest tests/test_cli.py -v`
 Expected: PASS (4 tests).
 
 Run: `python3 -m pytest`
-Expected: `620 passed`.
+Expected: `623 passed`.
 
 - [ ] **Step 6: Verify the package actually installs and the script works**
 
