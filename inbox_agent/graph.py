@@ -236,7 +236,8 @@ def build_graph(
         """Prefilter first, model only on what is left."""
         threads = _threads(state)
         decided, undecided = prefilter(threads, prefs)
-        decided += classify_batch(undecided, llm, policy, prefs.instructions())
+        decided += classify_batch(undecided, llm, policy, prefs.instructions(),
+                                  body_budget=settings.body_budget)
 
         # Age is decided here, deterministically, rather than asked of the
         # model. A two-year-old needs_reply is not a needs-reply, and the model

@@ -1670,7 +1670,7 @@ HttpError against a real mailbox would report success on work never done."
 
 ---
 
-### Task 6: `body_budget` on the prompt
+### Task 6: `body_budget` on the prompt  ✅ DONE
 
 The change `classify.py:252` needs so that populating `Thread.body` does not silently alter every prompt.
 
@@ -1687,7 +1687,7 @@ The change `classify.py:252` needs so that populating `Thread.body` does not sil
 
 **Five existing tests will break** if you change the default without touching them, because they pass `body=` and assert the body reaches the prompt: `test_email_body_is_fenced_as_data`, `test_injection_attempt_cannot_close_the_fence`, `test_injection_attempt_cannot_open_a_nested_fence`, `test_injection_attempt_with_both_tags_repeated_cannot_escape`, `test_body_is_truncated_to_protect_the_context_window`. Step 1 rewrites them to be *stronger* — the fence must hold on whichever field is actually used, so they get parametrised over both.
 
-- [ ] **Step 1: Rewrite the five body-dependent tests to cover both fields**
+- [x] **Step 1: Rewrite the five body-dependent tests to cover both fields**
 
 In `tests/test_classify.py`, replace the four injection tests and the truncation test with these. The payload moves into whichever field the budget selects, so the fence is proven on the field that actually carries attacker content:
 
@@ -1757,7 +1757,7 @@ def test_body_is_truncated_to_protect_the_context_window(budget):
     assert len(str(llm.calls[0])) < 12000
 ```
 
-- [ ] **Step 2: Add the new budget tests**
+- [x] **Step 2: Add the new budget tests**
 
 Append to `tests/test_classify.py`:
 
@@ -1817,12 +1817,12 @@ def test_classify_batch_threads_the_budget_through():
     assert "FULL BODY TEXT" in str(llm.calls[0])
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_classify.py -q`
 Expected: FAIL — `TypeError: build_prompt() got an unexpected keyword argument 'body_budget'`
 
-- [ ] **Step 4: Add the parameter to build_prompt**
+- [x] **Step 4: Add the parameter to build_prompt**
 
 Replace `build_prompt` (`classify.py:238-254`):
 
@@ -1870,7 +1870,7 @@ def build_prompt(thread: Thread, policy: Policy,
     return [system, human]
 ```
 
-- [ ] **Step 5: Thread it through classify_thread and classify_batch**
+- [x] **Step 5: Thread it through classify_thread and classify_batch**
 
 Replace the signature and the `build_prompt` call in `classify_thread` (`classify.py:271`):
 
@@ -1893,7 +1893,7 @@ def classify_batch(threads: list[Thread], llm, policy: Policy,
             for t in threads]
 ```
 
-- [ ] **Step 6: Pass the setting from the graph**
+- [x] **Step 6: Pass the setting from the graph**
 
 In `inbox_agent/graph.py:235`, inside the `triage` node:
 
@@ -1904,17 +1904,17 @@ In `inbox_agent/graph.py:235`, inside the `triage` node:
 
 `settings` is already in the `build_graph` closure (`graph.py:182`), so nothing else changes.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_classify.py tests/test_graph.py -q`
 Expected: PASS
 
-- [ ] **Step 8: Run the full suite**
+- [x] **Step 8: Run the full suite**
 
 Run: `python -m pytest -q --ignore=tests/test_learning.py`
 Expected: 235 passed
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add inbox_agent/classify.py inbox_agent/graph.py tests/test_classify.py
