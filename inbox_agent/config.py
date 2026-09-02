@@ -88,6 +88,12 @@ class Settings:
     # rather than a constant so the snippet-vs-body comparison is a config flip
     # driven from LangSmith traces, not a code edit. See the design spec 2.4.
     body_budget: int = 0
+    # auto | ollama | none. Whether rule text is embedded for semantic search.
+    # Nothing queries the index today (see the spec, section 1.3), so `auto`
+    # degrading to `none` loses no capability that currently exists - it only
+    # forfeits a future one. Defaulted so an existing checkout with Ollama
+    # running behaves exactly as it always has.
+    embeddings: str = "auto"
 
     @property
     def inbox_query(self) -> str:
@@ -142,6 +148,28 @@ def _resolve_gmail() -> str:
     return raw
 
 
+VALID_EMBEDDINGS = ("auto", "ollama", "none")
+
+
+def _resolve_embeddings() -> str:
+    """Whether rule text gets a vector index, and what happens when Ollama is
+    absent. See the design spec section 3.
+
+    `auto` is the same contract resolve_backend() already offers for
+    INBOX_LLM_BACKEND against the same daemon - probe, degrade, say so - so
+    there is one story about a missing Ollama rather than two.
+    """
+    raw = os.getenv("INBOX_EMBEDDINGS", "auto").strip().lower()
+    if raw not in VALID_EMBEDDINGS:
+        raise ValueError(
+            f"INBOX_EMBEDDINGS={raw!r} is not one of {VALID_EMBEDDINGS}. "
+            "Use 'auto' to index rule text when Ollama is running and degrade "
+            "when it is not, 'ollama' to require it, or 'none' to turn the "
+            "index off."
+        )
+    return raw
+
+
 def _resolve_body_budget() -> int:
     """Characters of body into the prompt. Negative is refused rather than
     clamped: clamping to 0 would look exactly like "snippet only was chosen",
@@ -186,6 +214,7 @@ def load_settings() -> Settings:
             os.getenv("INBOX_GOOGLE_CREDENTIALS", "secrets/credentials.json")),
         google_token=Path(os.getenv("INBOX_GOOGLE_TOKEN", "secrets/token.json")),
         body_budget=_resolve_body_budget(),
+        embeddings=_resolve_embeddings(),
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),

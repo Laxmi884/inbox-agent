@@ -159,3 +159,28 @@ def test_a_negative_body_budget_is_refused(monkeypatch):
     monkeypatch.setenv("INBOX_BODY_BUDGET", "-1")
     with pytest.raises(ValueError, match="INBOX_BODY_BUDGET"):
         load_settings()
+
+
+def test_embeddings_defaults_to_auto(monkeypatch):
+    """Absent means auto: use Ollama when it is there, degrade when it is not.
+    Defaulted rather than required so an existing checkout is unchanged."""
+    monkeypatch.delenv("INBOX_EMBEDDINGS", raising=False)
+    assert load_settings().embeddings == "auto"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("auto", "auto"), ("AUTO", "auto"), ("  ollama  ", "ollama"), ("none", "none"),
+])
+def test_embeddings_selection_is_normalised(monkeypatch, value, expected):
+    monkeypatch.setenv("INBOX_EMBEDDINGS", value)
+    assert load_settings().embeddings == expected
+
+
+def test_an_unrecognised_embeddings_value_fails_loudly(monkeypatch):
+    """Same reasoning as _resolve_gmail: a near miss must name the variable
+    rather than quietly pick a mode the owner did not ask for."""
+    monkeypatch.setenv("INBOX_EMBEDDINGS", "openai")
+    with pytest.raises(ValueError) as exc:
+        load_settings()
+    assert "INBOX_EMBEDDINGS" in str(exc.value)
+    assert "openai" in str(exc.value)
