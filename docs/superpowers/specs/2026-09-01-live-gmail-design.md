@@ -473,3 +473,81 @@ mailbox result, and means the rollout in section 5 has one subject at a time.
 - Incremental sync via `history.list`. Every run re-queries. At `/triage` scale
   that is one API call, and `agent/triaged` already does the deduplication that
   a history cursor would.
+
+
+## 8. First live run
+
+2026-09-01. Plan 1 implemented across nine tasks (`69816c3`..`0f45f56`), 516
+tests passing. Steps 1-3 of section 5 are complete; step 4, the digest on a
+phone, is outstanding and needs the owner.
+
+### What was verified against the real mailbox
+
+- **Auth.** One browser consent, `secrets/token.json` written at mode 600 with a
+  refresh token present, granted scopes exactly
+  `['https://www.googleapis.com/auth/gmail.modify']`. Reused thereafter with no
+  consent flow. `git status` sees nothing in `secrets/`.
+- **Reads.** `list_threads(10)` in 2.40s across five workers. `label_ids` came
+  back as display names with no raw `Label_...` leaking, dates parsed to ISO,
+  and **10 of 10 bodies were non-empty** - the first proof the MIME walk works
+  on real mail rather than fixtures.
+- **Body sizes.** Across 12 real threads: median 5,713 chars, min 672, max
+  24,176 - against a snippet capped at 201. That is the ~20x prompt change 2.4
+  predicted, now measured. `body_budget` stays 0.
+- **The label round trip.** `agent/triaged` created (id `Label_12`), applied to
+  a real thread, **confirmed to leave `inbox_query`**, then removed with the
+  thread's labels restored exactly. Re-checked afterwards: exactly one label of
+  that name exists, holding 0 threads. This is the premise of the whole
+  triaged-label design and it had never been tested against Gmail.
+- **The audit log is untouched by all of the above**, correctly: these were
+  direct client calls, not agent actions, so they never passed through
+  `execute_action`. All 35 existing records remain `simulated`.
+
+### Four defects found, none of which the suite could have caught
+
+1. **`SSL: WRONG_VERSION_NUMBER` on the first real page fetch.** googleapiclient's
+   service holds one `httplib2.Http`; it is not thread-safe; the five-worker
+   hydration pool corrupted its own socket. Bisected live: one worker always
+   fine, five always failed. **Thirty-one unit tests passed against a client
+   that could not fetch a single page of real mail** - a fake has no socket.
+   Fixed with a per-thread transport (`LiveGmailClient._http`).
+2. **The plan's factory would have reintroduced it.** It was written before the
+   bug existed and constructed `LiveGmailClient(service)` with no
+   `http_factory`. Every unit test would still have passed.
+3. **The HTML fallback was unreachable when a plain part existed but was
+   empty.** The plan chose on the presence of a `text/plain` part rather than on
+   whether it yielded text, so a corrupt or whitespace plain part returned ""
+   and never read the html part carrying the whole message - indistinguishable
+   from mail that genuinely had no body.
+4. **The prompt-injection tests covered the wrong field.** All four were pinned
+   to `body`, but at `body_budget=0` - the default, the configuration that
+   ships - it is the SNIPPET that reaches the prompt, and Gmail derives the
+   snippet from the body. The shipping configuration had no injection coverage
+   at all. Now parametrised over both.
+
+### Two spec claims this run corrected
+
+- **1.6 overstated the danger.** `_fence` has always capped at
+  `MAX_BODY_CHARS = 4000`, so live bodies were never going to arrive unbounded
+  and there was no context overflow to prevent. The real cost is measurement
+  continuity. Corrected in place.
+- **2.4's "reproduces today's behaviour exactly" was true only for the
+  snapshot.** Five fixtures in `test_classify.py` asserted the body reached the
+  prompt. Corrected in place.
+
+### Measured and found NOT to be a problem
+
+- All five `CATEGORY_*` labels are returned by `labels.list`, so they resolve
+  from the map and cost no extra calls on the miss path.
+- Zero-width marketing filler was 1.2% of body text overall, but 22.4% of one
+  message's first 4000 characters. Stripped; that body fell 30%.
+
+### Outstanding
+
+- **Section 5 step 4** - a full `/triage` on the phone with `INBOX_DRY_RUN=true`.
+  Needs the owner and a running bot.
+- **The consent screen is in Testing**, not production: publishing requires a
+  homepage URL and privacy policy URL. Google therefore revokes the refresh
+  token after exactly seven days, so this token dies around **8 September 2026**.
+  `ConsentExpiredError` exists to name that cause when it happens, since
+  Google's own `invalid_grant` does not.
