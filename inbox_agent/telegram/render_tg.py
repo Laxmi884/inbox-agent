@@ -54,6 +54,28 @@ SECTIONS: tuple[tuple[str, str], ...] = (
 # and the thread simply wants a person. Only these are one-tap approvable.
 ATTENTION_REASONS = frozenset({"needs_reply", "security_alert"})
 
+
+def _attention_phrase(items) -> str:
+    """"2 alerts", "1 reply & 2 alerts" - what is ACTUALLY in the tier.
+
+    The button used to read "N replies & alerts" whatever it contained, so a
+    queue of two security alerts and no replies was described as both. Read on
+    a phone as: "it says approve 2 replies & alerts but i only see security
+    alerts". A button that describes a queue the owner can see is not there is
+    a button they cannot trust, and this one authorises action on a mailbox.
+
+    Shared by the button and the footnote above it so the two cannot drift into
+    naming the same set differently one line apart.
+    """
+    replies = sum(1 for h in items if h.hold_reason == "needs_reply")
+    alerts = sum(1 for h in items if h.hold_reason == "security_alert")
+    parts = []
+    if replies:
+        parts.append(f"{replies} repl" + ("y" if replies == 1 else "ies"))
+    if alerts:
+        parts.append(f"{alerts} alert" + ("" if alerts == 1 else "s"))
+    return " & ".join(parts)
+
 _SUBJECT_CAP = 70
 # Capped like the others. Uncapped it was the one unbounded field in the message
 # and the only route to the 4096-char wall, where the budget below would start
@@ -328,13 +350,16 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     # Said only when there IS a split to explain: with nothing in the attention
     # tier no one-tap button is drawn, and with nothing outside it the button
     # covers everything. A line that always appears stops being read.
-    attention_total = sum(1 for h in ordered if h.hold_reason in ATTENTION_REASONS)
-    individual_total = len(ordered) - attention_total
-    if attention_total and individual_total:
+    attention_held = [h for h in ordered if h.hold_reason in ATTENTION_REASONS]
+    individual_total = len(ordered) - len(attention_held)
+    if attention_held and individual_total:
         lines.append("")
-        lines.append(f"The button below covers the {attention_total} in the "
-                     f"attention tier. {individual_total} more need approving "
-                     f"one at a time — tap a number.")
+        rest = (f"{individual_total} more needs approving on its own — tap its "
+                f"number." if individual_total == 1 else
+                f"{individual_total} more need approving one at a time — tap a "
+                f"number.")
+        lines.append(f"The button below covers the "
+                     f"{_attention_phrase(attention_held)}. {rest}")
     lines += tail
 
     # Belt and braces on a hard protocol limit. The budget above should already
@@ -366,7 +391,7 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
         # Attention tier only. A blanket button that could reach trash or a
         # low-confidence guess would rubber-stamp exactly the set this design
         # isolated to avoid rubber-stamping.
-        keyboard.append([(f"✅ Approve {len(attention)} replies & alerts",
+        keyboard.append([(f"✅ Approve {_attention_phrase(attention)}",
                           encode("approve_attention", digest_id=view.digest_id))])
 
     nav: list[tuple[str, str]] = []

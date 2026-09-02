@@ -734,3 +734,56 @@ def test_no_footnote_when_there_is_no_one_tap_button_at_all():
     already say that."""
     text, _ = digest(view(held_items=[held("t1", "trash"), held("t2", "trash")]))
     assert "more need" not in text.lower()
+
+
+# --- the one-tap button names what is actually there -------------------------
+# Read on a phone: "it says approve 2 replies & alerts but i only see security
+# alerts and no replies". The label was a fixed string covering both
+# ATTENTION_REASONS, so it claimed replies that were not there. A button that
+# describes a queue the owner can see is not describing is a button they cannot
+# trust, and this one authorises action on their mailbox.
+
+def test_the_button_says_alerts_when_there_are_only_alerts():
+    _, kb = digest(view(held_items=[
+        held("t1", "security_alert"), held("t2", "security_alert")]))
+    label = [l for row in kb for l, _ in row if l.startswith("✅")][0]
+    assert label == "✅ Approve 2 alerts", label
+
+
+def test_the_button_says_replies_when_there_are_only_replies():
+    _, kb = digest(view(held_items=[
+        held("t1", "needs_reply"), held("t2", "needs_reply")]))
+    label = [l for row in kb for l, _ in row if l.startswith("✅")][0]
+    assert label == "✅ Approve 2 replies", label
+
+
+def test_the_button_names_both_when_both_are_present():
+    _, kb = digest(view(held_items=[
+        held("t1", "needs_reply"), held("t2", "security_alert"),
+        held("t3", "security_alert")]))
+    label = [l for row in kb for l, _ in row if l.startswith("✅")][0]
+    assert label == "✅ Approve 1 reply & 2 alerts", label
+
+
+def test_the_button_is_singular_for_one():
+    _, kb = digest(view(held_items=[held("t1", "security_alert")]))
+    label = [l for row in kb for l, _ in row if l.startswith("✅")][0]
+    assert label == "✅ Approve 1 alert", label
+
+
+def test_the_footnote_uses_the_same_words_as_the_button():
+    """Two different names for the same set, one line apart, is the confusion
+    this whole fix is about."""
+    text, kb = digest(view(held_items=[
+        held("t1", "security_alert"), held("t2", "trash"), held("t3", "trash")]))
+    label = [l for row in kb for l, _ in row if l.startswith("✅")][0]
+    assert "1 alert" in label
+    assert "1 alert" in text
+
+
+def test_the_footnote_agrees_in_number_for_a_single_leftover():
+    text, _ = digest(view(held_items=[
+        held("a1", "security_alert"), held("t1", "trash")]))
+    note = [l for l in text.splitlines() if "button below" in l][0]
+    assert "1 more needs approving" in note, note
+    assert "1 more need approving" not in note
