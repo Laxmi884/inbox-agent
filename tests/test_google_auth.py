@@ -208,3 +208,45 @@ def test_the_dead_token_is_not_left_looking_valid(tmp_path, monkeypatch):
         get_credentials(client_secrets_path=_stub_secrets(tmp_path),
                         token_path=token)
     assert json.loads(token.read_text())["token"] == "stub"
+
+
+# --- consent date sidecar ---------------------------------------------------
+
+def test_consent_is_recorded_in_a_sidecar_not_in_the_token(tmp_path):
+    """A sidecar because token.json's schema belongs to google-auth: it is
+    produced by creds.to_json() and consumed by from_authorized_user_file, so a
+    foreign key invites a breakage on upgrade for no benefit."""
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "x"}')
+
+    google_auth.record_consent(token, now=datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+    assert google_auth.consent_sidecar(token) == tmp_path / "token.consent.json"
+    assert '"refresh_token": "x"' in token.read_text(), "token.json must be untouched"
+    assert google_auth.consented_at(token) == datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+
+def test_consent_date_is_unknown_when_no_sidecar_exists(tmp_path):
+    """Every token issued before this feature. Returning None makes doctor say
+    'unknown' rather than invent a date - a confident wrong prediction about
+    when the mailbox stops working is worse than no prediction."""
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text("{}")
+    assert google_auth.consented_at(token) is None
+
+
+def test_a_corrupt_sidecar_reads_as_unknown_rather_than_raising(tmp_path):
+    """Doctor must survive a hand-edited or truncated sidecar. This file is
+    diagnostics, never authorisation, so it can never be worth crashing over."""
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text("{}")
+    google_auth.consent_sidecar(token).write_text("not json{{")
+    assert google_auth.consented_at(token) is None

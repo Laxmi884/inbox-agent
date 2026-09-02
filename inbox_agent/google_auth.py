@@ -6,7 +6,9 @@ a different token store - without the client noticing.
 """
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -113,6 +115,44 @@ def _write_token(token_path: Path, creds) -> None:
         fh.write(creds.to_json())
 
 
+def consent_sidecar(token_path: Path) -> Path:
+    """Where the consent date lives: beside the token, never inside it.
+
+    token.json's schema is google-auth's - creds.to_json() writes it and
+    Credentials.from_authorized_user_file reads it - so an extra key there is a
+    library upgrade away from breaking authentication for a diagnostic.
+    """
+    return Path(token_path).with_suffix(".consent.json")
+
+
+def record_consent(token_path: Path, *, now: Optional[datetime] = None) -> None:
+    """Stamp the moment consent was granted.
+
+    Called ONLY from the consent path, never from the refresh path. Google's
+    seven-day revocation for an app in Testing runs from consent and is not
+    reset by refreshing, so stamping on refresh would promise six more days on
+    the morning the token dies - worse than tracking nothing.
+    """
+    when = now or datetime.now(timezone.utc)
+    path = consent_sidecar(token_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"consented_at": when.isoformat()}), encoding="utf-8")
+
+
+def consented_at(token_path: Path) -> Optional[datetime]:
+    """When consent was granted, or None if unrecorded or unreadable.
+
+    None for every token issued before this existed. Diagnostics only - never
+    read as authorisation - so a missing or corrupt file degrades to "unknown"
+    rather than raising in a caller that is trying to explain what is wrong.
+    """
+    try:
+        raw = json.loads(consent_sidecar(token_path).read_text(encoding="utf-8"))
+        return datetime.fromisoformat(raw["consented_at"])
+    except Exception:
+        return None
+
+
 def get_credentials(*, client_secrets_path: Path, token_path: Path,
                     scopes: Optional[list[str]] = None):
     """Load, refresh, or obtain credentials - in that order of preference.
@@ -161,6 +201,9 @@ def get_credentials(*, client_secrets_path: Path, token_path: Path,
     creds = _run_consent_flow(client_secrets_path=client_secrets_path,
                               scopes=scopes)
     _write_token(token_path, creds)
+    # Consent path only. The refresh path above deliberately does not touch
+    # this - see record_consent.
+    record_consent(token_path)
     return creds
 
 
