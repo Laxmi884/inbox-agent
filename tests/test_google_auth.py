@@ -250,3 +250,74 @@ def test_a_corrupt_sidecar_reads_as_unknown_rather_than_raising(tmp_path):
     token.write_text("{}")
     google_auth.consent_sidecar(token).write_text("not json{{")
     assert google_auth.consented_at(token) is None
+
+
+def test_sidecar_with_no_consented_at_key_reads_as_unknown(tmp_path):
+    """A sidecar that is valid JSON but missing the consented_at key (hand-edited
+    or half-written file) must not crash doctor; it reads as "unknown" instead."""
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text("{}")
+    google_auth.consent_sidecar(token).write_text('{"other_key": "value"}')
+    assert google_auth.consented_at(token) is None
+
+
+def test_refresh_path_does_not_create_a_sidecar(tmp_path, monkeypatch):
+    """The refresh path must never stamp the sidecar - Google's 7-day revocation
+    runs from consent and is not reset by refreshing, so stamping on refresh would
+    promise six more days on the morning the token dies. This test guards against
+    accidental placement of record_consent on the refresh branch."""
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token": "stub"}))
+
+    class FakeCreds:
+        valid = False
+        expired = True
+        refresh_token = "r"
+
+        def refresh(self, request):
+            self.valid = True
+
+        def to_json(self):
+            return '{"token": "refreshed"}'
+
+    def no_flow(*a, **k):
+        raise AssertionError("consent flow must not run on refresh")
+
+    monkeypatch.setattr("inbox_agent.google_auth._creds_from_file",
+                        lambda *a, **k: FakeCreds())
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow", no_flow)
+
+    get_credentials(client_secrets_path=_stub_secrets(tmp_path), token_path=token)
+    # The refresh path must NOT create a sidecar
+    assert not google_auth.consent_sidecar(token).exists(), \
+        "Refresh path must not stamp consent sidecar"
+
+
+def test_consent_path_creates_the_sidecar(tmp_path, monkeypatch):
+    """The consent path must create the sidecar, and only the consent path.
+    This test is the counterpart to test_refresh_path_does_not_create_a_sidecar
+    and pins both directions: consent creates it, refresh does not."""
+    token = tmp_path / "nested" / "token.json"
+
+    class FakeCreds:
+        valid = True
+        expired = False
+        refresh_token = "r"
+
+        def to_json(self):
+            return '{"token": "fresh"}'
+
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow",
+                        lambda **k: FakeCreds())
+
+    from inbox_agent import google_auth
+    get_credentials(client_secrets_path=_stub_secrets(tmp_path), token_path=token)
+    # The consent path must create a sidecar
+    assert google_auth.consent_sidecar(token).exists(), \
+        "Consent path must create sidecar"
+    assert google_auth.consented_at(token) is not None, \
+        "Sidecar must contain a valid consented_at timestamp"
