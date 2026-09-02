@@ -490,15 +490,29 @@ class Bot:
         context = ExecutionContext(policy_version=None, model=None, backend=None)
         did = []
         for action in item.item.proposed:
-            if action.kind == "none":
-                continue
+            # `none` goes through the chokepoint like everything else. It used
+            # to be skipped here, before execute_action ever saw it, which
+            # silently exempted the one decision most worth recording: the
+            # owner approving the agent's recommendation to leave a
+            # security_alert alone. That approval landed in no log, and
+            # held.remove() then destroyed the queue entry, leaving the thread
+            # indistinguishable from one nobody had ever looked at. audit.py
+            # promises a durable record of every attempt and _dispatch has
+            # always handled "none"; only this caller broke the promise.
             try:
                 execute_action(action, client=self.client, settings=self.settings,
                                log=self.log, actor="human", context=context)
-                label = (action.params or {}).get("label")
-                did.append(f"{action.kind}({label})" if label else action.kind)
             except ForbiddenActionError as exc:
                 did.append(f"refused {action.kind} ({exc})")
+                continue
+            # Recorded, but never reported as work done. An empty summary is
+            # what the caller turns into "Nothing to do.", and saying anything
+            # else would break the same rule the digest follows: never claim
+            # something happened when nothing did.
+            if action.kind == "none":
+                continue
+            label = (action.params or {}).get("label")
+            did.append(f"{action.kind}({label})" if label else action.kind)
         return ", ".join(did)
 
     def _verdict(self, intent) -> None:

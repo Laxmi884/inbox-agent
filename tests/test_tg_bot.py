@@ -1025,3 +1025,72 @@ def test_no_bulk_button_when_there_is_nothing_to_bulk(bot):
     b.handle_update(cb(encode("list", digest_id=b._digest_id)))
     kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
     assert "trash_all" not in kinds
+
+
+# --- approving a no-op --------------------------------------------------------
+# The Binance case, 2026-09-02. A KYC notice was classified security_alert at
+# confidence 1.0 with proposed action `none` - the agent correctly declining to
+# touch a security mail - and the owner approved that recommendation live.
+#
+# Nothing was recorded anywhere. _execute_held skipped the `none` before it
+# reached the chokepoint, then held.remove() hard-deleted the item, so the one
+# adjudication in the system that most deserved a record left none. The reject
+# path leaves a trace because it writes a learned rule; approve-of-nothing left
+# the thread indistinguishable from one never triaged at all.
+#
+# audit.py's docstring already promises "every attempt - permitted, refused, or
+# simulated - leaves a durable record", and _dispatch has handled kind "none"
+# since it was written. The chokepoint was never the problem; the caller was
+# routing around it.
+
+def _open_held_none(b):
+    """A held item proposing `none`, the shape the owner actually approved."""
+    b.handle_update(msg("/triage 4"))
+    b.held.add(ReviewItem(thread_id="sec-1", category="security_alert",
+                          subject="[Reminder] Update Your KYC Information",
+                          sender="do-not-reply@ses.binance.com", snippet="s",
+                          proposed=[Action(kind="none", thread_id="sec-1")],
+                          reason="A security and account verification notice.",
+                          confidence=1.0, source="model"),
+               run_id="r1", reason="security_alert")
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+
+
+def test_approving_a_no_op_still_leaves_an_audit_record(bot):
+    """Who decided this, and when, must be answerable afterwards."""
+    b, t, log = bot
+    _open_held_none(b)
+    before = len(log.records())
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    new = [r for r in log.records()[before:] if r.thread_id == "sec-1"]
+    assert new, "the owner's approval of a no-op left no trace at all"
+    assert new[0].action == "none"
+    assert new[0].actor == "human"
+
+
+def test_approving_a_no_op_still_drains_the_queue(bot):
+    b, t, _ = bot
+    _open_held_none(b)
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert b.held.all() == []
+
+
+def test_approving_a_no_op_still_says_there_was_nothing_to_do(bot):
+    """The record is for the log, not the screen. Reporting `none` as work done
+    would be the digest's 'never say done for what did not happen' rule broken
+    from the other side."""
+    b, t, _ = bot
+    _open_held_none(b)
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    assert "Nothing to do" in text
+    assert "none" not in text.lower().split("nothing")[0]
+
+
+def test_a_no_op_record_is_never_offered_as_an_undo_candidate(bot):
+    """It has no undo token, so it must not reach the undo list - approving a
+    no-op is not something that can be reversed."""
+    b, t, log = bot
+    _open_held_none(b)
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert all(r.action != "none" for r in log.undo_candidates())
