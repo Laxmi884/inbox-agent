@@ -1,0 +1,210 @@
+"""google_auth.py knows about OAuth and nothing about mail.
+
+Every test here runs with no network and no real credentials: the flow and the
+Credentials class are both injected, so the only thing under test is our own
+load / refresh / consent decision.
+"""
+import json
+import pytest
+
+from inbox_agent.google_auth import (
+    GMAIL_MODIFY_SCOPE, ConsentExpiredError, get_credentials,
+)
+
+
+def _stub_secrets(tmp_path):
+    p = tmp_path / "credentials.json"
+    p.write_text("{}")
+    return p
+
+
+def test_scope_is_modify_and_nothing_wider():
+    """gmail.modify grants label, archive, trash and draft-create, and grants
+    neither send nor permanent delete - so ALWAYS_FORBIDDEN is enforced at
+    Google's edge, not only at audit.py's chokepoint. A wider scope would be
+    less work later and is refused for exactly that reason."""
+    assert GMAIL_MODIFY_SCOPE == "https://www.googleapis.com/auth/gmail.modify"
+
+
+def test_missing_client_secret_names_the_console_steps(tmp_path):
+    """Same actionable-error style as load_snapshot (gmail.py:61).
+
+    Names the CURRENT console UI. Google moved these settings out of
+    "APIs & Services -> OAuth consent screen" into "Google Auth Platform", so
+    an error naming the old path sends the reader to a page that no longer
+    exists - which is worse than naming no path at all.
+    """
+    with pytest.raises(FileNotFoundError) as exc:
+        get_credentials(client_secrets_path=tmp_path / "absent.json",
+                        token_path=tmp_path / "token.json")
+    msg = str(exc.value)
+    assert "Gmail API" in msg
+    assert "Desktop app" in msg
+    assert "Google Auth Platform" in msg
+    assert "Test users" in msg      # the fallback when publishing is blocked
+    assert "seven days" in msg      # why publishing matters
+
+
+def test_valid_token_is_reused_without_a_consent_flow(tmp_path, monkeypatch):
+    """The whole point of persisting a token: one browser consent, ever."""
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token": "stub"}))
+
+    class FakeCreds:
+        valid = True
+        expired = False
+        refresh_token = None
+
+    def no_flow(*a, **k):
+        raise AssertionError("consent flow must not run for a valid token")
+
+    monkeypatch.setattr("inbox_agent.google_auth._creds_from_file",
+                        lambda *a, **k: FakeCreds())
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow", no_flow)
+
+    assert isinstance(get_credentials(client_secrets_path=_stub_secrets(tmp_path),
+                                      token_path=token), FakeCreds)
+
+
+def test_expired_token_with_a_refresh_token_refreshes_instead_of_reconsenting(
+        tmp_path, monkeypatch):
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token": "stub"}))
+    refreshed = []
+
+    class FakeCreds:
+        valid = False
+        expired = True
+        refresh_token = "r"
+
+        def refresh(self, request):
+            refreshed.append(request)
+            self.valid = True
+
+        def to_json(self):
+            return '{"token": "refreshed"}'
+
+    def no_flow(*a, **k):
+        raise AssertionError("consent flow must not run when a refresh works")
+
+    monkeypatch.setattr("inbox_agent.google_auth._creds_from_file",
+                        lambda *a, **k: FakeCreds())
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow", no_flow)
+
+    creds = get_credentials(client_secrets_path=_stub_secrets(tmp_path),
+                            token_path=token)
+    assert creds.valid is True
+    assert len(refreshed) == 1
+    assert json.loads(token.read_text())["token"] == "refreshed"
+
+
+def test_no_token_runs_the_consent_flow_and_writes_the_token(tmp_path, monkeypatch):
+    token = tmp_path / "nested" / "token.json"
+
+    class FakeCreds:
+        valid = True
+        expired = False
+        refresh_token = "r"
+
+        def to_json(self):
+            return '{"token": "fresh"}'
+
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow",
+                        lambda **k: FakeCreds())
+
+    get_credentials(client_secrets_path=_stub_secrets(tmp_path), token_path=token)
+    assert json.loads(token.read_text())["token"] == "fresh"
+
+
+def test_token_is_written_with_owner_only_permissions(tmp_path, monkeypatch):
+    """token.json is a live credential for the real mailbox."""
+    token = tmp_path / "token.json"
+
+    class FakeCreds:
+        valid = True
+        expired = False
+        refresh_token = "r"
+
+        def to_json(self):
+            return '{"token": "fresh"}'
+
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow",
+                        lambda **k: FakeCreds())
+
+    get_credentials(client_secrets_path=_stub_secrets(tmp_path), token_path=token)
+    assert (token.stat().st_mode & 0o077) == 0
+
+
+# --- the Testing-mode expiry ------------------------------------------------
+# Not in the plan. Added because this project's own consent screen is in
+# Testing: publishing to production requires a homepage URL and a privacy
+# policy URL, which a personal script does not have, so the refresh token is
+# revoked by Google after exactly seven days. That is a certainty here, not a
+# hypothetical, and the error Google returns for it - invalid_grant - says
+# nothing about the cause.
+
+def test_a_revoked_refresh_token_explains_the_testing_mode_cause(
+        tmp_path, monkeypatch):
+    """Raise, rather than silently reopening a browser.
+
+    A scheduled digest running at 08:00 with nobody present must fail loudly
+    with something actionable. Falling through to consent would leave it
+    hanging forever on a browser prompt no one will ever click, which reads as
+    a hang rather than an expired credential.
+    """
+    from google.auth.exceptions import RefreshError
+
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token": "stub"}))
+
+    class FakeCreds:
+        valid = False
+        expired = True
+        refresh_token = "r"
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    def no_flow(*a, **k):
+        raise AssertionError("must not silently reopen a browser")
+
+    monkeypatch.setattr("inbox_agent.google_auth._creds_from_file",
+                        lambda *a, **k: FakeCreds())
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow", no_flow)
+
+    with pytest.raises(ConsentExpiredError) as exc:
+        get_credentials(client_secrets_path=_stub_secrets(tmp_path),
+                        token_path=token)
+    msg = str(exc.value)
+    assert "seven days" in msg
+    assert "Testing" in msg
+    assert str(token) in msg          # the file to delete to re-consent
+
+
+def test_the_dead_token_is_not_left_looking_valid(tmp_path, monkeypatch):
+    """The revoked token stays on disk untouched, so re-running reproduces the
+    same named error rather than a different one. Deleting it here would turn
+    the next scheduled run into a silent browser prompt - exactly what the
+    raise above exists to prevent."""
+    from google.auth.exceptions import RefreshError
+
+    token = tmp_path / "token.json"
+    token.write_text(json.dumps({"token": "stub"}))
+
+    class FakeCreds:
+        valid = False
+        expired = True
+        refresh_token = "r"
+
+        def refresh(self, request):
+            raise RefreshError("invalid_grant")
+
+    monkeypatch.setattr("inbox_agent.google_auth._creds_from_file",
+                        lambda *a, **k: FakeCreds())
+    monkeypatch.setattr("inbox_agent.google_auth._run_consent_flow",
+                        lambda **k: (_ for _ in ()).throw(AssertionError()))
+
+    with pytest.raises(ConsentExpiredError):
+        get_credentials(client_secrets_path=_stub_secrets(tmp_path),
+                        token_path=token)
+    assert json.loads(token.read_text())["token"] == "stub"

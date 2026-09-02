@@ -217,7 +217,7 @@ secrets/ is gitignored before any credential can exist, not after."
 
 ---
 
-### Task 2: `google_auth.py`
+### Task 2: `google_auth.py`  ✅ DONE
 
 **Files:**
 - Create: `inbox_agent/google_auth.py`
@@ -229,7 +229,7 @@ secrets/ is gitignored before any credential can exist, not after."
   - `GMAIL_MODIFY_SCOPE: str` — the single scope constant.
   - `get_credentials(*, client_secrets_path: Path, token_path: Path, scopes: list[str] | None = None) -> Credentials`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_google_auth.py`:
 
@@ -369,12 +369,12 @@ def test_token_is_written_with_owner_only_permissions(tmp_path, monkeypatch):
     assert (token.stat().st_mode & 0o077) == 0
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_google_auth.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'inbox_agent.google_auth'`
 
-- [ ] **Step 3: Write google_auth.py**
+- [x] **Step 3: Write google_auth.py**
 
 Create `inbox_agent/google_auth.py`:
 
@@ -495,12 +495,12 @@ def get_credentials(*, client_secrets_path: Path, token_path: Path,
     return creds
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_google_auth.py -q`
 Expected: PASS (6 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add inbox_agent/google_auth.py tests/test_google_auth.py
