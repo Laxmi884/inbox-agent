@@ -79,20 +79,34 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
         note=("configured auto, but nothing is listening on Ollama - rules are "
               "still matched exactly, so nothing is broken" if degraded else "")))
 
-    for key, value in (("INBOX_TG_TOKEN", s.tg_token),
-                       ("INBOX_TG_CHAT_ID", s.tg_chat_id)):
-        checks.append(_setting(
-            key, value or "not set",
-            level="fatal" if not value else "ok",
-            note="the bot refuses to start without it" if not value else ""))
+    # INBOX_TG_TOKEN is a secret key; pass its raw value straight to
+    # _setting() so mask() sees the true absence and returns "not set"
+    # plainly. Pre-substituting the string "not set" here would hand mask()
+    # a truthy 7-character placeholder and it would render as a masked
+    # secret - "<redacted> (7 chars)" - which is exactly the shape a real
+    # loaded token has. On a screen whose job is fast triage of "is a token
+    # even loaded?", that lie is the same failure this module exists to
+    # catch. INBOX_TG_CHAT_ID is not a secret and is never masked, so
+    # substituting a placeholder for display is safe there.
+    checks.append(_setting(
+        "INBOX_TG_TOKEN", s.tg_token,
+        level="fatal" if not s.tg_token else "ok",
+        note="the bot refuses to start without it" if not s.tg_token else ""))
+    checks.append(_setting(
+        "INBOX_TG_CHAT_ID", s.tg_chat_id or "not set",
+        level="fatal" if not s.tg_chat_id else "ok",
+        note="the bot refuses to start without it" if not s.tg_chat_id else ""))
 
     for key, path in (("INBOX_GOOGLE_CREDENTIALS", s.google_credentials),
                       ("INBOX_GOOGLE_TOKEN", s.google_token)):
-        missing = not path.exists()
+        # The note must gate on the same condition as the level - a missing
+        # file that INBOX_GMAIL=snapshot never needed is not a problem, and
+        # an unmarked "ok" line should not read as if it were.
+        needs_it = not path.exists() and s.gmail == "live"
         checks.append(_setting(
             key, path,
-            level="fatal" if (missing and s.gmail == "live") else "ok",
-            note="missing, and INBOX_GMAIL=live needs it" if missing else ""))
+            level="fatal" if needs_it else "ok",
+            note="missing, and INBOX_GMAIL=live needs it" if needs_it else ""))
 
     checks.append(_oauth_check(s))
 
