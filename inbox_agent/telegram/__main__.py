@@ -13,7 +13,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ..audit import AuditLog
 from ..config import (build_gmail_client, get_embeddings, load_settings, mask,
-                      use_model)
+                      resolve_embeddings, use_model)
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -31,6 +31,21 @@ def policy_categories(policy) -> list[str]:
         return []
     body = section[1].split("\n## ", 1)[0]
     return re.findall(r"^-\s+`([a-z_]+)`", body, re.M)
+
+
+def _embeddings_banner(settings) -> str:
+    """The banner's embeddings line, as a string so it can be tested.
+
+    Reports the RESOLVED mode, never the configured one: on a machine whose
+    `ollama serve` has died those differ, and the resolved one is what the
+    store is actually doing. "none" alone would be ambiguous - it is also what
+    a deliberate INBOX_EMBEDDINGS=none looks like - so a degrade says why.
+    """
+    resolved = resolve_embeddings(settings.embeddings)
+    if resolved == "none" and settings.embeddings == "auto":
+        return ("embeddings: none   <- configured auto, but Ollama is not "
+                "listening; rules still match exactly")
+    return f"embeddings: {resolved}"
 
 
 def main() -> int:
@@ -55,7 +70,7 @@ def main() -> int:
     # mark_triaged takes every processed thread out of the fetch query and
     # `/backlog` uses the same query. See open_store.
     prefs = PreferenceStore(open_store(settings.store_dir / "prefs.sqlite",
-                                       get_embeddings()))
+                                       get_embeddings(settings.embeddings)))
     # Own namespace, own file: a held item is work in flight, not durable
     # preference knowledge, and build_graph now requires the queue explicitly
     # (task 4) rather than building one for itself. Separate files rather than
@@ -108,6 +123,7 @@ def main() -> int:
     print(f"store     : {settings.store_dir}  ({len(held.all())} held, "
           f"{len(_live)} rules carried over"
           + (f", {_retired} retired)" if _retired else ")"))
+    print(_embeddings_banner(settings))
     print("\nSend /triage in Telegram. Ctrl-C to stop.")
 
     try:

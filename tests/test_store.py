@@ -323,3 +323,44 @@ def test_a_bare_address_rule_does_not_match_a_different_address():
     s = store()
     s.add_rule(_sender_rule(SWS_ADDR))
     assert s.matching(thread(sender="Someone <no-reply@other.example>")) == []
+
+
+def test_rules_written_with_an_index_read_back_without_one(tmp_path):
+    """Spec section 3.4. `auto` degrading on a machine whose Ollama died makes
+    this path reachable without anyone choosing it, so learned rules must
+    survive it. A rule that becomes invisible is worse than one that errors:
+    the agent would silently stop honouring a correction the owner made."""
+    from datetime import datetime, timezone
+
+    from langchain_core.embeddings import Embeddings
+
+    from inbox_agent.store import PreferenceStore, open_store
+    from inbox_agent.models import ActionTemplate, Rule
+
+    class FakeEmbeddings(Embeddings):
+        """Deterministic, offline. The suite must not need Ollama.
+
+        MUST subclass Embeddings: langgraph's ensure_embeddings does
+        `isinstance(embed, Embeddings)` and otherwise wraps the argument in
+        EmbeddingsLambda, which expects a callable - so a duck-typed class with
+        embed_documents/embed_query is not accepted and raises TypeError.
+        """
+        def embed_documents(self, texts):
+            return [[0.1] * 768 for _ in texts]
+
+        def embed_query(self, text):
+            return [0.1] * 768
+
+    path = tmp_path / "prefs.sqlite"
+
+    indexed = PreferenceStore(open_store(path, FakeEmbeddings()))
+    # created_at is REQUIRED on Rule (models.py:94, no default).
+    indexed.add_rule(Rule(id="r-keepme", scope="sender", pattern="a@b.com",
+                          actions=[ActionTemplate(kind="archive", params={})],
+                          provenance="written while indexed",
+                          created_at=datetime.now(timezone.utc)))
+    assert len(indexed.rules()) == 1
+
+    plain = PreferenceStore(open_store(path))          # embeddings=None
+    ids = [r.id for r in plain.rules()]
+    assert ids == ["r-keepme"], f"rule lost when the index went away: {ids}"
