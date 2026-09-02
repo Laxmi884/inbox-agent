@@ -9,6 +9,7 @@ Stage A. The interface is deliberately narrow so Mem0 can sit behind it later.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -199,6 +200,40 @@ def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: st
     )
 
 
+def _sender_address(raw: str) -> str:
+    """The address out of a From header, or the string itself if it is bare."""
+    match = re.search(r"<([^>]+)>", raw)
+    return (match.group(1) if match else raw).strip().lower()
+
+
+def _sender_matches(pattern: str, sender: str) -> bool:
+    """Does a sender-scoped pattern cover this thread's sender?
+
+    The two Gmail clients disagree about what Thread.sender holds: a snapshot
+    thread carries a bare address, a live thread the full From header. A plain
+    equality test therefore made every snapshot-taught rule dead against the
+    real mailbox, silently - the simplywall.st rule had three hits, none live.
+
+    Normalising both sides to the address would fix that and break something
+    worse. One page of real mail turned up four addresses sending under several
+    display names: newsletters-noreply@linkedin.com is Forbes AND S&P Global AND
+    a real person. Widening every rule to its address would let a rule taught on
+    a newsletter decide a person's mail.
+
+    So the pattern's own shape carries the intent. No display name means the
+    ADDRESS, whoever it claims to be - which is exactly what a snapshot-taught
+    rule meant, having never had a display name available. A display name means
+    that identity, and is matched whole.
+    """
+    pattern = pattern.strip().lower()
+    sender = sender.strip().lower()
+    if pattern == sender:
+        return True
+    if "<" in pattern:
+        return False
+    return pattern == _sender_address(sender)
+
+
 class PreferenceStore:
     def __init__(self, store: InMemoryStore):
         self._store = store
@@ -285,7 +320,7 @@ class PreferenceStore:
         for rule in self._live_rules():
             if rule.scope == "category":
                 continue
-            if rule.scope == "sender" and rule.pattern == thread.sender.lower():
+            if rule.scope == "sender" and _sender_matches(rule.pattern, thread.sender):
                 out.append(rule)
             elif rule.scope == "domain" and rule.pattern == thread.sender_domain:
                 out.append(rule)

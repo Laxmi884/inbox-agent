@@ -252,3 +252,74 @@ def test_a_category_rule_never_retires_a_sender_rule():
                     created_at=datetime.now(timezone.utc)))
     assert len(s.matching(_one8())) == 1
     assert {r.id for r in s.rules() if not r.overridden} == {sender_rule.id, "r-cat"}
+
+
+# --- sender patterns across the two Thread.sender formats ---------------------
+# The two clients disagree about what Thread.sender holds. A snapshot thread
+# carries a bare address, 'no-reply@p.simplywall.st'; a live thread carries the
+# full From header, 'Simply Wall St <no-reply@p.simplywall.st>'. matching()
+# compared pattern == thread.sender.lower(), so every rule taught against the
+# snapshot was dead against the real mailbox - r-4d395834 sat there with 3 hits,
+# none of them live, silently deciding nothing.
+#
+# Normalising BOTH sides to the bare address would fix that and break something
+# worse. Four addresses in one 120-thread page send under multiple display
+# names: newsletters-noreply@linkedin.com is Forbes AND S&P Global AND a real
+# person, messaging-digest-noreply@linkedin.com is two different people. A rule
+# taught on Forbes would start deciding a person's mail.
+#
+# So the pattern's own shape says how wide it reaches. No display name means the
+# ADDRESS, whoever it claims to be - which is what every snapshot-taught rule
+# meant, having never had one. A display name means that identity, exactly.
+
+SWS_ADDR = "no-reply@p.simplywall.st"
+SWS_LIVE = "Simply Wall St <no-reply@p.simplywall.st>"
+
+
+def _sender_rule(pattern: str) -> Rule:
+    return Rule(id=f"r-{pattern[:6]}", scope="sender", pattern=pattern.lower(),
+                actions=[ActionTemplate(kind="trash")], provenance="owner corrected",
+                created_at=datetime.now(timezone.utc))
+
+
+def test_a_bare_address_rule_matches_a_live_full_header_sender():
+    """The simplywall.st rule, taught against the snapshot, must decide live mail."""
+    s = store()
+    s.add_rule(_sender_rule(SWS_ADDR))
+    assert len(s.matching(thread(sender=SWS_LIVE))) == 1
+
+
+def test_a_bare_address_rule_still_matches_a_bare_sender():
+    s = store()
+    s.add_rule(_sender_rule(SWS_ADDR))
+    assert len(s.matching(thread(sender=SWS_ADDR))) == 1
+
+
+def test_a_bare_address_rule_reaches_every_display_name_on_that_address():
+    """Deliberate: a pattern that names no identity cannot be asking for one."""
+    s = store()
+    s.add_rule(_sender_rule(SWS_ADDR))
+    assert len(s.matching(thread(sender=f"Simply Wall St Weekly <{SWS_ADDR}>"))) == 1
+
+
+def test_a_named_sender_rule_does_not_reach_another_name_on_one_address():
+    """The guard this whole design exists for. newsletters-noreply@linkedin.com
+    carries Forbes, S&P Global and a real person; a rule taught on one of them
+    must never decide the others."""
+    s = store()
+    s.add_rule(_sender_rule("forbes via linkedin <newsletters-noreply@linkedin.com>"))
+    assert s.matching(
+        thread(sender="Harnoor Saluja via LinkedIn <newsletters-noreply@linkedin.com>")) == []
+
+
+def test_a_named_sender_rule_still_matches_its_own_sender():
+    s = store()
+    s.add_rule(_sender_rule("forbes via linkedin <newsletters-noreply@linkedin.com>"))
+    assert len(s.matching(
+        thread(sender="Forbes via LinkedIn <newsletters-noreply@linkedin.com>"))) == 1
+
+
+def test_a_bare_address_rule_does_not_match_a_different_address():
+    s = store()
+    s.add_rule(_sender_rule(SWS_ADDR))
+    assert s.matching(thread(sender="Someone <no-reply@other.example>")) == []
