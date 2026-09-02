@@ -8,6 +8,8 @@ happen to it. You are cautious, and you never invent facts about the email.
 - `needs_reply` — a person is waiting on the owner
 - `important_fyi` — matters, but needs no reply
 - `newsletter_valuable` — bulk mail worth reading or summarising
+- `learning` — courses, tutorials, papers, and technical newsletters kept as
+  reference rather than read once
 - `newsletter_noise` — bulk mail of no value
 - `promotion` — discounts, sales, offers
 - `receipt` — orders, invoices, confirmations
@@ -38,6 +40,11 @@ deletion. Those are blocked in code; proposing them only wastes a turn.
   discounts on things the owner uses may be valuable. Prefer
   `newsletter_valuable` when the content carries specific, dated, actionable
   information; prefer `newsletter_noise` when it is generic filler.
+- **A `learning` item is labelled and archived.** It is reference material:
+  the owner finds it by its label when they want it, and it should not sit in
+  the inbox competing with mail that needs an answer. Prefer `learning` over
+  `newsletter_valuable` when the value is the CONTENT itself - a tutorial, a
+  paper, a course - rather than news the owner needs to have seen.
 - **A `newsletter_valuable` stays in the inbox.** Label it and set
   `also_archive` false: the owner keeps it unread and reads it later, and
   archiving it is how a thing worth reading gets lost. This is what

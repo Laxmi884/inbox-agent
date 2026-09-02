@@ -394,17 +394,29 @@ def test_a_stale_tap_says_so_instead_of_doing_nothing(bot):
     assert "/triage" in t.answered[-1]["text"]
 
 
-def test_a_button_with_no_behaviour_yet_says_that_too(bot):
-    """Asserted on approve_attention, the last button still waiting on a later
-    plan. It was `open` until `open` was built; the invariant is that a button
-    which cannot act says so rather than answering with silence, not that any
-    particular button stays unbuilt."""
+def test_every_button_on_the_digest_now_acts(bot):
+    """Was test_a_button_with_no_behaviour_yet_says_that_too, asserted on
+    approve_attention as the last unbuilt button. It is built, so there is no
+    inert button left to assert against and the old test asserted the opposite
+    of what the code now does.
+
+    The invariant it protected survives and is what is asserted here: a tap is
+    never answered with silence. That defect - a button that renders, does
+    nothing, and says nothing - is the one this UI has shipped three times, and
+    the reason it kept shipping is that verification called encode() instead of
+    pressing what was on the screen.
+    """
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
     for item in [review_item(f"a{i}", category="needs_reply") for i in range(2)]:
         b.held.add(item, run_id="r1", reason="needs_reply")
+    before = len(b.held.all())
     b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
-    assert t.answered[-1]["text"], "an inert button answered with silence"
+    # It acted...
+    assert len(b.held.all()) < before, "the button still does nothing"
+    # ...and it said so on the screen, not only in a toast that vanishes.
+    assert t.edited, "acted but left the screen unchanged"
+    assert "Approved" in t.edited[-1]["text"]
 
 
 def test_held_is_offered_in_the_help_text(bot):
@@ -839,3 +851,77 @@ def test_correcting_a_rule_decision_records_which_rule_it_overrode(bot):
     b.handle_update(cb(encode("teach_trash", 0, digest_id=b._digest_id)))
     rule = b.prefs.rules()[0]
     assert rule.supersedes == "r-old1234"
+
+
+# --- the attention-tier approve --------------------------------------------
+# Reported from a phone as "approve button is not working". It was not broken:
+# it was the one button knowingly left unbuilt, answering with a Telegram toast
+# that is trivially missed on a phone. The safety objection recorded against it
+# is already satisfied on the render side - render_tg.py filters the button's
+# set to ATTENTION_REASONS before it is ever offered - so it structurally cannot
+# reach trash or a low-confidence guess. Only the wiring was missing.
+
+def _held_of(b, reason, thread_id, kind="draft", label=None):
+    from inbox_agent.models import Action, HeldItem, ReviewItem
+    from datetime import datetime, timezone
+    b.held.add(ReviewItem(thread_id=thread_id, category=reason,
+                          subject=f"Subject {thread_id}",
+                          sender=f"{thread_id}@x.com", snippet="s",
+                          proposed=[Action(kind=kind, thread_id=thread_id,
+                                           params={"label": label} if label else {})],
+                          reason="r", confidence=0.9, source="model"),
+               run_id="r1", reason=reason)
+
+
+def test_approve_attention_executes_the_attention_tier(bot):
+    b, t, _ = bot
+    _held_of(b, "needs_reply", "t1")
+    _held_of(b, "security_alert", "t2")
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    before = len(b.held.all())
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+    assert len(b.held.all()) == before - 2, "attention items not drained"
+    assert "not built" not in t.edited[-1]["text"].lower()
+
+
+def test_approve_attention_leaves_the_authorisation_tier_alone(bot):
+    """The whole point of the two tiers. A blanket button that also approved a
+    trash or a low-confidence guess would rubber-stamp exactly the set the
+    partition exists to isolate."""
+    b, t, _ = bot
+    _held_of(b, "needs_reply", "t1")
+    _held_of(b, "trash", "t2", kind="trash")
+    _held_of(b, "low_confidence", "t3")
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+    left = {h.hold_reason for h in b.held.all()}
+    assert left == {"trash", "low_confidence"}, left
+
+
+def test_approve_attention_says_what_it_would_have_done(bot):
+    """Under dry-run it must never say 'done' for work that did not reach
+    Gmail - the same rule the digest's block title follows."""
+    b, t, _ = bot
+    _held_of(b, "needs_reply", "t1")
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    assert "Would have run" in text
+    assert "draft" in text
+
+
+def test_approve_attention_with_nothing_to_approve_says_so(bot):
+    b, t, _ = bot
+    _held_of(b, "trash", "t2", kind="trash")
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+    assert "nothing" in t.edited[-1]["text"].lower()
+    assert len(b.held.all()) == 1

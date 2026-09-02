@@ -86,6 +86,12 @@ class DoneItem:
     actions: list[tuple[str, Optional[str]]] = field(default_factory=list)
     # The digest's header counts these; here they are marked individually, so
     # "the rules you taught me" can be checked rather than taken on trust.
+    # Gmail's own preview of the thread, so the report says what the mail WAS
+    # and not only what happened to it. The snippet rather than a model-written
+    # summary on purpose: it is already on ReviewItem and already fetched, so it
+    # costs no tokens, no latency, and moves no figure in the model registry.
+    # It is also the literal opening of the mail, so it cannot be hallucinated.
+    snippet: str = ""
     from_rule: bool = False
     # WHICH rule, in the rule's own terms: "sender no-reply@x.com → trash".
     # `from_rule` alone said a rule decided it and refused to say which, and for
@@ -434,6 +440,11 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
         block = (f"{offset}. {_oneline(item.subject, _SUBJECT_CAP)}\n"
                  f"{_oneline(item.sender, _SENDER_CAP)}\n"
                  f"→ {_done_actions(item)}")
+        if item.snippet.strip():
+            # Appended before the budget check below, so a snippet can never
+            # push the message past Telegram's limit - it shrinks the page
+            # instead, which is what the budget has always done.
+            block += f"\n{_oneline(item.snippet, _SNIPPET_CAP)}"
         if item.rule_note:
             block += f"\n↳ your rule: {_oneline(item.rule_note, _ACTION_CAP + 40)}"
         elif item.from_rule:
@@ -483,6 +494,9 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
 
 
 _WHY_CAP = 300
+# Two lines on a phone. Gmail's snippets run to ~200 chars, which is three or
+# four lines and starts to bury the entries either side of it.
+_SNIPPET_CAP = 110
 
 
 def item_view(subject: str, sender: str, actions_text: str, why: str, *,

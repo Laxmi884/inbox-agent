@@ -26,7 +26,8 @@ from ..config import Settings
 from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
-from .render_tg import DigestView, DoneItem, digest, done_panel, item_view
+from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem, digest,
+                        done_panel, item_view)
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -230,7 +231,8 @@ class Bot:
                 proposal = known.get(thread_id, {})
                 item = DoneItem(thread_id=thread_id,
                                 subject=proposal.get("subject") or thread_id,
-                                sender=proposal.get("sender") or "")
+                                sender=proposal.get("sender") or "",
+                                snippet=proposal.get("snippet") or "")
                 rows[thread_id] = item
             item.actions.append((kind, label))
             actor = str(record.get("actor", ""))
@@ -368,6 +370,61 @@ class Bot:
             self.chat_id, self._message_id,
             f"{_short(item.item.subject)}\n{summary}\n\n{remaining} left waiting.",
             [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _approve_attention(self) -> None:
+        """Approve every held item in the attention tier, in one tap.
+
+        Reported from a phone as "the approve button is not working". It was not
+        broken - it was unbuilt, and answered with a Telegram toast, which on a
+        phone is a banner that vanishes. A button that looks dead and a button
+        that is dead are the same button to the person pressing it.
+
+        The objection recorded against building it was that a blanket approve
+        could rubber-stamp a trash or a low-confidence guess - exactly the set
+        the two-tier partition exists to isolate. That objection is already
+        answered on the render side: render_tg only offers this button over
+        items whose hold_reason is in ATTENTION_REASONS. This filters by the
+        same constant rather than trusting the caller, because a callback id is
+        attacker-reachable in principle and the deny-list is not the only thing
+        worth enforcing twice.
+
+        Everything goes through _execute_held, so it is the same chokepoint, the
+        same deny-list, the same dry-run skip and the same audit record as
+        approving items one at a time - with the actor recorded as `human`,
+        because it was.
+        """
+        queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
+        attention = [h for h in queue if h.hold_reason in ATTENTION_REASONS]
+        if not attention:
+            self._panel = self._panel_before_item or self._panel
+            self.transport.edit_message(
+                self.chat_id, self._message_id,
+                "Nothing in the attention tier to approve.\n\n"
+                f"{len(queue)} still waiting, all of them needing a decision "
+                "one at a time.",
+                [[("↩ Back to the digest",
+                   encode("list", digest_id=self._digest_id))]])
+            return
+
+        did: list[str] = []
+        for item in attention:
+            done = self._execute_held(item)
+            self.held.remove(item.thread_id)
+            if done:
+                did.append(f"{_short(item.item.subject)} → {done}")
+
+        # Never the word "done" for something that did not reach Gmail - the
+        # same rule the digest's block title follows, and the same reason: the
+        # banner saying dry_run is on is on a terminal, and this is on a phone.
+        verb = "Would have run" if self.settings.dry_run else "Ran"
+        remaining = len(self.held.all())
+        lines = [f"Approved {len(attention)}.", ""]
+        lines += [f"{verb}: {line}" for line in did] or ["Nothing to do."]
+        lines += ["", f"{remaining} left waiting."]
+        self.transport.edit_message(
+            self.chat_id, self._message_id, "\n".join(lines),
+            [[("↩ Back to the digest",
+               encode("list", digest_id=self._digest_id))]])
 
     def _execute_held(self, item) -> str:
         """Push one held item's proposed actions through the chokepoint.
@@ -695,10 +752,14 @@ class Bot:
         """Every path answers the callback, and says something when it refuses.
 
         Telegram spins the button until answerCallbackQuery arrives, and an
-        empty answer clears the spinner without saying anything. Both refusals
-        below - a stale digest, and a button whose behaviour is not built yet -
-        used to be silent, which is indistinguishable from a broken bot: the
-        owner taps again, and again, and then asks what the button is for.
+        empty answer clears the spinner without saying anything. A stale digest
+        used to refuse silently, which is indistinguishable from a broken bot:
+        the owner taps again, and again, and then asks what the button is for.
+
+        approve_attention was the other case and is no longer one - it acts now.
+        Its toast was reported from a phone as "the approve button is not
+        working", which is the lesson: on a phone a toast is a banner that
+        vanishes, so anything worth telling the owner belongs on the screen.
         """
         intent = decode(query.get("data", ""))
         answer = query.get("id", "")
@@ -759,11 +820,7 @@ class Bot:
             self._teach(wide=intent.kind == "scope_wide")
             return
         if intent.kind in ("approve_attention",):
-            # Plan 2 gives these their real behaviour. Say so rather than
-            # re-rendering an unchanged message, which Telegram rejects as
-            # unmodified and which therefore looks like nothing at all.
-            self._ack(answer, "Not built yet - approving the attention tier "
-                             "lands in the next step.")
+            self._approve_attention()
             return
 
     # --- the interrupt path -------------------------------------------------

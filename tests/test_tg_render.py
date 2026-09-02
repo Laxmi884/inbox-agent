@@ -650,3 +650,48 @@ def test_the_rule_replaces_the_why_rather_than_repeating_it():
 def test_the_item_view_omits_the_rule_line_when_the_model_decided():
     text, _ = item_view(**view_args())
     assert "Rule:" not in text
+
+
+# --- a snippet under each done entry ----------------------------------------
+# Asked for on a phone: "in done items can i get short summary in 2 or 3 lines".
+# Taken from the snippet rather than a model-written summary, because the
+# snippet is already on ReviewItem and already fetched - it costs no tokens, no
+# latency, and does not move a single figure in the model registry.
+
+def _done_view(**kw):
+    from inbox_agent.telegram.render_tg import DoneItem
+    item = DoneItem(thread_id="t1", subject="Lyft is hiring a Data Analyst",
+                    sender="LinkedIn Job Alerts <jobalerts@linkedin.com>",
+                    actions=[("archive", None)], **kw)
+    return done_view([item])
+
+
+def test_the_done_panel_shows_the_snippet():
+    text, _ = done_panel(_done_view(snippet="Your job alert for data analyst "
+                                            "in North York. New jobs match."))
+    assert "Your job alert for data analyst" in text
+
+
+def test_a_done_entry_without_a_snippet_renders_unchanged():
+    """Older runs, and anything the join could not resolve, must not render a
+    blank line where the summary would go."""
+    text, _ = done_panel(_done_view(snippet=""))
+    assert "\n\n\n" not in text
+    assert "Lyft is hiring" in text
+
+
+def test_the_snippet_is_capped_to_about_two_lines():
+    text, _ = done_panel(_done_view(snippet="x" * 400))
+    body = [l for l in text.splitlines() if l.startswith("x")]
+    assert body and len(body[0]) <= 120, len(body[0]) if body else 0
+
+
+def test_the_snippet_never_pushes_the_panel_past_telegrams_limit():
+    """The byte budget already shrinks the page rather than truncating mid-word.
+    Adding a snippet per entry must go through that same budget."""
+    from inbox_agent.telegram.render_tg import DoneItem
+    items = [DoneItem(thread_id=f"t{i}", subject="S" * 70, sender="a@b.com" * 6,
+                      actions=[("label", "recruiter"), ("archive", None)],
+                      snippet="y" * 200) for i in range(40)]
+    text, _ = done_panel(done_view(items))
+    assert len(text) <= 4096
