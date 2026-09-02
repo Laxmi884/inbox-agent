@@ -268,9 +268,12 @@ existing `mask()` for secrets), and source. It flags:
 - **⚠ override** — an environment value shadowing a *different* `.env` value.
   This is 1.4, made visible in one line.
 - **⚠ OAuth expiry** — `google_auth.py:52` documents that Google revokes the
-  refresh token of an External app in Testing after exactly seven days. Doctor
-  reports the token file's age and the projected revocation date, so the death
-  is predicted rather than discovered.
+  refresh token of an External app in Testing after exactly seven days. The
+  seven days run from **consent**, and nothing currently records when that
+  happened: `token.json`'s `expiry` field is the *access* token's hour-long
+  lifetime, and `_write_token` rewrites the whole file on every refresh, so its
+  mtime tracks the last refresh instead. Doctor therefore needs a fact that does
+  not exist yet — see 4.1.
 - **⚠ policy drift** — `Policy.drifted` already carries this; doctor surfaces it
   alongside the source.
 - **⚠ degraded embeddings** — `INBOX_EMBEDDINGS=auto` that resolved to `none`
@@ -282,6 +285,32 @@ existing `mask()` for secrets), and source. It flags:
 
 Exit code is non-zero when any fatal is present, so Project 2 can use it as a
 launchd pre-flight check.
+
+### 4.1 Recording when consent happened
+
+A sidecar beside the token, `<token>.consent.json`, holding one field:
+
+```json
+{"consented_at": "2026-09-01T22:37:00Z"}
+```
+
+A sidecar rather than a key inside `token.json`, because that file's schema
+belongs to `google-auth` — it is produced by `creds.to_json()` and consumed by
+`Credentials.from_authorized_user_file`, and adding a foreign key to it invites
+a breakage on a library upgrade for no benefit.
+
+`google_auth.get_credentials` has two write paths and they must behave
+differently: the **consent** path stamps the sidecar with the current time; the
+**refresh** path leaves it alone. Stamping on refresh would reset a clock that
+Google does not reset, which is worse than not tracking it at all — it would
+promise six more days on the morning the token dies.
+
+For a token that predates this, the sidecar is absent and doctor says
+`consent date unknown - re-consent to start tracking` rather than guessing.
+**The token on this machine is such a token**, so the first useful warning
+arrives after the next consent. That is the correct trade: an invented date
+would produce a confident wrong prediction, which is the failure mode this
+whole spec keeps arguing against.
 
 ## 5. README and remote
 
