@@ -730,3 +730,63 @@ def test_the_rewritten_reason_says_it_was_the_owners_rule(wiring):
     reason = Decision.model_validate(out["decisions"][0]).reason
     assert "your rule" in reason.lower()
     assert "promotion" in reason
+
+
+# --- a run's verdict supersedes what an earlier run held ---------------------
+
+def test_a_rerun_that_stops_holding_a_thread_clears_the_stale_held_entry(wiring):
+    """Found on a live phone, and dangerous.
+
+    A LangChain workshop was held as `promotion` -> trash. The policy was
+    corrected, the SAME thread re-triaged, the model returned `learning` ->
+    label, and it was auto-executed. The stale trash entry stayed in the queue,
+    so the digest showed one thread twice with contradictory verdicts - and
+    approving the stale one would have trashed a thread the agent had just
+    filed as learning material, executing a proposal the agent itself had
+    superseded.
+
+    The queue outliving runs is the design. Nothing reconciling it against a
+    newer verdict was the bug.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    # Run 1: trash, which is held for authorisation.
+    wiring["llm"] = FakeLLM(ThreadJudgment(
+        category="promotion", action="trash", label=None,
+        reason="worthless", confidence=1.0))
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-1"}})
+    assert [h.thread_id for h in wiring["held"].all()] == ["t1"]
+    assert wiring["held"].all()[0].item.category == "promotion"
+
+    # Run 2, same thread: now a confident label, which auto-executes.
+    wiring["llm"] = FakeLLM(ThreadJudgment(
+        category="learning", action="label", label="learning",
+        reason="a technical workshop", confidence=1.0))
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-2"}})
+    assert wiring["held"].all() == [], (
+        "the superseded trash proposal is still in the queue; the digest would "
+        "show this thread twice and approving it would trash it")
+
+
+def test_a_thread_the_rerun_never_saw_stays_held(wiring):
+    """The carry-over the persistent queue exists for. Only threads a run
+    actually processed may have their held entry superseded - otherwise a
+    /triage of 10 would silently empty a queue holding 40."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    from inbox_agent.models import Action, ReviewItem
+
+    wiring["held"].add(
+        ReviewItem(thread_id="not-in-this-run", category="promotion",
+                   subject="Older", sender="old@x.com", snippet="s",
+                   proposed=[Action(kind="trash", thread_id="not-in-this-run")],
+                   reason="r", confidence=1.0, source="model"),
+        run_id="r0", reason="trash")
+
+    wiring["llm"] = FakeLLM(ThreadJudgment(
+        category="learning", action="label", label="learning",
+        reason="a workshop", confidence=1.0))
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-1"}})
+    assert [h.thread_id for h in wiring["held"].all()] == ["not-in-this-run"]

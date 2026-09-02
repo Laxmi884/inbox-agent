@@ -345,7 +345,28 @@ def build_graph(
         return {"executed": executed, "refused": refused}
 
     def enqueue_held(state: TriageState) -> dict:
+        """Persist this run's held items, and retire what it superseded.
+
+        The queue outliving runs is the point (Plan 1): an item waits until the
+        owner rules on it, not until the run ends. But a thread this run
+        processed and did NOT hold has been re-judged, and the older verdict is
+        dead. Leaving it queued put one thread in the digest twice with
+        contradictory proposals - seen live, where a LangChain workshop held as
+        `promotion -> trash` was re-classified `learning -> label` and
+        auto-executed, while the trash entry stayed on screen. Approving that
+        entry would have trashed a thread the agent had just filed as learning
+        material: executing a proposal the agent itself had superseded.
+
+        Scoped to `auto`, never to the whole queue. A /triage of 10 must not
+        empty a queue holding 40 - threads this run never fetched are exactly
+        the carry-over the queue exists for.
+        """
         run_id = ReviewRequest.model_validate(state["review"]).run_id
+        for raw in state.get("auto", []):
+            thread_id = raw.get("thread_id") if isinstance(raw, dict) else None
+            if thread_id:
+                # Absent is not an error, and most of these were never held.
+                held.remove(thread_id)
         for raw in state.get("held", []):
             held.add(ReviewItem.model_validate(raw["item"]),
                      run_id=run_id, reason=raw["reason"])

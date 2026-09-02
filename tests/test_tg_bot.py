@@ -875,9 +875,12 @@ def _held_of(b, reason, thread_id, kind="draft", label=None):
 
 def test_approve_attention_executes_the_attention_tier(bot):
     b, t, _ = bot
-    _held_of(b, "needs_reply", "t1")
-    _held_of(b, "security_alert", "t2")
     b.handle_update(msg("/triage 4"))
+    # Seeded AFTER the run: a held entry for a thread the run itself processed
+    # is now retired as superseded, which is the point of
+    # test_a_rerun_that_stops_holding_a_thread_clears_the_stale_held_entry.
+    _held_of(b, "needs_reply", "h1")
+    _held_of(b, "security_alert", "h2")
     _done_run(b)
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     before = len(b.held.all())
@@ -891,10 +894,10 @@ def test_approve_attention_leaves_the_authorisation_tier_alone(bot):
     trash or a low-confidence guess would rubber-stamp exactly the set the
     partition exists to isolate."""
     b, t, _ = bot
-    _held_of(b, "needs_reply", "t1")
-    _held_of(b, "trash", "t2", kind="trash")
-    _held_of(b, "low_confidence", "t3")
     b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "h1")
+    _held_of(b, "trash", "h2", kind="trash")
+    _held_of(b, "low_confidence", "h3")
     _done_run(b)
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
@@ -906,8 +909,8 @@ def test_approve_attention_says_what_it_would_have_done(bot):
     """Under dry-run it must never say 'done' for work that did not reach
     Gmail - the same rule the digest's block title follows."""
     b, t, _ = bot
-    _held_of(b, "needs_reply", "t1")
     b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "h1")
     _done_run(b)
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
@@ -918,8 +921,8 @@ def test_approve_attention_says_what_it_would_have_done(bot):
 
 def test_approve_attention_with_nothing_to_approve_says_so(bot):
     b, t, _ = bot
-    _held_of(b, "trash", "t2", kind="trash")
     b.handle_update(msg("/triage 4"))
+    _held_of(b, "trash", "h2", kind="trash")
     _done_run(b)
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))

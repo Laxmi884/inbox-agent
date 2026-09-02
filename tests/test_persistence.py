@@ -118,3 +118,59 @@ def test_the_directory_is_created_rather_than_demanded(db):
     assert not db.parent.exists()
     open_store(db).conn.close()
     assert db.exists()
+
+
+# --- a run's verdict supersedes what it held before ---------------------------
+# Found on a live phone. A LangChain workshop was held as promotion -> trash.
+# The policy was corrected, the SAME thread was re-triaged, the model returned
+# learning -> label, and it was auto-executed. The stale trash entry stayed in
+# the queue: the digest then showed one thread twice with contradictory
+# verdicts, and approving the stale one would have trashed a thread the agent
+# had just filed as learning material - executing a proposal the agent itself
+# had superseded.
+#
+# The queue outliving runs is the design (Plan 1). Nothing reconciling it
+# against a newer verdict was the bug.
+
+def test_a_rerun_that_no_longer_holds_a_thread_drops_the_stale_entry(tmp_path):
+    from inbox_agent.models import Action, ReviewItem
+    from inbox_agent.store import HeldQueue, open_store
+
+    q = HeldQueue(open_store(tmp_path / "held.sqlite"))
+    stale = ReviewItem(thread_id="t1", category="promotion", subject="Workshop",
+                       sender="hello@mail.langchain.com", snippet="s",
+                       proposed=[Action(kind="trash", thread_id="t1")],
+                       reason="promotional", confidence=1.0, source="model")
+    q.add(stale, run_id="r1", reason="trash")
+    assert len(q.all()) == 1
+
+    # Run 2 decides the same thread needs no holding at all.
+    q.remove("t1")
+    assert q.all() == []
+
+
+def test_removing_a_thread_that_was_never_held_is_not_an_error(tmp_path):
+    """The reconciliation runs over every auto-executed thread, and most of
+    them were never in the queue."""
+    from inbox_agent.store import HeldQueue, open_store
+
+    q = HeldQueue(open_store(tmp_path / "held.sqlite"))
+    q.remove("never-seen")          # must not raise
+    assert q.all() == []
+
+
+def test_a_thread_this_run_did_not_touch_stays_held(tmp_path):
+    """The carry-over the persistent queue exists for. Only threads the run
+    actually processed may have their held entry superseded."""
+    from inbox_agent.models import Action, ReviewItem
+    from inbox_agent.store import HeldQueue, open_store
+
+    q = HeldQueue(open_store(tmp_path / "held.sqlite"))
+    for tid in ("t1", "t2"):
+        q.add(ReviewItem(thread_id=tid, category="promotion", subject=tid,
+                         sender=f"{tid}@x.com", snippet="s",
+                         proposed=[Action(kind="trash", thread_id=tid)],
+                         reason="r", confidence=1.0, source="model"),
+              run_id="r1", reason="trash")
+    q.remove("t1")                  # only t1 was re-processed
+    assert [h.thread_id for h in q.all()] == ["t2"]
