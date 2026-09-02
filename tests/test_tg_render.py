@@ -202,16 +202,16 @@ def test_a_section_count_is_the_whole_section_not_just_this_page():
     first, _ = digest(view(items), page=0)
     second, _ = digest(view(items), page=1)
 
-    assert "🗑 TRASH — needs your OK (5 of 8)" in first
+    assert "🗑 TRASH — approve one at a time (5 of 8)" in first
     assert "🔒 SECURITY (3 of 5)" in first
-    assert "🗑 TRASH — needs your OK (3 of 8)" in second
+    assert "🗑 TRASH — approve one at a time (3 of 8)" in second
     assert "🔒 SECURITY (2 of 5)" in second
 
 
 def test_a_section_shown_whole_reports_a_plain_count():
     """"(2 of 2)" would be noise on the common case - one page, nothing hidden."""
     text, _ = digest(view([held("t1", "trash"), held("t2", "trash")]))
-    assert "🗑 TRASH — needs your OK (2)" in text
+    assert "🗑 TRASH — approve one at a time (2)" in text
 
 
 def test_an_out_of_range_page_clamps_rather_than_raising():
@@ -695,3 +695,42 @@ def test_the_snippet_never_pushes_the_panel_past_telegrams_limit():
                       snippet="y" * 200) for i in range(40)]
     text, _ = done_panel(done_view(items))
     assert len(text) <= 4096
+
+
+# --- saying which items the one-tap button cannot reach ----------------------
+# Asked on a phone, holding a digest with 8 held items and a button reading
+# "Approve 2 replies & alerts": "is this expected?" It was - the button covers
+# ATTENTION_REASONS and the other 6 were trash, which needs individual
+# authorisation. But nothing on the screen said so, and the owner had to ask.
+# A correct design the owner cannot read is not yet a finished design.
+
+def test_the_trash_heading_says_it_needs_approving_one_at_a_time():
+    text, _ = digest(view(held_items=[
+        held("t1", "trash"), held("t2", "trash")]))
+    trash_heading = [l for l in text.splitlines() if "TRASH" in l][0]
+    assert "one at a time" in trash_heading or "individually" in trash_heading
+
+
+def test_the_digest_says_how_many_the_one_tap_button_cannot_cover():
+    """The exact question asked from the phone."""
+    text, _ = digest(view(held_items=[
+        held("t1", "security_alert"), held("t2", "needs_reply"),
+        held("t3", "trash"), held("t4", "trash"), held("t5", "trash")]))
+    assert "3 more" in text
+    assert "one at a time" in text.lower() or "individually" in text.lower()
+
+
+def test_no_footnote_when_the_button_covers_everything():
+    """Nothing to explain, so nothing is said. A line that always appears stops
+    being read."""
+    text, _ = digest(view(held_items=[
+        held("t1", "security_alert"), held("t2", "needs_reply")]))
+    assert "more need" not in text.lower()
+
+
+def test_no_footnote_when_there_is_no_one_tap_button_at_all():
+    """With nothing in the attention tier the button is not drawn, so there is
+    no split to explain - every item is individual and the numbered buttons
+    already say that."""
+    text, _ = digest(view(held_items=[held("t1", "trash"), held("t2", "trash")]))
+    assert "more need" not in text.lower()

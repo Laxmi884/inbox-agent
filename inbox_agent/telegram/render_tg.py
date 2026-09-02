@@ -39,7 +39,12 @@ DONE_PAGE_SIZE = HELD_PAGE_SIZE
 # Section order is hold-reason precedence order, so the most consequential
 # things are nearest the top of the message where they are read first.
 SECTIONS: tuple[tuple[str, str], ...] = (
-    ("trash", "🗑 TRASH — needs your OK"),
+    # "one at a time" rather than just "needs your OK": the one-tap button
+    # below covers ATTENTION_REASONS only, and an owner holding a digest with
+    # two alerts and six trash proposals read "Approve 2" as the button being
+    # broken. The heading is where that is answered while the items are being
+    # read; the footnote under the button answers it again while deciding.
+    ("trash", "🗑 TRASH — approve one at a time"),
     ("needs_reply", "✉️ NEEDS REPLY"),
     ("security_alert", "🔒 SECURITY"),
     ("low_confidence", "❓ NOT SURE"),
@@ -319,6 +324,17 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     if len(shown) < len(window):
         lines.append("")
         lines.append(_OVERFLOW % (len(window) - len(shown)))
+
+    # Said only when there IS a split to explain: with nothing in the attention
+    # tier no one-tap button is drawn, and with nothing outside it the button
+    # covers everything. A line that always appears stops being read.
+    attention_total = sum(1 for h in ordered if h.hold_reason in ATTENTION_REASONS)
+    individual_total = len(ordered) - attention_total
+    if attention_total and individual_total:
+        lines.append("")
+        lines.append(f"The button below covers the {attention_total} in the "
+                     f"attention tier. {individual_total} more need approving "
+                     f"one at a time — tap a number.")
     lines += tail
 
     # Belt and braces on a hard protocol limit. The budget above should already
@@ -345,6 +361,7 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
                           encode("done", digest_id=view.digest_id))])
 
     attention = [h for h in ordered if h.hold_reason in ATTENTION_REASONS]
+    individual = len(ordered) - len(attention)
     if attention:
         # Attention tier only. A blanket button that could reach trash or a
         # low-confidence guess would rubber-stamp exactly the set this design
