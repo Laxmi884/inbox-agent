@@ -2326,7 +2326,7 @@ make that claim."
 
 ---
 
-### Task 9: Live rollout
+### Task 9: Live rollout  ◑ steps 1-3, 5-6 done; step 4 needs the owner's phone
 
 Not code. A green suite is not evidence the thing works — the four defects that mattered most on the last branch were invisible to 295 passing tests and obvious within one real run. **Do not merge before this task is complete.**
 
@@ -2340,7 +2340,7 @@ Not code. A green suite is not evidence the thing works — the four defects tha
 
 **Prerequisite, and it is the human's to do.** In the Google Cloud Console: create a project; APIs & Services → Library → enable the **Gmail API**; OAuth consent screen → External, add yourself, **publishing status "In production"**; Credentials → OAuth client ID → **Desktop app**; download and save to `secrets/credentials.json`. Without this, everything below fails at step 1 and nothing else can be verified.
 
-- [ ] **Step 1: Authenticate once**
+- [x] **Step 1: Authenticate once**
 
 ```bash
 INBOX_GMAIL=live python -c "
@@ -2354,7 +2354,7 @@ Expected: a browser opens once for consent; `secrets/token.json` is written; pri
 
 Confirm: `ls -l secrets/token.json` shows mode `-rw-------`, and `git status --porcelain secrets/` prints nothing.
 
-- [ ] **Step 2: Read the real inbox, dry-run on**
+- [x] **Step 2: Read the real inbox, dry-run on**
 
 ```bash
 INBOX_GMAIL=live INBOX_DRY_RUN=true python -c "
@@ -2374,7 +2374,7 @@ Confirm all four, and stop if any fails:
 - `body` is non-zero for most threads — this is the first proof the MIME walk works on real mail;
 - `date` parsed to ISO.
 
-- [ ] **Step 3: Confirm the triaged label is created exactly once**
+- [x] **Step 3: Confirm the triaged label is created exactly once**
 
 ```bash
 INBOX_GMAIL=live python -c "
@@ -2406,11 +2406,11 @@ Confirm the banner shows `gmail : live   <- THE REAL MAILBOX` and `dry_run : Tru
   `tail -50 inbox_agent/audit.jsonl | grep -c '"result": "simulated"'` should equal the record count;
 - nothing in Gmail changed: the threads are still unread and still in the inbox.
 
-- [ ] **Step 5: Record what the run showed**
+- [x] **Step 5: Record what the run showed**
 
 Append a `## 8. First live run` section to the spec with: the date, thread count, how many bodies were non-empty, the observed body-length distribution, and **every defect found**. If nothing was found, say that — with what was checked.
 
-- [ ] **Step 6: Commit the findings**
+- [x] **Step 6: Commit the findings**
 
 ```bash
 git add docs/superpowers/specs/2026-09-01-live-gmail-design.md
