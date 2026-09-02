@@ -143,3 +143,50 @@ def test_a_demoted_rule_is_kept_not_deleted():
         prefs.record_hit(r.id)
         prefs.record_override(r.id)
     assert any(x.id == r.id for x in prefs.rules())
+
+
+# --- what a correction overrode --------------------------------------------
+# `record_override` bumps an integer and nothing records WHAT the owner wanted
+# instead, so a rule wrong the same way four times is indistinguishable from a
+# rule wrong four different ways. The first should converge on the corrected
+# action; the second should die. Both currently die, at MIN_HITS_BEFORE_DEMOTION.
+#
+# The replacement action IS captured - on the new rule - but nothing joins the
+# new rule back to the one it replaced, so the pairing is unrecoverable after
+# the fact. `supersedes` records the join at the only moment it is known.
+
+def test_a_correction_records_which_rule_it_overrode():
+    r = rule_from_correction(thread(), [ActionTemplate(kind="label", params={"label": "job_alerts"})],
+                             "corrected", supersedes="r-old1234")
+    assert r.supersedes == "r-old1234"
+
+
+def test_a_correction_of_a_model_decision_supersedes_nothing():
+    """Only a rule can be overridden. A correction of the model's own judgement
+    has no prior rule to point at, and must not invent one."""
+    r = rule_from_correction(thread(), [ActionTemplate(kind="archive")], "corrected")
+    assert r.supersedes is None
+
+
+def test_rules_stored_before_supersedes_existed_still_load():
+    """Real rules are on disk. A new required field would make them unloadable."""
+    legacy = {"id": "r-old", "scope": "sender", "pattern": "a@b.com",
+              "actions": [{"kind": "archive", "params": {}}], "provenance": "note",
+              "created_at": "2026-09-01T00:00:00Z"}
+    assert Rule.model_validate(legacy).supersedes is None
+
+
+def test_learn_from_response_links_the_new_rule_to_the_one_it_overrode():
+    """The interrupt path learns too, and has the overriding rule id in the
+    proposal it is correcting."""
+    from inbox_agent.graph import learn_from_response
+    from inbox_agent.models import ReviewResponse
+
+    prefs = PreferenceStore(build_store())
+    response = ReviewResponse(decisions={"t1": "reject"})
+    proposals = [{"thread_id": "t1", "actions": [{"kind": "archive"}],
+                  "rule_id": "r-old1234", "source": "rule"}]
+    learned, _ = learn_from_response(response, [thread()], prefs, proposals)
+    assert learned
+    stored = [r for r in prefs.rules() if r.id == learned[0]][0]
+    assert stored.supersedes == "r-old1234"

@@ -824,3 +824,18 @@ def test_a_deleted_rule_does_not_break_the_item_view(bot):
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
     assert t.edited[-1]["text"]
+
+
+def test_correcting_a_rule_decision_records_which_rule_it_overrode(bot):
+    """`record_override` already bumps the old rule's counter. What was missing
+    is the join: which correction produced which replacement. Without it a
+    future vote-distribution over corrections cannot be reconstructed from the
+    rules the owner is teaching now - the pairing is only knowable here."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actor="rule:r-old1234")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("teach_trash", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert rule.supersedes == "r-old1234"

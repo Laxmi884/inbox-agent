@@ -102,6 +102,17 @@ class Rule(BaseModel):
     # `overridden` boolean could only say "someone disagreed once", which is not
     # enough to tell a slightly-wrong rule from a broken one.
     override_count: int = 0
+    # The rule this one was taught to replace, when the correction that created
+    # it was a correction OF a rule. `override_count` says THAT the owner
+    # disagreed; this says which rule they disagreed with, and this rule's
+    # `actions` say what they wanted instead. The three together are a vote:
+    # four corrections all replacing `archive` with `label` mean "keep the
+    # scope, change the action", while four corrections replacing it with four
+    # different things mean the rule is genuinely unsound. Nothing consumes
+    # this yet - demotion is still the scalar count - but the pairing is only
+    # knowable at correction time, so not recording it now would make the
+    # distinction unrecoverable from rules taught in the meantime.
+    supersedes: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod

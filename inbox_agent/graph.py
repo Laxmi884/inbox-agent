@@ -95,6 +95,9 @@ def learn_from_response(
     # rejected rather than just that something was.
     by_decision = {d.get("thread_id"): (d.get("actions") or [{}])[0].get("kind")
                    for d in (proposals or [])}
+    # Which rule decided each thread, so a correction can name what it replaces.
+    # None for anything the model judged itself - there is no rule to supersede.
+    by_rule = {d.get("thread_id"): d.get("rule_id") for d in (proposals or [])}
     learned: list[str] = []
     skipped: list[dict] = []
 
@@ -135,7 +138,8 @@ def learn_from_response(
         params = dict(edits[0].params) if edits else {}
         rule = rule_from_correction(by_id[thread_id],
                                     [ActionTemplate(kind=kind, params=params)], note,
-                                    rejected=rejected, corpus=threads)
+                                    rejected=rejected, corpus=threads,
+                                    supersedes=by_rule.get(thread_id))
         prefs.add_rule(rule)
         learned.append(rule.id)
 

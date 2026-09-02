@@ -356,7 +356,7 @@ class Bot:
                                           sender=item.item.sender)),
                 [ActionTemplate(kind="none")],
                 f"owner refused {proposed} on {item.item.subject[:50]!r}",
-                rejected=proposed)
+                rejected=proposed, supersedes=item.item.rule_id)
             self.prefs.add_rule(rule)
             summary = (f"Left alone. Learned: {rule.scope} {rule.pattern} "
                        f"→ {rule.summary}.")
@@ -513,17 +513,24 @@ class Bot:
         category = pending["category"]
         actions = pending["actions"]
 
+        # Guarded exactly as record_override is below, and for the same reason:
+        # only a rule can be superseded, so a correction of the model's own
+        # judgement must not name one.
+        superseded = pending.get("rule_id") if item.from_rule else None
+
         if wide:
             rule = Rule(id=f"r-{uuid.uuid4().hex[:8]}", scope="category",
                         pattern=category, actions=actions,
                         provenance=f"owner corrected {item.subject[:60]!r}",
-                        created_at=datetime.now(timezone.utc))
+                        created_at=datetime.now(timezone.utc),
+                        supersedes=superseded)
             self.prefs.add_rule(rule)
             reach = f"every {category}"
         else:
             thread = self._thread_for(item)
             rule = rule_from_correction(
-                thread, actions, f"owner corrected {item.subject[:60]!r}")
+                thread, actions, f"owner corrected {item.subject[:60]!r}",
+                supersedes=superseded)
             self.prefs.add_rule(rule)
             reach = f"{rule.scope} {rule.pattern}"
 
@@ -531,8 +538,8 @@ class Bot:
         # This is the caller record_override has been waiting for since it was
         # written; without it precision never moves and a bad rule is never
         # demoted, however often it is corrected.
-        if item.from_rule and pending.get("rule_id"):
-            self.prefs.record_override(pending["rule_id"])
+        if superseded:
+            self.prefs.record_override(superseded)
 
         extra = (" I will do that without asking again, because a rule you "
                  "taught is your own instruction." if pending["verdict"] == "teach_trash"

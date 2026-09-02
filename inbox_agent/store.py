@@ -169,7 +169,8 @@ def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None
 
 def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: str,
                          *, rejected: Optional[ActionKind] = None,
-                         corpus: Optional[list[Thread]] = None) -> Rule:
+                         corpus: Optional[list[Thread]] = None,
+                         supersedes: Optional[str] = None) -> Rule:
     """Turn one human correction into a durable, attributable rule.
 
     `actions` is the sequence to take next time, not a single kind: the
@@ -180,6 +181,10 @@ def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: st
     `rejected` records a bare "not this" - a reject with no replacement. The
     spec counts every reject OR edit as a candidate rule; only edits used to
     produce one, so a Skip taught nothing at all.
+
+    `supersedes` names the rule being corrected, when there is one. Keyword-only
+    and defaulted: a correction of the model's own judgement overrides no rule,
+    and every existing caller passes three positional arguments.
     """
     scope, pattern = choose_scope(thread, corpus)
     return Rule(
@@ -188,6 +193,7 @@ def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: st
         pattern=pattern,
         actions=list(actions),
         rejected_action=rejected,
+        supersedes=supersedes,
         provenance=note,
         created_at=datetime.now(timezone.utc),
     )
