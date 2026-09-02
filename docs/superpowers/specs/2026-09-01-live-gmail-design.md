@@ -233,20 +233,58 @@ comparison needs no second fetch over 21,058 threads.
 Bodies reach disk via the held queue. `.gitignore` already covers
 `inbox_agent/store/` and `*.sqlite`.
 
-### 2.5 The MCP server wraps our client, and shares the chokepoint
+### 2.5 Stage B evaluates Google's official MCP server; we do not write one
 
-`inbox_agent/mcp_server.py`, FastMCP over stdio, seven tools mirroring the
-protocol. `fastmcp 2.14.7` is already installed.
+**Revised.** This section previously specified `inbox_agent/mcp_server.py`, a
+FastMCP surface over our own client, on the reasoning that a server whose tool
+list is ours dodges 2.1's objection to third-party servers. Google publishes an
+official remote Gmail MCP server, which changes the build-versus-adopt call.
 
-The load-bearing detail: **mutating tools route through `execute_action`**, so
-the deny-list and the audit log apply identically. The MCP surface is an
-alternative caller of the chokepoint, never a bypass. `send_message` is not
-advertised because it was never written — 2.1's objection to a third-party
-server does not apply to a server whose tool list is ours.
+`https://gmailmcp.googleapis.com/mcp/v1`, Google-hosted, Developer Preview.
+Ten tools: `search_threads`, `get_thread`, `get_message`, `label_thread`,
+`label_message`, `unlabel_thread`, `unlabel_message`, `create_draft`,
+`list_drafts`, `list_labels`.
 
-Not imported by the digest path. It exists so Stage B has a proven transport,
-and so this mailbox can be driven by an external client under this project's
-policy rather than a generic connector's.
+**2.1's objection does not apply to it.** It advertises neither `send_message`
+nor any trash or delete verb, so there is no forbidden tool to filter out. It is
+a read-and-label surface.
+
+**Which is why it is right for Stage B and wrong for Plan 1.** Against our seven
+methods it covers six — `archive` via `unlabel_thread("INBOX")`, unverified —
+and is missing `trash`. Trash is not incidental here: it is the top of the
+autonomy ladder, the sole occupant of the authorisation tier by 2.6's own
+partition, has its own `teach_trash` verdict in the bot, and is the rule the
+owner actually proved end to end on a phone. A Plan 1 client that cannot trash
+would remove a tier the digest was designed around.
+
+For Stage B the missing verbs invert into a virtue: a model exploring
+autonomously over a surface that structurally cannot send or destroy is a better
+sandbox than one we would have to keep safe ourselves.
+
+Three further findings, recorded so this is not re-litigated:
+
+- **It does not avoid the OAuth setup; it adds to it.** Own Cloud project, own
+  OAuth client, own consent screen — plus enabling the Gmail MCP API, plus
+  joining the Workspace Developer Preview Program. Section 3.0's credentials
+  work is required either way.
+- **Developer Preview, not GA.** The point of running Stage A live is to collect
+  measurements. Measurements taken against an API that can change or be
+  withdrawn underneath them are worth less.
+- **It is itself a wrapper over the Gmail API.** Reaching it costs token
+  management (as direct) plus an MCP client, JSON-RPC, and tool-call
+  marshalling, on a boundary where 2.1 established no model sits.
+
+One asymmetry worth keeping in view: Google's own documentation leads with
+indirect prompt injection and instructs callers to screen content, because MCP
+assumes a model holds these tools with mail content in its context. Stage A does
+not — `_fence` (`classify.py:216`) treats bodies as untrusted data and the model
+emits only a structured judgement, while deterministic code acts. **Stage B is
+where that stops being true**, and Google's warning starts applying to us at the
+same moment we would adopt their server.
+
+Plan 3 therefore becomes an evaluation, not a build. Open questions for it:
+whether `unlabel_thread` accepts the `INBOX` system label, and whether Developer
+Preview enrolment has an approval delay.
 
 ### 2.6 `/backlog` is a deterministic bulk archive, with no model in it
 
@@ -409,9 +447,10 @@ together:
    confirmation, and `messages.batchModify` paging. Needs plan 1's client and
    nothing else. Roughly 56 API calls and no model, so it is verifiable in one
    sitting.
-3. **The MCP surface** — `mcp_server.py` over the client from plan 1, routed
-   through `execute_action`. Independently verifiable and independently
-   revertable.
+3. **The MCP evaluation** — per the revised 2.5, assess Google's official
+   `gmailmcp.googleapis.com` for Stage B rather than building a FastMCP surface.
+   Independently verifiable, and now mostly a spike rather than an
+   implementation.
 
 Plan 1 is on the critical path to the milestone. Plan 2 is the one-time cleanup
 and should not run until plan 1's rollout has proven the client against live
@@ -429,8 +468,8 @@ mailbox result, and means the rollout in section 5 has one subject at a time.
   otherwise.
 - Bodies in the prompt. The budget defaults to 0; turning it up is step 5's
   outcome, not this spec's.
-- Stage B tool-calling. The MCP server is the transport; the agent that uses it
-  is later work.
+- Stage B tool-calling. Per 2.5 the transport is likely Google's official MCP
+  server; the agent that uses it is later work either way.
 - Incremental sync via `history.list`. Every run re-queries. At `/triage` scale
   that is one API call, and `agent/triaged` already does the deduplication that
   a history cursor would.
