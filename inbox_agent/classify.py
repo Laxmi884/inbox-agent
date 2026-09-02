@@ -279,6 +279,25 @@ def build_prompt(thread: Thread, policy: Policy, instructions=None,
     return [system, human]
 
 
+# Categories the agent files without asking, and may therefore also mark read.
+#
+# archive() removes INBOX and nothing else, so filed mail stayed UNREAD: out of
+# the inbox but still inflating the unread count from All Mail. A human
+# archiving a job alert does not leave it bold.
+#
+# `learning` and `newsletter_valuable` are deliberately absent. The policy keeps
+# both in the inbox precisely so they get read later, and marking them seen
+# would undo the thing that keeps them visible - the same mistake, from the
+# other direction, as archiving a dated workshop invitation.
+#
+# An allow-list rather than a deny-list, so a category nobody thought about
+# keeps its unread state. Being wrong here is silent: the owner does not notice
+# mail they never saw.
+MARK_READ_ON_ARCHIVE = frozenset({
+    "promotion", "recruiter", "receipt", "automated", "newsletter_noise",
+})
+
+
 def _to_actions(judgment: ThreadJudgment, thread_id: str) -> list[Action]:
     if judgment.action == "label":
         actions = [Action(kind="label", thread_id=thread_id,
@@ -289,8 +308,18 @@ def _to_actions(judgment: ThreadJudgment, thread_id: str) -> list[Action]:
         # or trash judgment must never be doubled or turned into a sequence.
         if judgment.also_archive:
             actions.append(Action(kind="archive", thread_id=thread_id))
-        return actions
-    return [Action(kind=judgment.action, thread_id=thread_id)]
+    else:
+        actions = [Action(kind=judgment.action, thread_id=thread_id)]
+
+    # Read-marking rides on filing, so it is keyed off an archive actually being
+    # present rather than off the judgment: a labelled thread staying in the
+    # inbox keeps its unread state, and a trash is left as the single reversible
+    # action it already is.
+    if (any(a.kind == "archive" for a in actions)
+            and judgment.category in MARK_READ_ON_ARCHIVE):
+        actions.append(Action(kind="unlabel", thread_id=thread_id,
+                              params={"label": "UNREAD"}))
+    return actions
 
 
 def classify_thread(thread: Thread, llm, policy: Policy, instructions=None,

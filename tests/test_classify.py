@@ -224,7 +224,10 @@ def test_label_plus_archive_produces_both_actions_in_order():
                                  label="recruiter", also_archive=True,
                                  reason="a job alert, filed not read", confidence=0.9))
     d = classify_thread(thread(), llm, policy())
-    assert [a.kind for a in d.actions] == ["label", "archive"]
+    # recruiter is filed without asking, so it also picks up the read marker -
+    # see MARK_READ_ON_ARCHIVE. The ordering this test exists for is unchanged:
+    # the label lands before the archive.
+    assert [a.kind for a in d.actions] == ["label", "archive", "unlabel"]
     assert d.actions[0].params["label"] == "recruiter"
     assert d.actions[1].thread_id == "t1"
 
@@ -238,12 +241,21 @@ def test_also_archive_defaults_off_so_existing_behaviour_is_unchanged():
 
 def test_also_archive_never_doubles_a_non_label_action():
     """`archive` + also_archive must not emit archive twice, and must not turn
-    a trash into an archive-then-trash."""
+    a trash into an archive-then-trash.
+
+    Asserts on the judgment's own action rather than the whole list, because an
+    archived thread in a filed-without-asking category now also carries a read
+    marker (MARK_READ_ON_ARCHIVE). That marker is not a doubling: the point here
+    is that the judged action appears exactly once, and that nothing turns a
+    trash into a sequence."""
     for kind in ("archive", "trash", "none"):
         llm = FakeLLM(ThreadJudgment(category="promotion", action=kind,
                                      also_archive=True, reason="r", confidence=0.5))
         d = classify_thread(thread(), llm, policy())
-        assert [a.kind for a in d.actions] == [kind], f"{kind} was doubled"
+        kinds = [a.kind for a in d.actions]
+        assert kinds.count(kind) == 1, f"{kind} was doubled: {kinds}"
+        assert kinds[0] == kind, f"{kind} was preceded by something: {kinds}"
+        assert set(kinds) <= {kind, "unlabel"}, f"{kind} grew an extra action: {kinds}"
 
 
 # --- the budget -------------------------------------------------------------
@@ -299,3 +311,75 @@ def test_classify_batch_threads_the_budget_through():
     classify_batch([thread(snippet="SNIP", body="FULL BODY TEXT")], llm,
                    policy(), body_budget=100)
     assert "FULL BODY TEXT" in str(llm.calls[0])
+
+
+# --- marking filed mail as read ----------------------------------------------
+# archive() removes INBOX and nothing else, so 34 threads filed on the first
+# live day were still UNREAD afterwards: out of the inbox, but inflating the
+# unread count from All Mail. A human archiving a job alert does not leave it
+# bold.
+#
+# Only the tiers the agent files WITHOUT asking are marked read. learning and
+# newsletter_valuable are deliberately excluded: the policy keeps both in the
+# inbox precisely so they get read later, and marking them seen would undo the
+# thing that keeps them visible. The set is an allow-list rather than a
+# deny-list, so a category nobody thought about keeps its unread state.
+
+def _kinds(judgment):
+    return [a.kind for a in classify_thread(thread(), FakeLLM(judgment), policy()).actions]
+
+
+def test_archiving_a_noisy_category_also_marks_it_read():
+    for category in ("promotion", "recruiter", "receipt", "automated", "newsletter_noise"):
+        j = ThreadJudgment(category=category, action="label", label=category,
+                           also_archive=True, reason="r", confidence=0.9)
+        assert _kinds(j) == ["label", "archive", "unlabel"], f"{category} left unread"
+
+
+def test_the_read_marker_names_UNREAD_and_is_reversible():
+    from inbox_agent.models import REVERSIBLE_ACTIONS
+    j = ThreadJudgment(category="promotion", action="label", label="promotion",
+                       also_archive=True, reason="r", confidence=0.9)
+    d = classify_thread(thread(), FakeLLM(j), policy())
+    marker = d.actions[-1]
+    assert marker.kind == "unlabel"
+    assert marker.params == {"label": "UNREAD"}
+    assert marker.kind in REVERSIBLE_ACTIONS
+
+
+def test_a_bare_archive_judgment_is_also_marked_read():
+    """Not every archive arrives via the label branch."""
+    j = ThreadJudgment(category="promotion", action="archive", reason="r", confidence=0.9)
+    assert _kinds(j) == ["archive", "unlabel"]
+
+
+def test_learning_and_valuable_newsletters_are_never_marked_read():
+    """Both stay in the inbox to be read later. Marking them seen defeats that,
+    and would quietly undo the fix that stopped learning mail being binned."""
+    for category in ("learning", "newsletter_valuable"):
+        j = ThreadJudgment(category=category, action="label", label=category,
+                           also_archive=True, reason="r", confidence=0.9)
+        assert _kinds(j) == ["label", "archive"], f"{category} was marked read"
+
+
+def test_an_unlisted_category_keeps_its_unread_state():
+    """Allow-list, not deny-list: an unfamiliar category stays bold."""
+    for category in ("other", "important_fyi", "unknown"):
+        j = ThreadJudgment(category=category, action="label", label=category,
+                           also_archive=True, reason="r", confidence=0.9)
+        assert _kinds(j) == ["label", "archive"], f"{category} was marked read"
+
+
+def test_a_thread_that_is_not_archived_is_never_marked_read():
+    """Read-marking rides on filing. A labelled thread staying in the inbox
+    must not lose its unread state."""
+    j = ThreadJudgment(category="promotion", action="label", label="promotion",
+                       reason="r", confidence=0.9)
+    assert _kinds(j) == ["label"]
+
+
+def test_trash_is_not_given_a_read_marker():
+    """Trash is gated behind approval and reverses as one action; appending a
+    second one would leave the undo half-applied."""
+    j = ThreadJudgment(category="promotion", action="trash", reason="r", confidence=0.9)
+    assert _kinds(j) == ["trash"]
