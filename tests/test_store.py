@@ -2,7 +2,8 @@
 from datetime import datetime, timezone
 
 from inbox_agent.models import ActionTemplate, Rule, Thread
-from inbox_agent.store import PreferenceStore, build_store, rule_from_correction
+from inbox_agent.store import (MIN_HITS_BEFORE_DEMOTION, PreferenceStore,
+                               build_store, rule_from_correction)
 
 
 def thread(**kw) -> Thread:
@@ -143,3 +144,111 @@ def test_a_demoted_category_rule_stops_matching():
         s.record_hit(r.id)
         s.record_override(r.id)
     assert s.matching_category("newsletter_valuable") == []
+
+
+# --- replacing a rule ---------------------------------------------------------
+# Correcting the same sender twice produced TWO live rules with identical scope
+# and pattern (r-b26fe722 and r-ba2727c6 against 'one8 <updates@one8.com>',
+# two minutes apart, 2026-09-02). add_rule only ever stored; nothing reconciled
+# a new rule against the one it replaces.
+#
+# `matching` takes max(created_at), so the newer one wins and the bug is
+# invisible - until the newer one is demoted. Then the older takes over, and
+# because a rule that never fires has hit_count 0 it can never itself be
+# demoted, so the correction the owner replaced becomes permanent.
+#
+# Same failure as the stale held entry fixed in f2f9357, one layer down: the
+# store only ever added, and nothing retired what a later verdict superseded.
+
+ONE8 = "one8 <updates@one8.com>"
+
+
+def _one8(**kw):
+    return thread(sender=ONE8, subject="Order #81612525A confirmed", **kw)
+
+
+def _receipt_only():
+    return [ActionTemplate(kind="label", params={"label": "receipt"}),
+            ActionTemplate(kind="unlabel", params={"label": "UNREAD"})]
+
+
+def _receipt_and_archive():
+    return [ActionTemplate(kind="label", params={"label": "receipt"}),
+            ActionTemplate(kind="archive"),
+            ActionTemplate(kind="unlabel", params={"label": "UNREAD"})]
+
+
+def test_a_second_correction_of_one_sender_leaves_only_one_live_rule():
+    s = store()
+    s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    live = s.matching(_one8())
+    assert len(live) == 1, f"two rules decide the same mail: {[r.id for r in live]}"
+    assert [a.kind for a in live[0].actions] == ["label", "archive", "unlabel"]
+
+
+def test_the_replaced_rule_is_retired_not_deleted():
+    """mark_overridden's own reasoning: a rule the owner overruled is part of
+    the record. It must stop deciding, not stop existing."""
+    s = store()
+    first = s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    stored = {r.id: r for r in s.rules()}
+    assert first.id in stored, "the replaced rule was deleted"
+    assert stored[first.id].overridden is True
+
+
+def test_the_new_rule_names_what_it_replaced():
+    """supersedes had no consumer until now. This is the first."""
+    s = store()
+    first = s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    second = s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    assert second.supersedes == first.id
+
+
+def test_a_retired_rule_does_not_come_back_when_its_replacement_is_demoted():
+    """The whole point. A demoted replacement must not resurrect the correction
+    the owner threw away - which a zero-hit rule would do permanently, being
+    undemotable."""
+    s = store()
+    s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    second = s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    for _ in range(MIN_HITS_BEFORE_DEMOTION):
+        s.record_hit(second.id)
+    for _ in range(MIN_HITS_BEFORE_DEMOTION):
+        s.record_override(second.id)
+    assert s.matching(_one8()) == [], "the replaced rule came back after a demotion"
+
+
+def test_replacing_a_rule_does_not_dent_its_precision():
+    """Retiring and penalising are different. The replaced rule never fired, so
+    counting an override would record a disagreement with a decision that was
+    never made - and precision divides by hit_count."""
+    s = store()
+    first = s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    stored = {r.id: r for r in s.rules()}[first.id]
+    assert stored.override_count == 0
+    assert stored.precision is None
+
+
+def test_a_different_sender_is_untouched():
+    s = store()
+    other = s.add_rule(rule_from_correction(thread(), [ActionTemplate(kind="archive")], "n"))
+    s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    s.add_rule(rule_from_correction(_one8(), _receipt_and_archive(), "owner corrected"))
+    assert {r.id for r in s.rules() if not r.overridden} >= {other.id}
+    assert len(s.matching(thread())) == 1
+
+
+def test_a_category_rule_never_retires_a_sender_rule():
+    """Scope AND pattern. A category rule for `receipt` decides different mail
+    from a sender rule that happens to apply the receipt label."""
+    s = store()
+    sender_rule = s.add_rule(rule_from_correction(_one8(), _receipt_only(), "owner corrected"))
+    s.add_rule(Rule(id="r-cat", scope="category", pattern="receipt",
+                    actions=[ActionTemplate(kind="archive")],
+                    provenance="owner corrected every receipt",
+                    created_at=datetime.now(timezone.utc)))
+    assert len(s.matching(_one8())) == 1
+    assert {r.id for r in s.rules() if not r.overridden} == {sender_rule.id, "r-cat"}

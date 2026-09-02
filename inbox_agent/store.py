@@ -204,6 +204,43 @@ class PreferenceStore:
         self._store = store
 
     def add_rule(self, rule: Rule) -> Rule:
+        """Store a rule, retiring any live rule it replaces.
+
+        Same scope AND same pattern means the two decide the same mail, so a
+        newer one is a replacement rather than a second opinion. Without this
+        the older rule stayed live and merely lost the `max(created_at)`
+        tie-break in `matching` - which hid the problem rather than avoiding it.
+        The moment the newer rule is demoted, `_live_rules` drops it and the
+        older takes over, resurrecting the correction the owner threw away. And
+        it does so permanently: a rule that never fires has `hit_count` 0, so it
+        can never meet MIN_HITS_BEFORE_DEMOTION and can never itself be demoted.
+
+        Retired, not penalised. `override_count` stays untouched because it
+        means "this rule fired and the owner undid its decision", and a
+        superseded rule may never have fired at all - counting an override there
+        would record a disagreement with a decision that was never made, into a
+        `precision` that divides by `hit_count`.
+
+        Retired, not deleted, for the reason `mark_overridden` already gives: a
+        rule the owner overruled is part of the record. It stops deciding; it
+        does not stop existing.
+
+        Scope is part of the test, not just pattern: a `category` rule for
+        `receipt` decides different mail from a `sender` rule that happens to
+        apply the receipt label, so neither may retire the other.
+        """
+        replaced = [r for r in self._live_rules()
+                    if r.id != rule.id
+                    and r.scope == rule.scope
+                    and r.pattern == rule.pattern]
+        for existing in replaced:
+            self.mark_overridden(existing.id)
+        # A caller that already named what it supersedes knows better than this
+        # does: it saw the rule that actually produced the item on screen, which
+        # may be a different scope from the one being written now.
+        if replaced and not rule.supersedes:
+            rule = rule.model_copy(
+                update={"supersedes": max(replaced, key=lambda r: r.created_at).id})
         self._put(rule)
         return rule
 

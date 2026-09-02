@@ -99,8 +99,15 @@ def main() -> int:
     print(f"chat id   : {settings.tg_chat_id}  (the only authorised sender)")
     print(f"token     : {mask(settings.tg_token)}")
     print(f"categories: {categories}")
+    # Live rules, not all rules. A retired rule is kept as part of the record
+    # but can never fire, and counting it here would overstate what the agent
+    # actually carries - the same overstatement the dead simplywall.st rule
+    # already makes on its own.
+    _live = [r for r in prefs.rules() if not r.overridden]
+    _retired = len(prefs.rules()) - len(_live)
     print(f"store     : {settings.store_dir}  ({len(held.all())} held, "
-          f"{len(prefs.rules())} rules carried over)")
+          f"{len(_live)} rules carried over"
+          + (f", {_retired} retired)" if _retired else ")"))
     print("\nSend /triage in Telegram. Ctrl-C to stop.")
 
     try:
