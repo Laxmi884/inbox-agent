@@ -92,7 +92,9 @@ def main() -> int:
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
     print(f"body      : {settings.body_budget} chars into the prompt"
           + ("  (snippet only)" if settings.body_budget == 0 else ""))
-    print(f"policy    : {policy.version}")
+    print(f"policy    : {policy.version}"
+          + ("   <- DRIFTED from the committed policies/default.md"
+             if policy.drifted else ""))
     print(f"mode      : {bot.mode}")
     print(f"chat id   : {settings.tg_chat_id}  (the only authorised sender)")
     print(f"token     : {mask(settings.tg_token)}")

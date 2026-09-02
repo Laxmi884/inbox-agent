@@ -115,3 +115,60 @@ def test_the_resolved_commit_is_recorded_not_the_tag(tmp_path, monkeypatch):
                     allow_remote=True)
     assert p.version == "hub:13ac11f1deadbeef"
     assert "dev" not in p.version
+
+
+# --- drift between the two copies --------------------------------------------
+# policies/default.md and the hub's POLICY.md are two copies of one text, and
+# the local one cannot be deleted: four tests above assert on its content with
+# allow_remote=False, and the notebook must run with no key and no network. So
+# the duplication is structural and the only question is whether drift can go
+# unnoticed - which is precisely how the 404 survived, silently, for weeks.
+#
+# The pull is the one moment both texts are in hand, so the check costs a file
+# read and no network. The hub version still wins: it is what the audit record
+# names, and a forgotten push must never take a triage run down.
+
+def _fake_client(text, monkeypatch, commit="abc123"):
+    class Ctx:
+        files = {"POLICY.md": text}
+        commit_hash = commit
+
+    class FakeClient:
+        def pull_skill(self, identifier, *, version=None):
+            return Ctx()
+
+    monkeypatch.setattr("langsmith.Client", lambda *a, **kw: FakeClient())
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2_pt_test")
+
+
+def test_matching_copies_do_not_report_drift(tmp_path, monkeypatch):
+    from inbox_agent.policy import LOCAL_POLICY
+    _fake_client(LOCAL_POLICY.read_text(encoding="utf-8"), monkeypatch)
+    p = load_policy(replace(make_settings(tmp_path), context_hub_tag=""))
+    assert p.source == "context_hub"
+    assert p.drifted is False
+
+
+def test_drift_is_flagged_and_named(tmp_path, monkeypatch, capsys):
+    _fake_client("a policy that is not the committed one", monkeypatch)
+    p = load_policy(replace(make_settings(tmp_path), context_hub_tag=""))
+    assert p.drifted is True, "a hub policy differing from the committed file went unreported"
+    out = capsys.readouterr().out
+    assert "drift" in out.lower()
+    assert "default.md" in out
+
+
+def test_drift_does_not_stop_the_run_and_the_hub_still_wins(tmp_path, monkeypatch):
+    """A forgotten push must not take a triage run down, and the version stamp
+    has to keep naming what actually ran."""
+    _fake_client("a policy that is not the committed one", monkeypatch, commit="deadbeef")
+    p = load_policy(replace(make_settings(tmp_path), context_hub_tag=""))
+    assert p.text == "a policy that is not the committed one"
+    assert p.version == "hub:deadbeef"
+
+
+def test_a_local_only_policy_is_never_marked_drifted(tmp_path):
+    """Nothing to compare against: with no hub in play there are not two copies."""
+    p = load_policy(make_settings(tmp_path), allow_remote=False)
+    assert p.source == "local"
+    assert p.drifted is False

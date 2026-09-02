@@ -23,6 +23,12 @@ class Policy:
     text: str
     version: str
     source: Literal["context_hub", "local"]
+    # True when the hub's POLICY.md and the committed policies/default.md have
+    # diverged. Carried on the object rather than only printed, so the bot's
+    # startup banner can say it too: a warning that scrolls past on a long
+    # startup is the same as no warning. Always False for a local-only load -
+    # with no hub in play there are not two copies to disagree.
+    drifted: bool = False
 
 
 def _pull_from_context_hub(settings: Settings) -> Policy:
@@ -48,10 +54,38 @@ def _pull_from_context_hub(settings: Settings) -> Policy:
             content = files[name]
             text = getattr(content, "content", content)
             commit = getattr(ctx, "commit_hash", settings.context_hub_tag)
-            return Policy(text=text, version=f"hub:{commit}", source="context_hub")
+            return Policy(text=text, version=f"hub:{commit}",
+                          source="context_hub", drifted=_drifted(text))
     raise RuntimeError(
         f"skill {settings.context_hub_skill!r} has no POLICY.md/AGENTS.md/SKILL.md"
     )
+
+
+def _drifted(remote_text: str) -> bool:
+    """Has the committed fallback diverged from what the hub is serving?
+
+    The local file cannot be deleted - the content tests read it with
+    allow_remote=False and the notebook has to run with no key and no network -
+    so two copies of one text exist by construction. The only real question is
+    whether they can disagree unnoticed, and that is exactly how the 404 above
+    survived: the agent ran on the local file for weeks while looking wired to
+    the hub.
+
+    This is the one moment both texts are in hand, so the check costs a file
+    read and no network. Whitespace at the edges is not drift; a push round-trip
+    can add or drop a trailing newline and that is not a policy change.
+    """
+    try:
+        local = LOCAL_POLICY.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if local.strip() == (remote_text or "").strip():
+        return False
+    print(f"[policy] DRIFT: the hub policy and {LOCAL_POLICY.name} differ. "
+          f"Running the HUB version (it is what the audit record names). "
+          f"Push {LOCAL_POLICY} to the hub, or pull it down, to bring them "
+          f"back into step.")
+    return True
 
 
 def load_policy(settings: Settings, *, allow_remote: bool = True) -> Policy:
