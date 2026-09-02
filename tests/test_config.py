@@ -232,3 +232,34 @@ def test_get_embeddings_probes_rather_than_deferring_to_first_write(monkeypatch)
                         lambda *a, **k: probed.append(True) or False)
     config_mod.get_embeddings("auto")
     assert probed, "get_embeddings must probe Ollama, not just construct a client"
+
+
+def test_source_of_reports_a_shell_export_as_environment(monkeypatch):
+    """The bug from spec 1.4: a value exported before launch wins over .env and
+    dies with its shell. Naming it is the whole point of doctor."""
+    monkeypatch.setattr(config_mod, "_ENV_AT_IMPORT", frozenset({"INBOX_GMAIL"}))
+    assert config_mod.source_of("INBOX_GMAIL") == "environment"
+
+
+def test_source_of_reports_a_file_value_as_dotenv(monkeypatch):
+    monkeypatch.setattr(config_mod, "_ENV_AT_IMPORT", frozenset())
+    monkeypatch.setattr(config_mod, "dotenv_values",
+                        lambda *a, **k: {"INBOX_GMAIL": "live"})
+    assert config_mod.source_of("INBOX_GMAIL") == "dotenv"
+
+
+def test_source_of_reports_an_absent_key_as_default(monkeypatch):
+    monkeypatch.setattr(config_mod, "_ENV_AT_IMPORT", frozenset())
+    monkeypatch.setattr(config_mod, "dotenv_values", lambda *a, **k: {})
+    assert config_mod.source_of("INBOX_BODY_BUDGET") == "default"
+
+
+def test_environment_wins_even_when_the_file_agrees(monkeypatch):
+    """The case a post-hoc value comparison gets wrong. If the shell and the
+    file both say "live", comparing values cannot tell you which one is load
+    bearing - but only the file survives a restart, so the distinction is the
+    entire warning."""
+    monkeypatch.setattr(config_mod, "_ENV_AT_IMPORT", frozenset({"INBOX_GMAIL"}))
+    monkeypatch.setattr(config_mod, "dotenv_values",
+                        lambda *a, **k: {"INBOX_GMAIL": "live"})
+    assert config_mod.source_of("INBOX_GMAIL") == "environment"

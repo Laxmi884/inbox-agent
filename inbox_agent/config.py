@@ -11,7 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv, find_dotenv, dotenv_values
+
+# Captured BEFORE load_dotenv, and the ordering IS the mechanism: once
+# load_dotenv has run there is no way to tell a value the shell exported from
+# one the file supplied, because both are simply keys in os.environ. Comparing
+# values afterwards cannot distinguish them either - when the shell and the
+# file agree, the comparison says "same" and the warning that matters is lost.
+# Only the file survives a restart, so which one won is the whole question.
+# Do not move this line below load_dotenv.
+_ENV_AT_IMPORT = frozenset(os.environ)
 
 load_dotenv(find_dotenv(), override=False)
 
@@ -257,6 +266,21 @@ def mask(value: Optional[str]) -> str:
     if len(value) <= 11:
         return f"<redacted>  ({len(value)} chars)"
     return f"{value[:7]}...{value[-4:]}  ({len(value)} chars)"
+
+
+def source_of(key: str) -> str:
+    """Where the effective value of `key` came from: environment | dotenv | default.
+
+    load_dotenv runs with override=False, so precedence is
+    shell environment > .env > code default. A value that came from the shell
+    does not survive a restart, which is how a bot came back on the snapshot in
+    dry-run while still sending normal-looking digests. See the design spec 1.4.
+    """
+    if key in _ENV_AT_IMPORT:
+        return "environment"
+    if key in dotenv_values(find_dotenv()):
+        return "dotenv"
+    return "default"
 
 
 def get_llm(backend: Optional[str] = None):
