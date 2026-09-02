@@ -154,40 +154,91 @@ line; the console script is additive.
 
 ## 3. The embeddings seam
 
-A new setting, resolved in the established style of `_resolve_gmail` and
-`_resolve_triaged_label` — validate at load time, raise naming the variable that
-is wrong, never fall back silently:
+`INBOX_EMBEDDINGS` takes `auto` (the default), `ollama`, or `none`. An
+unrecognised value raises at load time naming the variable, in the established
+style of `_resolve_gmail` and `_resolve_triaged_label`.
 
-```python
-VALID_EMBEDDINGS = ("none", "ollama")
+The three values differ in what happens when Ollama is not listening, which is
+the only interesting axis:
 
-def _resolve_embeddings() -> str:
-    raw = os.getenv("INBOX_EMBEDDINGS", "none").strip().lower()
-    if raw not in VALID_EMBEDDINGS:
-        raise ValueError(...)   # names INBOX_EMBEDDINGS and the valid set
-    return raw
-```
+| value | Ollama up | Ollama down |
+|---|---|---|
+| `auto` (default) | embeddings on | **falls back to `none`, prints why** |
+| `ollama` | embeddings on | **raises at startup** |
+| `none` | off | off |
 
-`get_embeddings(kind)` returns `None` for `"none"`. `telegram/__main__.py:58`
-passes `settings.embeddings` through. `_index()` already returns `None` for a
-`None` embeddings argument (`store.py:70`), so every layer below already
-supports this — the change is a resolver plus one call site.
+`auto` is not a new idea; it is `resolve_backend()`'s existing contract applied
+to the same daemon. That function already probes `ollama_available()` and prints
+a named fallback when `INBOX_LLM_BACKEND=ollama` finds nothing listening, and
+reusing the shape means there is one story about what happens when Ollama is
+absent rather than two.
 
-**The default is `none`**, justified by 1.3: no call site queries the index, so
-turning it off removes an Ollama round-trip per rule write and a hard dependency
-while changing nothing observable. On this machine it is strictly a speedup.
+**On a machine with Ollama running — this one — `auto` resolves to Ollama and
+nothing changes.** Vectors keep being written exactly as they are today, so the
+backfill problem in 3.2 never arises here. A clone without Ollama degrades to
+`none` with a printed reason instead of breaking at the first correction, which
+is 1.2. Someone who wants embeddings to be non-negotiable pins `ollama` and gets
+a hard failure instead of a quiet degrade.
 
-The vector code is kept, not deleted. This makes embeddings opt-in rather than
-removed, so semantic rule matching stays one setting away.
+The fallback is safe *specifically because of 1.3*: nothing queries the index, so
+a run without it loses no capability that exists today. That finding no longer
+has to justify the default — it justifies why degrading is acceptable.
 
-### 3.1 Migration risk
+### 3.1 The failure must move to startup
 
-An existing `prefs.sqlite` was written *with* an index. Opening it with
-`index=None` must still return its rules. The vectors live in a separate table
-from the key-value rows and `_search_all` reads by namespace only, so this
-should hold — but "should" is not evidence, and this is the one change that
-could damage a store holding real learned rules. It gets a dedicated test
-(section 6) against a fixture store built with an index.
+Independent of the default, and the real fix to 1.2. Today `get_embeddings()`
+constructs an `OllamaEmbeddings` without touching the network, so the process
+starts happily and dies at the first `put` — a correction, hours later, in the
+one code path the whole system exists for.
+
+Both `auto` and `ollama` therefore probe `ollama_available()` (already in
+`config.py`, 1.5s timeout) **at construction**. Whether the outcome is a
+fallback or an exception, it is decided while a human is watching the banner,
+not while they are tapping a button in Telegram.
+
+The vector code is kept, not deleted, so semantic rule matching stays one
+setting away — with the caveat in 3.3.
+
+### 3.2 Backfill
+
+`SqliteStore` embeds on `put` and does not backfill. Any rule written while
+embeddings were off has no vector, so a store that has run in both modes is
+half-indexed — and a half-indexed store searched semantically returns confident,
+incomplete results, which is the invisible-failure shape this codebase otherwise
+refuses to ship.
+
+Not a problem on this machine under the chosen default, since `auto` will
+resolve to Ollama. It becomes one for anyone who runs a while on `none` and
+later switches. Re-embedding is a loop calling `_put` over `rules()`, so
+whenever semantic matching is actually wired up it must ship with that backfill
+step. Recorded here rather than solved here.
+
+### 3.3 Semantic matching is a safety change, not a feature flag
+
+Flagged so that turning this on later is a deliberate decision rather than an
+assumed next step. `matching()` decides which learned rule fires, and a firing
+rule acts. `partition.hold_reason` grants **trash authority** to rule-sourced
+decisions precisely because a rule is an exact, citable instruction the owner
+gave. Fuzzy matching turns that into "this thread resembles one you taught me
+about, so I will trash it", and it undermines `MIN_PRECISION` demotion too,
+which tracks precision per rule on the assumption that the rule fires
+deterministically.
+
+### 3.4 Reading an indexed store without an index
+
+No longer on the default path, but now reachable two ways: `auto` degrading on a
+machine whose Ollama has stopped, and anyone setting `none` on a store that has
+already been written with an index. `prefs.sqlite` on this machine is such a
+store.
+
+Opening it with `index=None` must still return every rule. The vectors live in a
+separate table from the key-value rows and `_search_all` reads by namespace
+only, so this should hold — but "should" is not evidence, and this is the path
+that could make real learned rules invisible. It gets a dedicated test
+(section 6) against a fixture store built *with* an index.
+
+The `auto` route makes this sharper, not softer: a laptop where `ollama serve`
+died between restarts silently takes this path. Rules must survive it.
 
 ## 4. `doctor`
 
@@ -222,6 +273,10 @@ existing `mask()` for secrets), and source. It flags:
   is predicted rather than discovered.
 - **⚠ policy drift** — `Policy.drifted` already carries this; doctor surfaces it
   alongside the source.
+- **⚠ degraded embeddings** — `INBOX_EMBEDDINGS=auto` that resolved to `none`
+  because Ollama was not listening. Doctor reports the **resolved** mode, not the
+  configured one; on a laptop whose `ollama serve` has died these differ, and
+  the resolved one is what the store is actually doing.
 - **✗ fatal** — a selected backend that is unreachable, absent Google
   credentials, missing Telegram token or chat id.
 
@@ -245,14 +300,21 @@ the whole project and costs minutes to remove.
 
 Unit:
 
-- `_resolve_embeddings`: default, both valid values, and an invalid value that
-  raises and names the variable
+- `_resolve_embeddings`: all three valid values, the `auto` default, and an
+  invalid value that raises and names the variable
+- the resolution matrix in section 3, with `ollama_available()` patched both
+  ways — six cases, and the two that matter are `auto` + down (falls back,
+  prints) and `ollama` + down (**raises, and raises at startup rather than at
+  first put**)
 - `source_of`: environment, `.env`, and default — including the case where both
   the environment and the file define a key with the *same* value, which a
   post-hoc value comparison gets wrong and this mechanism must get right
-- doctor's fatal-versus-warning classification and its exit code
+- doctor's fatal-versus-warning classification and its exit code, including that
+  it reports the *resolved* embeddings mode rather than the configured one — on
+  a machine where Ollama has died those differ, and the resolved one is the
+  truth
 
-Migration (section 3.1): build a store with an index, write rules, reopen with
+Section 3.4: build a store *with* an index, write rules, reopen with
 `index=None`, assert every rule reads back.
 
 Regression: all 584 existing tests stay green.
@@ -262,10 +324,20 @@ caught 1.2, because the suite constructs stores without embeddings by design
 (`build_store`'s docstring: *"Embeddings are optional so the test suite runs
 without Ollama"*). The suite is structurally incapable of reaching this bug.
 
-So: a second BotFather token, `INBOX_GMAIL=snapshot`, `INBOX_DRY_RUN=true`, a
-store directory inside the worktree, and **Ollama stopped**. Then `/triage`,
-correct an item, and confirm a rule is written. That reproduces the bug on the
-old code and demonstrates the fix on the new.
+Setup for both runs below: a second BotFather token, `INBOX_GMAIL=snapshot`,
+`INBOX_DRY_RUN=true`, a store directory inside the worktree, and a backend that
+is not Ollama, so stopping Ollama does not also remove the classifier.
+
+1. **Ollama stopped, `auto`.** Startup must say it fell back. `/triage`, correct
+   an item, confirm the rule is written and reads back. This is 1.2 on the old
+   code and a clean degrade on the new — and it is the run a clone would make.
+2. **Ollama running, `auto`.** Must resolve to Ollama and write vectors, proving
+   the default preserves today's behaviour rather than merely claiming to.
+3. **Ollama stopped, `INBOX_EMBEDDINGS=ollama`.** Must fail at startup, in the
+   banner, naming Ollama — not at the correction in step 1.
+
+Step 1 needs Ollama down. Do it when no scheduled or manual triage is expected,
+or the live bot on `main` loses its classifier for the duration.
 
 ## 7. Not doing
 
@@ -278,5 +350,12 @@ old code and demonstrates the fix on the new.
 - **Multi-tenancy.** `INBOX_TG_CHAT_ID` is singular by construction. Each person
   runs their own process; that was the decision taken at the start of this
   milestone.
-- **Deleting the vector code.** Section 3 makes it optional, not absent.
+- **Deleting the vector code, or turning embeddings off by default.** An earlier
+  draft defaulted to `none` on the strength of 1.3. Overruled deliberately:
+  keeping Ollama the default on a machine that has it means this project changes
+  no observable behaviour there at all, and the backfill trap in 3.2 never opens.
+  The clone-and-run problem is solved by `auto` degrading, not by everyone
+  losing the index.
+- **Wiring up semantic rule matching.** Section 3.3 — it is a safety change, and
+  it needs the backfill in 3.2 shipped with it.
 - **The timezone fix (1.5) and the launchd unit.** Both belong to Project 2.
