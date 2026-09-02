@@ -12,8 +12,8 @@ import sys
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ..audit import AuditLog
-from ..config import (build_gmail_client, get_embeddings, load_settings, mask,
-                      resolve_embeddings, use_model)
+from ..config import (build_embeddings, build_gmail_client, load_settings,
+                      mask, use_model)
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -33,15 +33,17 @@ def policy_categories(policy) -> list[str]:
     return re.findall(r"^-\s+`([a-z_]+)`", body, re.M)
 
 
-def _embeddings_banner(settings) -> str:
+def _embeddings_banner(settings, resolved: str) -> str:
     """The banner's embeddings line, as a string so it can be tested.
 
-    Reports the RESOLVED mode, never the configured one: on a machine whose
-    `ollama serve` has died those differ, and the resolved one is what the
-    store is actually doing. "none" alone would be ambiguous - it is also what
-    a deliberate INBOX_EMBEDDINGS=none looks like - so a degrade says why.
+    Takes the RESOLVED mode as a required argument rather than probing again:
+    on a machine whose `ollama serve` has died, resolving twice cost a second
+    Ollama probe, a duplicated degrade warning, and a window in which the
+    banner could report a mode other than what the store actually got. This
+    is a pure formatter over (configured, resolved) - no side effects, no
+    network. "none" alone would be ambiguous - it is also what a deliberate
+    INBOX_EMBEDDINGS=none looks like - so a degrade says why.
     """
-    resolved = resolve_embeddings(settings.embeddings)
     if resolved == "none" and settings.embeddings == "auto":
         return ("embeddings: none   <- configured auto, but Ollama is not "
                 "listening; rules still match exactly")
@@ -69,8 +71,9 @@ def main() -> int:
     # were merely lost that way; held items became unreachable, because
     # mark_triaged takes every processed thread out of the fetch query and
     # `/backlog` uses the same query. See open_store.
+    embeddings_mode, embeddings = build_embeddings(settings.embeddings)
     prefs = PreferenceStore(open_store(settings.store_dir / "prefs.sqlite",
-                                       get_embeddings(settings.embeddings)))
+                                       embeddings))
     # Own namespace, own file: a held item is work in flight, not durable
     # preference knowledge, and build_graph now requires the queue explicitly
     # (task 4) rather than building one for itself. Separate files rather than
@@ -123,7 +126,7 @@ def main() -> int:
     print(f"store     : {settings.store_dir}  ({len(held.all())} held, "
           f"{len(_live)} rules carried over"
           + (f", {_retired} retired)" if _retired else ")"))
-    print(_embeddings_banner(settings))
+    print(_embeddings_banner(settings, embeddings_mode))
     print("\nSend /triage in Telegram. Ctrl-C to stop.")
 
     try:

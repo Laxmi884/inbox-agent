@@ -354,6 +354,23 @@ def get_embeddings(kind: Optional[str] = None):
     return OllamaEmbeddings(model=DEFAULT_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
 
+def build_embeddings(kind: Optional[str] = None) -> tuple[str, Optional[object]]:
+    """Resolve once, and return both what was resolved and the object built.
+
+    Callers need both: the store needs the embeddings, the banner needs to
+    state what the store actually got. Resolving separately for each meant two
+    Ollama probes, two copies of the degrade warning, and a window in which the
+    two answers could disagree.
+    """
+    resolved = resolve_embeddings(kind)
+    if resolved == "none":
+        return resolved, None
+
+    from langchain_ollama import OllamaEmbeddings
+
+    return resolved, OllamaEmbeddings(model=DEFAULT_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+
+
 # ---------------------------------------------------------------------------
 # Model registry
 #
