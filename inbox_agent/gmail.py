@@ -169,6 +169,10 @@ class _LabelMap:
         self._http = http or (lambda: None)
         self._by_id: dict[str, str] = {}
         self._by_name: dict[str, str] = {}
+        # Gmail enforces name uniqueness case-INSENSITIVELY. Without this index
+        # a lookup for 'learning' misses the mailbox's 'Learning', creation is
+        # attempted, and Gmail answers 409. See to_id.
+        self._by_lower: dict[str, str] = {}
         self._loaded = False
         self._lock = threading.Lock()
 
@@ -176,12 +180,16 @@ class _LabelMap:
         """Rebuild from labels.list. Caller holds the lock."""
         result = self._service.users().labels().list(
             userId="me").execute(http=self._http())
-        by_id, by_name = {}, {}
+        by_id, by_name, by_lower = {}, {}, {}
         for label in result.get("labels", []):
             by_id[label["id"]] = label["name"]
             by_name[label["name"]] = label["id"]
+            # setdefault, so that when two labels differ only by case the
+            # fallback is stable rather than dependent on labels.list ordering.
+            # Which one it picks only matters when neither is an exact match.
+            by_lower.setdefault(label["name"].lower(), label["id"])
         # Rebind, never mutate: see the thread-safety note above.
-        self._by_id, self._by_name = by_id, by_name
+        self._by_id, self._by_name, self._by_lower = by_id, by_name, by_lower
         self._loaded = True
 
     def refresh(self) -> None:
@@ -226,9 +234,21 @@ class _LabelMap:
         created in Gmail (or by another process) after this map was built would
         be created a second time, leaving two labels sharing one name and a
         `to_name` lookup that depends on dict ordering.
+
+        Case. Gmail's uniqueness rule for label names is case-INSENSITIVE, so
+        `create("learning")` against a mailbox holding 'Learning' does not
+        return the existing label - it fails with 409 "Label name exists or
+        conflicts". An exact-case dict cannot see that collision coming, which
+        is why the first live run died mid-batch with ten actions already
+        written to the mailbox. So a miss falls back to a case-folded lookup
+        before concluding the label is new.
+
+        Exact match still wins. Resolving 'learning' to an existing 'Learning'
+        is adopting the label the owner already keeps, which is the intent; but
+        if both spellings somehow exist, the one asked for is the one meant.
         """
         self._ensure()
-        label_id = self._by_name.get(name)
+        label_id = self._resolve(name)
         if label_id is not None:
             return label_id
 
@@ -236,7 +256,7 @@ class _LabelMap:
         # would otherwise both refetch, both still miss, and both create it.
         with self._lock:
             self._fetch()
-            label_id = self._by_name.get(name)
+            label_id = self._resolve(name)
             if label_id is not None:
                 return label_id
             created = self._service.users().labels().create(
@@ -247,7 +267,20 @@ class _LabelMap:
                           http=self._http())
             self._by_id = self._by_id | {created["id"]: created["name"]}
             self._by_name = self._by_name | {created["name"]: created["id"]}
+            self._by_lower = ({created["name"].lower(): created["id"]}
+                              | self._by_lower)
             return created["id"]
+
+    def _resolve(self, name: str) -> Optional[str]:
+        """Exact name first, then case-folded. None if the label is genuinely new.
+
+        Readers never hold the lock, so this reads each dict exactly once and
+        relies on both only ever being REPLACED - the same rule as to_name.
+        """
+        label_id = self._by_name.get(name)
+        if label_id is not None:
+            return label_id
+        return self._by_lower.get(name.lower())
 
 
 # Everything between these tags is markup or code, never prose. Removed

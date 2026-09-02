@@ -197,3 +197,59 @@ def test_a_concurrent_miss_creates_the_label_only_once():
         w.join()
     assert fake.created == ["agent/triaged"], fake.created
     assert len(set(got)) == 1, got
+
+
+# --- case ------------------------------------------------------------------
+# Gmail enforces label-name uniqueness case-INSENSITIVELY, but this map is a
+# plain dict keyed on the exact display name. The gap between those two facts
+# killed the first live run: the mailbox holds 'Learning', the taxonomy asks
+# for 'learning', the lookup missed, and create() came back 409 "Label name
+# exists or conflicts" from inside auto_execute - after ten real actions had
+# already been written to the mailbox.
+
+class FailingCreateLabels(FakeLabels):
+    """Gmail's actual behaviour: a create that only differs by case is a 409."""
+
+    def create(self, userId="me", body=None):
+        wanted = body["name"].lower()
+        if any(l["name"].lower() == wanted for l in self._labels):
+            raise AssertionError(
+                f"create({body['name']!r}) would 409: a label already exists "
+                f"whose name differs only by case")
+        return super().create(userId=userId, body=body)
+
+
+def test_an_existing_label_resolves_regardless_of_case():
+    """'Learning' is in the real mailbox; the taxonomy says 'learning'."""
+    m, fake = _map()
+    assert m.to_id("learning") == "Label_7181901001278056114"
+    assert fake.created == []
+
+
+def test_a_case_variant_is_never_created_as_a_second_label():
+    """The 409 is Gmail refusing to hold two labels one case apart. Resolving
+    to the existing one is the only outcome that is not a crash."""
+    fake = FailingCreateLabels(REAL_LABELS)
+    m = _LabelMap(FakeService(fake))
+    assert m.to_id("LEARNING") == "Label_7181901001278056114"
+    assert m.to_id("learning") == "Label_7181901001278056114"
+    assert fake.created == []
+
+
+def test_an_exact_match_still_wins_over_a_case_variant():
+    """With both 'Learning' and 'learning' present - possible only if they were
+    created before Gmail's rule, or in another account - the exact name is the
+    one the owner asked for."""
+    labels = REAL_LABELS + [{"id": "Label_88", "name": "learning", "type": "user"}]
+    m, fake = _map(labels)
+    assert m.to_id("learning") == "Label_88"
+    assert m.to_id("Learning") == "Label_7181901001278056114"
+    assert fake.created == []
+
+
+def test_a_genuinely_new_name_is_still_created():
+    """The case fix must not turn every miss into a silent no-op."""
+    m, fake = _map()
+    new_id = m.to_id("needs_reply")
+    assert fake.created == ["needs_reply"]
+    assert m.to_name(new_id) == "needs_reply"
