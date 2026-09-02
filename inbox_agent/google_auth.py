@@ -162,3 +162,17 @@ def get_credentials(*, client_secrets_path: Path, token_path: Path,
                               scopes=scopes)
     _write_token(token_path, creds)
     return creds
+
+
+def authorized_http(credentials):
+    """A FRESH transport bound to `credentials`.
+
+    Called once per worker thread. httplib2.Http is not thread-safe and
+    googleapiclient's service object holds exactly one, so a hydration pool
+    sharing it corrupts SSL socket state - see LiveGmailClient._http, and the
+    real-mailbox reproduction recorded there.
+    """
+    import google_auth_httplib2
+    import httplib2
+
+    return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http())

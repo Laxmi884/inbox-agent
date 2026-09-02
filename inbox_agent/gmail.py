@@ -10,12 +10,18 @@ from __future__ import annotations
 import base64
 import html as html_mod
 import json
+import logging
 import re
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 from .models import Thread
+
+log = logging.getLogger(__name__)
 
 
 # The subset of Gmail search syntax the snapshot client can honour. Kept
@@ -154,8 +160,13 @@ class _LabelMap:
       wrong label in the digest, and close to undiagnosable afterwards.
     """
 
-    def __init__(self, service):
+    def __init__(self, service, http=None):
         self._service = service
+        # `http` is a zero-arg callable returning this thread's transport, or
+        # None. See LiveGmailClient._http: a refresh triggered by a miss inside
+        # a hydration worker would otherwise share the service's single
+        # httplib2.Http with whatever else that pool is doing.
+        self._http = http or (lambda: None)
         self._by_id: dict[str, str] = {}
         self._by_name: dict[str, str] = {}
         self._loaded = False
@@ -163,7 +174,8 @@ class _LabelMap:
 
     def _fetch(self) -> None:
         """Rebuild from labels.list. Caller holds the lock."""
-        result = self._service.users().labels().list(userId="me").execute()
+        result = self._service.users().labels().list(
+            userId="me").execute(http=self._http())
         by_id, by_name = {}, {}
         for label in result.get("labels", []):
             by_id[label["id"]] = label["name"]
@@ -231,7 +243,8 @@ class _LabelMap:
                 userId="me",
                 body={"name": name,
                       "labelListVisibility": "labelShow",
-                      "messageListVisibility": "show"}).execute()
+                      "messageListVisibility": "show"}).execute(
+                          http=self._http())
             self._by_id = self._by_id | {created["id"]: created["name"]}
             self._by_name = self._by_name | {created["name"]: created["id"]}
             return created["id"]
@@ -367,3 +380,261 @@ def _extract_body(payload: dict) -> str:
         return _normalise(text)
     text = _html_to_text("\n".join(h for h in html if h.strip()))
     return text or ""
+
+
+# One list call plus one get per thread. 50 threads sequentially is ~10s of
+# almost pure round-trip latency. Five at a time is well inside quota (a
+# threads.get is 10 units against 250 units/sec/user, so 50 gets is 500 units)
+# and is simpler than BatchHttpRequest, which needs its own callback plumbing
+# and error handling for a saving we do not need at this size.
+_HYDRATE_WORKERS = 5
+
+# Backoff applies to 429 and 5xx ONLY. A 4xx is a bug in our request - a bad
+# label id, a malformed query - and retrying it just makes the same mistake
+# more slowly while hiding it from the caller.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 4
+
+
+def _status_of(error) -> Optional[int]:
+    resp = getattr(error, "resp", None)
+    status = getattr(resp, "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_backoff(call, *, what: str):
+    """Execute a Gmail request, retrying only what is worth retrying.
+
+    Everything else propagates. A silently swallowed HttpError against a real
+    mailbox is the worst outcome available here: the run reports success and the
+    mail was never touched.
+    """
+    delay = 1.0
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            return call()
+        except Exception as exc:
+            status = _status_of(exc)
+            if status not in _RETRY_STATUSES or attempt == _MAX_ATTEMPTS:
+                raise
+            log.warning("gmail %s returned %s, retry %d/%d in %.1fs",
+                        what, status, attempt, _MAX_ATTEMPTS - 1, delay)
+            time.sleep(delay)
+            delay *= 2
+
+
+def _header(headers: list[dict], name: str) -> str:
+    lowered = name.lower()
+    for h in headers:
+        if (h.get("name") or "").lower() == lowered:
+            return h.get("value") or ""
+    return ""
+
+
+def _iso_date(raw: str) -> str:
+    """RFC 2822 -> ISO 8601.
+
+    The snapshot stores ISO and recency.py does date arithmetic on this field,
+    so both clients must produce the same shape. An unparseable date returns the
+    raw string rather than raising: a malformed Date header is the sender's
+    fault and must not cost the owner a whole run.
+    """
+    if not raw:
+        return ""
+    try:
+        return parsedate_to_datetime(raw).isoformat()
+    except (TypeError, ValueError):
+        return raw
+
+
+class LiveGmailClient:
+    """The real mailbox, behind the same seven-method protocol as the snapshot.
+
+    Takes a BUILT service object rather than credentials, which is what makes it
+    testable: every test drives it through a fake of the googleapiclient
+    resource chain, with no network and no credentials anywhere.
+
+    Two invariants it shares with SnapshotGmailClient and must never break:
+    `query` is answered the same way by both - here, by handing it to Gmail
+    verbatim - and `Thread.label_ids` holds display NAMES.
+    """
+
+    def __init__(self, service, http_factory=None):
+        self._service = service
+        self._http_factory = http_factory
+        self._local = threading.local()
+        self._labels = _LabelMap(service, http=self._http)
+
+    def _http(self):
+        """This thread's transport, or None to use the service's own.
+
+        httplib2.Http is NOT thread-safe, and googleapiclient's service object
+        holds exactly one. Sharing it across the hydration pool corrupts the
+        SSL socket state, and it surfaces as
+
+            ssl.SSLError: [SSL: WRONG_VERSION_NUMBER] wrong version number
+
+        which names nothing whatsoever about threads. Reproduced against the
+        real mailbox before this existed: one worker succeeded every time, five
+        workers failed every time.
+
+        None is a valid return and is what the tests use - HttpRequest.execute
+        falls back to its own http when passed None, so the fakes never need a
+        transport at all.
+        """
+        if self._http_factory is None:
+            return None
+        http = getattr(self._local, "http", None)
+        if http is None:
+            http = self._local.http = self._http_factory()
+        return http
+
+    # --- reads --------------------------------------------------------------
+
+    def _threads_resource(self):
+        return self._service.users().threads()
+
+    def list_threads(self, limit: int = 50, query: str = "") -> list[Thread]:
+        """Ids from Gmail, then one get per id to hydrate.
+
+        `query` goes to the API verbatim; `matches_query` is never called here.
+        Gmail's `q` accepts display names for `label:` - verified against the
+        real mailbox with `-label:Education/AI` - so `settings.inbox_query`
+        needs no translation. Only `label_ids` on the way back does.
+        """
+        result = _with_backoff(
+            lambda: self._threads_resource().list(
+                userId="me", q=query,
+                maxResults=limit).execute(http=self._http()),
+            what="threads.list")
+        ids = [t["id"] for t in (result.get("threads") or [])]
+        if not ids:
+            return []
+
+        # Built once here rather than lazily inside each worker: five threads
+        # racing to build it would issue five labels.list calls.
+        self._labels._ensure()
+
+        with ThreadPoolExecutor(max_workers=_HYDRATE_WORKERS) as pool:
+            # pool.map preserves input order. Gmail returns newest first and the
+            # digest renders in that order, so ordering is contract rather than
+            # an accident of scheduling.
+            return list(pool.map(self.get_thread, ids))
+
+    def get_thread(self, thread_id: str) -> Thread:
+        raw = _with_backoff(
+            lambda: self._threads_resource().get(
+                userId="me", id=thread_id,
+                format="full").execute(http=self._http()),
+            what="threads.get")
+        return self._to_thread(raw)
+
+    def _to_thread(self, raw: dict) -> Thread:
+        messages = raw.get("messages") or []
+        if not messages:
+            return Thread(id=raw.get("id", ""), subject="", sender="", to=[],
+                          date="", snippet="", body="", label_ids=[])
+
+        first = messages[0]
+        headers = (first.get("payload") or {}).get("headers") or []
+
+        # Labels are per-message in Gmail but per-thread everywhere above this
+        # line, so union them: a thread is UNREAD if any message in it is.
+        label_ids: list[str] = []
+        for msg in messages:
+            for lid in msg.get("labelIds") or []:
+                name = self._labels.to_name(lid)
+                if name not in label_ids:
+                    label_ids.append(name)
+
+        to_raw = _header(headers, "To")
+        return Thread(
+            id=raw.get("id", ""),
+            subject=_header(headers, "Subject"),
+            sender=_header(headers, "From"),
+            to=[a.strip() for a in to_raw.split(",") if a.strip()],
+            date=_iso_date(_header(headers, "Date")),
+            snippet=first.get("snippet", "") or "",
+            body=_extract_body(first.get("payload") or {}),
+            label_ids=label_ids,
+        )
+
+    # --- writes -------------------------------------------------------------
+
+    def _modify(self, thread_id: str, body: dict) -> dict[str, Any]:
+        _with_backoff(
+            lambda: self._threads_resource().modify(
+                userId="me", id=thread_id,
+                body=body).execute(http=self._http()),
+            what="threads.modify")
+        return {"thread_id": thread_id, **body}
+
+    def apply_label(self, thread_id: str, label: str) -> dict[str, Any]:
+        return self._modify(
+            thread_id, {"addLabelIds": [self._labels.to_id(label)]}
+        ) | {"label": label}
+
+    def remove_label(self, thread_id: str, label: str) -> dict[str, Any]:
+        return self._modify(
+            thread_id, {"removeLabelIds": [self._labels.to_id(label)]}
+        ) | {"label": label}
+
+    def archive(self, thread_id: str) -> dict[str, Any]:
+        # INBOX is a system label whose id IS "INBOX", so this needs no lookup
+        # and cannot create anything.
+        return self._modify(
+            thread_id, {"removeLabelIds": ["INBOX"]}) | {"action": "archive"}
+
+    def trash(self, thread_id: str) -> dict[str, Any]:
+        """threads.trash(), not a TRASH label.
+
+        The real endpoint is what untrash() reverses, and what puts the thread
+        in Trash with the 30-day recovery window the owner expects. Adding a
+        TRASH label by hand is a different operation that does not reverse the
+        same way.
+        """
+        _with_backoff(
+            lambda: self._threads_resource().trash(
+                userId="me", id=thread_id).execute(http=self._http()),
+            what="threads.trash")
+        return {"thread_id": thread_id, "action": "trash"}
+
+    def create_draft(self, thread_id: str, body: str) -> dict[str, Any]:
+        """A reply draft attached to the thread.
+
+        threadId alone is what makes Gmail file the draft in the right
+        conversation; In-Reply-To and References are set from the LAST message
+        so other mail clients thread it too.
+        """
+        thread = _with_backoff(
+            lambda: self._threads_resource().get(
+                userId="me", id=thread_id,
+                format="full").execute(http=self._http()),
+            what="threads.get")
+        messages = thread.get("messages") or []
+        headers = ((messages[-1].get("payload") or {}).get("headers") or []
+                   if messages else [])
+        message_id = _header(headers, "Message-ID")
+        to = _header(headers, "From")
+        subject = _header(headers, "Subject")
+        if subject and not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        lines = [f"To: {to}", f"Subject: {subject}"]
+        if message_id:
+            lines.append(f"In-Reply-To: {message_id}")
+            lines.append(f"References: {message_id}")
+        raw = "\r\n".join(lines) + "\r\n\r\n" + body
+        encoded = base64.urlsafe_b64encode(raw.encode()).decode()
+
+        created = _with_backoff(
+            lambda: self._service.users().drafts().create(
+                userId="me",
+                body={"message": {"threadId": thread_id, "raw": encoded}}
+            ).execute(http=self._http()),
+            what="drafts.create")
+        return {"thread_id": thread_id, "draft_id": created.get("id"),
+                "draft_chars": len(body)}

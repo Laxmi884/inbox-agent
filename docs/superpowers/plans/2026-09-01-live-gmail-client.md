@@ -1076,7 +1076,7 @@ text part and must still classify on subject and sender."
 
 ---
 
-### Task 5: `LiveGmailClient`
+### Task 5: `LiveGmailClient`  ✅ DONE
 
 **Files:**
 - Modify: `inbox_agent/gmail.py` (append `LiveGmailClient`)
@@ -1086,7 +1086,7 @@ text part and must still classify on subject and sender."
 - Consumes: `_LabelMap` (Task 3), `_extract_body` (Task 4).
 - Produces: `LiveGmailClient(service)` implementing all seven `GmailClient` methods — `list_threads`, `get_thread`, `apply_label`, `remove_label`, `archive`, `trash`, `create_draft`. The constructor takes a built Gmail `service` object, never credentials; that is what keeps it testable.
 
-- [ ] **Step 1: Write the FakeGmailApi and the failing tests**
+- [x] **Step 1: Write the FakeGmailApi and the failing tests**
 
 Create `tests/test_live_gmail.py`:
 
@@ -1367,12 +1367,12 @@ def test_empty_result_is_an_empty_list_not_an_error(api):
     assert LiveGmailClient(api).list_threads(limit=10) == []
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/test_live_gmail.py -q`
 Expected: FAIL with `ImportError: cannot import name 'LiveGmailClient'`
 
-- [ ] **Step 3: Implement LiveGmailClient**
+- [x] **Step 3: Implement LiveGmailClient**
 
 Add to the imports at the top of `inbox_agent/gmail.py`:
 
@@ -1629,17 +1629,17 @@ class LiveGmailClient:
                 "draft_chars": len(body)}
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_live_gmail.py -q`
 Expected: PASS (18 tests)
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: Run the full suite**
 
 Run: `python -m pytest -q --ignore=tests/test_learning.py`
 Expected: 224 passed (173 baseline + 7 + 6 + 10 + 10 + 18)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add inbox_agent/gmail.py tests/test_live_gmail.py
