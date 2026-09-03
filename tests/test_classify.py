@@ -383,3 +383,59 @@ def test_trash_is_not_given_a_read_marker():
     second one would leave the undo half-applied."""
     j = ThreadJudgment(category="promotion", action="trash", reason="r", confidence=0.9)
     assert _kinds(j) == ["trash"]
+
+
+# --- progress, so a stall is distinguishable from work ----------------------
+#
+# graph.invoke is one blocking call: a run eighteen minutes into a stall looks
+# exactly like one that started a second ago. The incident that motivated this
+# was a model running away to its 16 384-token ceiling at ~179s per thread,
+# logging nothing at all - the run just took forever and nobody could say where
+# it was.
+
+import logging
+
+from inbox_agent.classify import SLOW_CLASSIFY_SECONDS, classify_batch
+
+
+class _FixedLLM:
+    """Answers instantly and identically; the timing is faked by the clock."""
+    def with_structured_output(self, schema): return self
+    def invoke(self, messages):
+        return ThreadJudgment(category="promotion", action="archive",
+                              reason="a sale", confidence=0.9)
+
+
+def _threads(n):
+    return [Thread(id=f"t{i}", subject=f"S{i}", sender="a@b.com", to=[],
+                   date="2026-09-01T10:00:00Z", snippet="s", body="",
+                   label_ids=["INBOX"]) for i in range(n)]
+
+
+def test_each_thread_reports_where_the_run_has_got_to(caplog):
+    with caplog.at_level(logging.INFO, logger="inbox_agent.classify"):
+        classify_batch(_threads(3), _FixedLLM(), policy())
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("1/3" in line for line in lines)
+    assert any("3/3" in line for line in lines)
+
+
+def test_an_ordinary_thread_is_information_not_a_warning(caplog):
+    with caplog.at_level(logging.INFO, logger="inbox_agent.classify"):
+        classify_batch(_threads(1), _FixedLLM(), policy())
+    assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+def test_a_runaway_thread_is_a_warning(caplog, monkeypatch):
+    """Buried at INFO among fifty healthy threads it would not be found."""
+    clock = iter([0.0, SLOW_CLASSIFY_SECONDS + 1.0])
+    monkeypatch.setattr("inbox_agent.classify.time.monotonic", lambda: next(clock))
+    with caplog.at_level(logging.INFO, logger="inbox_agent.classify"):
+        classify_batch(_threads(1), _FixedLLM(), policy())
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+def test_the_batch_still_returns_every_decision():
+    """Instrumentation must not change the answer."""
+    decisions = classify_batch(_threads(4), _FixedLLM(), policy())
+    assert [d.thread_id for d in decisions] == ["t0", "t1", "t2", "t3"]

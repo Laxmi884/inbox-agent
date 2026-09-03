@@ -1494,3 +1494,66 @@ def test_status_still_answers_when_the_countdown_cannot_be_read(bot, monkeypatch
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     b.handle_update(msg("/status"))
     assert "No run is waiting" in t.sent[-1]["text"]
+
+
+# --- traces you can tell apart ----------------------------------------------
+#
+# P4's first problem is not that runs are untraced, it is that a trace nobody
+# can identify answers no question. A run against the real mailbox and one
+# against the frozen snapshot look identical until something says which.
+
+def test_the_run_is_tagged_with_the_mailbox_it_touched(bot):
+    b, _, _ = bot
+    config = b._trace_config(limit=4)
+    assert f"gmail:{b.settings.gmail}" in config["tags"]
+    assert config["run_name"] == f"triage-{b.settings.gmail}"
+
+
+def test_the_run_is_tagged_with_whether_it_could_write(bot):
+    """dry_run is the difference between a rehearsal and the real thing."""
+    b, _, _ = bot
+    assert "dry_run:true" in b._trace_config(limit=4)["tags"]
+
+
+def test_the_trace_carries_the_policy_that_judged(bot):
+    b, _, _ = bot
+    b.policy_version = "hub:abc123"
+    assert b._trace_config(4)["metadata"]["policy_version"] == "hub:abc123"
+
+
+def test_an_untold_policy_version_is_unknown_not_a_guess(bot):
+    b, _, _ = bot                       # the fixture passes none
+    assert b._trace_config(4)["metadata"]["policy_version"] == "unknown"
+
+
+def test_the_trace_does_not_carry_the_owners_chat_id(bot):
+    """LangSmith is an external service and the chat id identifies the owner.
+    It has already been redacted once from a file in this repo."""
+    b, _, _ = bot
+    config = b._trace_config(limit=4)
+    blob = f"{config['run_name']}{config['tags']}{config['metadata']}"
+    assert b.chat_id not in blob
+
+
+def test_the_trace_config_still_carries_the_checkpointer_identity(bot):
+    """Losing thread_id here would silently detach every run from its
+    checkpoint - the resume path and /cancel both key off it."""
+    b, _, _ = bot
+    assert b._trace_config(4)["configurable"]["thread_id"] == \
+        b._config["configurable"]["thread_id"]
+
+
+def test_a_real_run_goes_through_the_traced_config(bot):
+    """The config is only worth building if invoke actually receives it."""
+    b, t, _ = bot
+    seen = {}
+    original = b.graph.invoke
+
+    def spy(state, config, *a, **k):
+        seen.update(config)
+        return original(state, config, *a, **k)
+
+    b.graph.invoke = spy
+    b.handle_update(msg("/triage 4"))
+    assert seen.get("run_name", "").startswith("triage-")
+    assert seen["configurable"]["thread_id"]

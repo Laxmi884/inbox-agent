@@ -50,7 +50,8 @@ class Bot:
     def __init__(self, *, transport, graph, settings: Settings,
                  held: HeldQueue, prefs: PreferenceStore, client=None,
                  log: Optional[AuditLog] = None,
-                 categories: Sequence[str] = (), mode: Optional[str] = None):
+                 categories: Sequence[str] = (), mode: Optional[str] = None,
+                 policy_version: Optional[str] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
@@ -69,6 +70,10 @@ class Bot:
         self.client = client
         self.log = log
         self.categories = list(categories)
+        # Recorded, not resolved: the policy is loaded once in __main__ and the
+        # bot only reports which one is in play. Optional because a caller that
+        # does not care about traces should not be forced to thread it through.
+        self.policy_version = policy_version
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
 
@@ -112,6 +117,37 @@ class Bot:
         # One LangGraph thread per triage run. A new run gets a new id so a
         # replayed callback against a finished run cannot resume it.
         return {"configurable": {"thread_id": f"tg-{self.chat_id}-{self._run}"}}
+
+    def _trace_config(self, limit: int) -> dict:
+        """The checkpointer identity, plus enough for a trace to be findable.
+
+        Traces are worth having only if you can tell them apart. Untagged, a
+        run against the real mailbox is indistinguishable in LangSmith from one
+        against the frozen snapshot, and a dry run from one that actually
+        wrote - which is the same confusion spec 1.4 is about, arriving by a
+        different route.
+
+        The chat id is deliberately absent. It identifies the owner, LangSmith
+        is an external service, and it has already been redacted once from a
+        file in this repo. The policy version is deliberately present: it is a
+        Context Hub commit hash, Context Hub is LangSmith, so it is not
+        travelling anywhere new - and without it a judgment in a trace cannot
+        be tied to the policy that produced it.
+        """
+        config = dict(self._config)
+        config["run_name"] = f"triage-{self.settings.gmail}"
+        config["tags"] = [
+            f"gmail:{self.settings.gmail}",
+            f"dry_run:{str(self.settings.dry_run).lower()}",
+            f"backend:{self.settings.backend}",
+        ]
+        config["metadata"] = {
+            "run": self._run,
+            "limit": limit,
+            "mode": "incremental",
+            "policy_version": self.policy_version or "unknown",
+        }
+        return config
 
     def _authorised(self, update: dict) -> bool:
         """Exactly one Telegram user may drive this bot.
@@ -851,7 +887,8 @@ class Bot:
         # what the queue and the digest replace.
         try:
             self._last_run = self.graph.invoke(
-                {"limit": limit, "mode": "incremental"}, self._config)
+                {"limit": limit, "mode": "incremental"},
+                self._trace_config(limit))
         except Exception as exc:
             # Silence is indistinguishable from an empty inbox, which is a
             # failure the owner would trust for days without noticing. Say so.

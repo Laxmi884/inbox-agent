@@ -6,6 +6,8 @@ The email body is fenced as untrusted data and never joined to instructions.
 """
 from __future__ import annotations
 
+import logging
+import time
 from typing import Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -346,8 +348,39 @@ def classify_thread(thread: Thread, llm, policy: Policy, instructions=None,
     )
 
 
+log = logging.getLogger(__name__)
+
+# A thread that takes longer than this to classify is not slow, it is wrong.
+# Chosen from the incident that motivated the logging: a model that ran away to
+# its 16 384-token ceiling sat at ~179s per thread, while an ordinary snippet
+# classification is seconds. Anywhere between those is a threshold; this one is
+# far enough above normal not to cry wolf and far enough below the runaway to
+# catch it on the first thread rather than the twentieth.
+SLOW_CLASSIFY_SECONDS = 30.0
+
+
 def classify_batch(threads: list[Thread], llm, policy: Policy,
                    instructions=None, *, body_budget: int = 0) -> list[Decision]:
-    """Sequential by design: one thread per call keeps context small for Gemma."""
-    return [classify_thread(t, llm, policy, instructions, body_budget=body_budget)
-            for t in threads]
+    """Sequential by design: one thread per call keeps context small for Gemma.
+
+    Sequential is also why the progress line matters. `graph.invoke` is one
+    blocking call, so a run eighteen minutes into a stall looks exactly like a
+    run that started a second ago - the owner sees nothing either way. A model
+    that ran away to its token ceiling cost ~179s per thread and logged not one
+    word about it; the run simply took forever and nobody could say where it
+    was. Now it says where it is.
+    """
+    decisions = []
+    total = len(threads)
+    for index, thread in enumerate(threads, 1):
+        started = time.monotonic()
+        decision = classify_thread(thread, llm, policy, instructions,
+                                   body_budget=body_budget)
+        elapsed = time.monotonic() - started
+        # WARNING rather than INFO past the threshold, so the one thread worth
+        # looking at is not buried in fifty that were fine.
+        log.log(logging.WARNING if elapsed >= SLOW_CLASSIFY_SECONDS else logging.INFO,
+                "classify %d/%d %s in %.1fs -> %s", index, total,
+                thread.id, elapsed, decision.category)
+        decisions.append(decision)
+    return decisions

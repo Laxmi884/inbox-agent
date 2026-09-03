@@ -101,7 +101,8 @@ def main() -> int:
     # The same PreferenceStore the graph reads rules from: a correction is a
     # store write, and two instances would let one land where nothing reads it.
     bot = Bot(transport=transport, graph=graph, settings=settings, held=held,
-              prefs=prefs, client=client, log=log, categories=categories)
+              prefs=prefs, client=client, log=log, categories=categories,
+              policy_version=policy.version)
 
     print(f"backend   : {settings.backend}")
     # Which mailbox is in play is the single thing to be certain of before a
