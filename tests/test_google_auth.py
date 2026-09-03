@@ -252,6 +252,23 @@ def test_a_corrupt_sidecar_reads_as_unknown_rather_than_raising(tmp_path):
     assert google_auth.consented_at(token) is None
 
 
+def test_a_naive_timestamp_in_the_sidecar_reads_as_unknown_rather_than_raising(tmp_path):
+    """record_consent always writes an aware, UTC timestamp; a naive one can
+    only come from a hand-edit - the likeliest one being exactly this field.
+    fromisoformat() parses a naive value without error, so without a tzinfo
+    check this would return a naive datetime that doctor._oauth_check then
+    subtracts from an aware datetime.now(timezone.utc), raising TypeError
+    instead of doctor reporting anything at all. Treat it as unknown, the
+    same as a corrupt or missing sidecar."""
+    from inbox_agent import google_auth
+
+    token = tmp_path / "token.json"
+    token.write_text("{}")
+    google_auth.consent_sidecar(token).write_text(
+        '{"consented_at": "2026-09-01T00:00:00"}')
+    assert google_auth.consented_at(token) is None
+
+
 def test_sidecar_with_no_consented_at_key_reads_as_unknown(tmp_path):
     """A sidecar that is valid JSON but missing the consented_at key (hand-edited
     or half-written file) must not crash doctor; it reads as "unknown" instead."""

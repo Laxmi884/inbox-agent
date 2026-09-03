@@ -16,7 +16,7 @@ from typing import Optional
 # draft-create - every action on the autonomy ladder - and grants neither send
 # (gmail.send) nor permanent delete (https://mail.google.com/).
 #
-# ALWAYS_FORBIDDEN (config.py:28) is exactly {send_message, delete_forever}, so
+# ALWAYS_FORBIDDEN (config.py:37) is exactly {send_message, delete_forever}, so
 # the scope boundary and the deny-list coincide. That puts the two forbidden
 # actions beyond reach at Google's edge and not only at audit.py's chokepoint,
 # which is a strictly stronger guarantee than our own code can offer. A wider
@@ -140,15 +140,27 @@ def record_consent(token_path: Path, *, now: Optional[datetime] = None) -> None:
 
 
 def consented_at(token_path: Path) -> Optional[datetime]:
-    """When consent was granted, or None if unrecorded or unreadable.
+    """When consent was granted, or None if unrecorded, unreadable, or naive.
 
     None for every token issued before this existed. Diagnostics only - never
     read as authorisation - so a missing or corrupt file degrades to "unknown"
     rather than raising in a caller that is trying to explain what is wrong.
+
+    record_consent always writes an aware, UTC timestamp, so a naive one here
+    can only come from a hand-edited sidecar - the likeliest hand-edit being
+    exactly this field. A naive value cannot be safely assumed to be UTC (or
+    any other zone), and doctor._oauth_check subtracts it from an aware
+    `datetime.now(timezone.utc)`; guessing a zone would risk a confident wrong
+    revocation date, and mixing aware/naive raises TypeError instead of
+    degrading. So a naive value is treated the same as an unreadable one:
+    unknown, not raised, not guessed.
     """
     try:
         raw = json.loads(consent_sidecar(token_path).read_text(encoding="utf-8"))
-        return datetime.fromisoformat(raw["consented_at"])
+        parsed = datetime.fromisoformat(raw["consented_at"])
+        if parsed.tzinfo is None:
+            return None
+        return parsed
     except Exception:
         return None
 
