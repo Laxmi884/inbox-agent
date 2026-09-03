@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inbox-agent"
+version = "0.1.0"
+description = "An email triage agent that acts on the confident majority and asks about the rest"
+requires-python = ">=3.11"
+
+# Floors are the versions this was verified against, not guesses. graph.py
+# documents checkpoint_id behaviour confirmed against langgraph 1.2.11
+# specifically, so going below these is unsupported.
+dependencies = [
+  "langgraph>=1.2.11",
+  "langgraph-checkpoint-sqlite>=3.1.0",
+  "langchain-core>=1.6.0",
+  "langsmith>=0.11.1",
+  "pydantic>=2.11",
+  "python-dotenv>=1.2",
+  "google-api-python-client>=2.200",
+  "google-auth>=2.52",
+  "google-auth-oauthlib>=1.4",
+  "google-auth-httplib2>=0.4",
+  "httplib2>=0.22",
+  "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+# Both providers are imported lazily inside functions in config.py, so neither
+# is needed to import the package - only to build the model it names.
+ollama = ["langchain-ollama>=1.1.0"]
+openai = ["langchain-openai>=1.2.1"]
+dev    = ["pytest>=7.4"]
+
+[project.scripts]
+inbox-agent = "inbox_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["inbox_agent"]
