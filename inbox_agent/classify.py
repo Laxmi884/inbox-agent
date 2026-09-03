@@ -351,12 +351,23 @@ def classify_thread(thread: Thread, llm, policy: Policy, instructions=None,
 log = logging.getLogger(__name__)
 
 # A thread that takes longer than this to classify is not slow, it is wrong.
-# Chosen from the incident that motivated the logging: a model that ran away to
-# its 16 384-token ceiling sat at ~179s per thread, while an ordinary snippet
-# classification is seconds. Anywhere between those is a threshold; this one is
-# far enough above normal not to cry wolf and far enough below the runaway to
-# catch it on the first thread rather than the twentieth.
-SLOW_CLASSIFY_SECONDS = 30.0
+#
+# Measured rather than guessed, on gemma4:12b-mlx via Ollama with
+# body_budget=0, 2026-09-03: four representative threads took 4.3s, 4.5s, 8.1s
+# and 11.2s once the model was warm, and the very first call after a restart
+# took 21.5s because it includes the model load. The runaway that motivated
+# this logging sat at ~179s per thread.
+#
+# So the honest window is "above ~21s, well below 179s", and the first draft of
+# this constant was 30s - under 3x the worst healthy thread, and close enough
+# to a cold start to fire on the first thread of a run that was fine. That is
+# the cry-wolf failure tools/secret_scan.py is built around, reached from the
+# inside. 60s is ~5x the worst measured healthy thread and still catches the
+# runaway on its first thread rather than its twentieth.
+#
+# Bodies raise this: every figure above is snippet-sized, so a deployment with
+# body_budget>0 should re-measure before trusting the margin.
+SLOW_CLASSIFY_SECONDS = 60.0
 
 
 def classify_batch(threads: list[Thread], llm, policy: Policy,
