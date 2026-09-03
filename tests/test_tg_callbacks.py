@@ -181,7 +181,8 @@ def test_a_digest_id_that_is_not_hex_is_rejected():
 # travels, so no callback string can name a thread the owner was not shown.
 
 def test_the_new_verdict_kinds_round_trip():
-    for kind in ("keep", "relabel", "teach_trash", "scope_narrow", "scope_wide"):
+    for kind in ("keep", "relabel", "teach_trash", "keep_inbox", "file_away",
+                 "scope_narrow", "scope_wide"):
         intent = decode(encode(kind, 3, digest_id="7f2a"))
         assert intent.kind == kind
         assert intent.index == 3
@@ -190,7 +191,8 @@ def test_the_new_verdict_kinds_round_trip():
 
 def test_every_new_kind_fits_the_byte_cap():
     """64 bytes is protocol. An index reaches three digits on a backlog."""
-    for kind in ("keep", "relabel", "teach_trash", "scope_narrow", "scope_wide"):
+    for kind in ("keep", "relabel", "teach_trash", "keep_inbox", "file_away",
+                 "scope_narrow", "scope_wide"):
         assert len(encode(kind, 999, digest_id="7f2a").encode()) <= CB_MAX_BYTES
 
 
