@@ -33,3 +33,14 @@ inbox_agent/checkpoints.sqlite*
 *.sqlite-shm
 *.sqlite-wal
 .superpowers/
+
+# Scratch notebooks — test.ipynb held a live Cohere API key in cell source.
+# Untracked files are invisible to tools/secret_scan.py (it reads git ls-files
+# and the staged set), so an untracked scratch file is exactly where a secret
+# survives unnoticed until someone runs `git add .`.
+test.ipynb
+parsed_output.md
+
+# Worktrees created for parallel branches. These are full checkouts managed by
+# git itself; committing them would nest the repo inside itself.
+.claude/worktrees/

@@ -322,6 +322,56 @@ class Bot:
         ]
         self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
+    def _ask_filing(self, item: DoneItem) -> None:
+        """Category first, filing second - asked unconditionally on relabel.
+
+        A `learning` item stays in the inbox per policy, but the archive the
+        run produced was a consequence of the category being wrong, not an
+        independent decision to preserve. Asking every time is uniform,
+        predictable, and needs no reading of the policy to get right; the two
+        answers are exact inverses of each other so a reader can predict
+        either from the other.
+        """
+        text = f"{item.subject}\n\nKeep it in the inbox, or file it away?"
+        keyboard = [
+            [("Keep in inbox",
+              encode("keep_inbox", self._open_index, digest_id=self._digest_id))],
+            [("File it away",
+              encode("file_away", self._open_index, digest_id=self._digest_id))],
+            [("↩ Back", encode("list", digest_id=self._digest_id))],
+        ]
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
+
+    def _set_filing(self, *, file_away: bool) -> None:
+        """Apply the filing answer to the pending actions, then ask scope.
+
+        Both branches start by stripping every archive AND trash - not just
+        archive - because a done item's actions are not guaranteed to be
+        the label/archive shape relabel usually sees. A fired teach_trash
+        rule's done item is a bare trash(), and render_tg offers "Label
+        as..." on any done item with no gate on what it did, so relabel can
+        reach a trash action here. Filtering only archive would let that
+        trash survive file_away untouched and ride along into the taught
+        rule - "keep this, file it under X" would still re-trash future
+        mail, the opposite of what was asked. Keep stops there; file adds
+        back exactly one archive. That makes the two genuinely exact
+        inverses of the same starting point, not just of each other's name.
+        """
+        pending = self._pending
+        if pending is None:
+            return
+        opened = self._open_item()
+        if opened is None:
+            self._panel = self._panel_before_item
+            self._show(edit=True)
+            return
+        _kind, item = opened
+        actions = [a for a in pending["actions"] if a.kind not in ("archive", "trash")]
+        if file_away:
+            actions = actions + [ActionTemplate(kind="archive")]
+        pending["actions"] = actions
+        self._ask_scope(pending["verdict"], item, pending["category"])
+
     def _held_verdict(self, intent) -> None:
         """Approve or refuse one held item, and drain it from the queue.
 
@@ -557,12 +607,17 @@ class Bot:
         elif intent.kind == "relabel":
             chosen = self.categories[intent.label_index] \
                 if 0 <= (intent.label_index or 0) < len(self.categories) else category
-            # The original sequence with the label swapped: correcting the
-            # label should not silently also change whether it was archived.
-            actions = [ActionTemplate(kind=k, params={"label": chosen} if k == "label"
-                                      else ({"label": v} if v else {}))
-                       for k, v in item.actions] or \
-                      [ActionTemplate(kind="label", params={"label": chosen})]
+            # One label(chosen), always, then everything else the run did
+            # that isn't a label, in order. NOT built by substituting into an
+            # existing label action: 6 of 10 threads in the run that found
+            # this bug were bare `archive, unlabel(UNREAD)` with no label
+            # action to substitute into, so the substitution silently
+            # dropped the correction. unlabel is not a label action - only
+            # kind == "label" is - so unlabel(UNREAD) passes through here
+            # untouched rather than being mistaken for the thing to replace.
+            actions = [ActionTemplate(kind="label", params={"label": chosen})] + \
+                      [ActionTemplate(kind=k, params={"label": v} if v else {})
+                       for k, v in item.actions if k != "label"]
             category = chosen
         else:
             actions = [ActionTemplate(kind="trash")]
@@ -575,6 +630,12 @@ class Bot:
             # (Plan 1's partition decision), which is a blast radius no single
             # correction should be able to reach.
             self._teach(wide=False)
+            return
+        if intent.kind == "relabel":
+            # Asked every time, unconditionally: the filing the run chose may
+            # have been a consequence of the wrong category, and there is no
+            # policy-reading shortcut that is both simple and predictable.
+            self._ask_filing(item)
             return
         self._ask_scope(intent.kind, item, category)
 
@@ -881,6 +942,9 @@ class Bot:
             return
         if intent.kind in ("keep", "relabel", "teach_trash"):
             self._verdict(intent)
+            return
+        if intent.kind in ("keep_inbox", "file_away"):
+            self._set_filing(file_away=intent.kind == "file_away")
             return
         if intent.kind in ("scope_narrow", "scope_wide"):
             self._teach(wide=intent.kind == "scope_wide")
