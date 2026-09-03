@@ -671,6 +671,175 @@ def test_relabel_offers_the_policys_categories(bot):
     assert any("recruiter" in l for l in labels)
 
 
+# --- relabel writes the label it names ---------------------------------------
+# 6 of 10 threads in the run that produced this bug were actioned as bare
+# `archive, unlabel(UNREAD)` - no `label` action to substitute the chosen
+# category into. The old code silently dropped the correction and taught a
+# rule that filed mail away instead of labelling it, at rule authority, so
+# it auto-executed the opposite of what the owner asked.
+
+def test_relabel_over_actions_with_no_label_produces_label_chosen(bot):
+    """The reported bug, reproduced exactly: a run that only archived and
+    cleared UNREAD has no `label` action to substitute into. This must
+    fail against the code that substitutes into an existing label action,
+    because there is nothing here to substitute into."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("archive", None), ("unlabel", "UNREAD")))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))  # -> recruiter
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert any(a.kind == "label" and a.params.get("label") == "recruiter"
+               for a in rule.actions), \
+        f"the chosen label never made it into the rule: {rule.actions!r}"
+
+
+def test_relabel_over_actions_with_a_label_replaces_it(bot):
+    """A label was already there - the owner just picked the wrong one -
+    so the fix must swap it, not add a second label action alongside it."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "recruiter"), ("archive", None),
+                          ("unlabel", "UNREAD")))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 1, digest_id=b._digest_id)))  # -> promotion
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert kinds.count("label") == 1, f"expected exactly one label, got {rule.actions!r}"
+    assert rule.actions[kinds.index("label")].params.get("label") == "promotion"
+
+
+def test_unlabel_is_never_mistaken_for_a_label_action(bot):
+    """unlabel(UNREAD) carries a `label` param exactly like `label` does.
+    Only kind == "label" counts as a label action - unlabel must pass
+    through untouched and must not be counted as, or replaced like, one."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("unlabel", "UNREAD"),))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))  # -> recruiter
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert kinds == ["label", "unlabel"]
+    assert kinds.count("label") == 1
+
+
+# --- relabel also asks about filing -------------------------------------
+# `learning` stays in the inbox per policy, but relabel used to preserve
+# whatever filing the wrong category produced. The owner's decision: ask
+# every time, right after the category tap and before the scope question.
+
+def test_choosing_a_category_asks_about_filing_before_scope(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))
+    assert b.prefs.rules() == [], "a rule was written before filing/scope were chosen"
+    kinds = [decode(d).kind for row in t.edited[-1]["keyboard"] for (_, d) in row]
+    assert {"keep_inbox", "file_away"} <= set(kinds)
+
+
+def test_keep_in_inbox_removes_archive_and_trash(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    # Both archive and trash present, so the trash half of the assertion
+    # below is not vacuous - a filter that dropped "trash" from its
+    # exclusion set would still pass a fixture with no trash in it.
+    _done_run(b, actions=(("archive", None), ("trash", None), ("unlabel", "UNREAD")))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep_inbox", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert "archive" not in kinds and "trash" not in kinds
+
+
+def test_file_it_away_also_strips_a_coexisting_trash(bot):
+    """The path a review found reachable: a taught teach_trash rule always
+    teaches exactly [trash()]. When that rule later fires, the done item's
+    only action is trash - render_tg offers "Label as..." on any done item
+    with no gate on what it did, so relabel can be tapped on a trashed
+    item. Filing it away must not let that trash ride along: "keep this,
+    file it under X" would otherwise still re-trash future matching mail,
+    the opposite of what was asked."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("trash", None),), actor="rule:x")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("file_away", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert "trash" not in kinds, f"trash rode along into the taught rule: {rule.actions!r}"
+    assert kinds.count("archive") == 1
+
+
+def test_file_it_away_adds_archive_when_absent(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("label", "recruiter"), ("unlabel", "UNREAD")))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 1, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("file_away", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert kinds.count("archive") == 1
+
+
+def test_file_it_away_does_not_duplicate_an_existing_archive(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("archive", None), ("unlabel", "UNREAD")))
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("file_away", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert kinds.count("archive") == 1
+
+
+def test_the_full_relabel_sequence_writes_exactly_what_the_taps_said(bot):
+    """relabel -> category -> filing -> scope, end to end."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)  # default: category "promotion", actions (("archive", None),)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))       # tap 1
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))    # tap 2: recruiter
+    b.handle_update(cb(encode("keep_inbox", 0, digest_id=b._digest_id)))    # tap 3
+    b.handle_update(cb(encode("scope_wide", 0, digest_id=b._digest_id)))    # tap 4
+    rule = b.prefs.rules()[0]
+    assert rule.scope == "category"
+    assert rule.pattern == "recruiter"
+    assert [(a.kind, a.params) for a in rule.actions] == \
+        [("label", {"label": "recruiter"})]
+
+
 # --- held verdicts do something ---------------------------------------------
 # The item view shipped with Approve and Not this and no handler behind either.
 # A button that renders and does nothing is the defect this whole branch has
