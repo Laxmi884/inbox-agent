@@ -754,7 +754,10 @@ def test_choosing_a_category_asks_about_filing_before_scope(bot):
 def test_keep_in_inbox_removes_archive_and_trash(bot):
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    _done_run(b, actions=(("archive", None), ("unlabel", "UNREAD")))
+    # Both archive and trash present, so the trash half of the assertion
+    # below is not vacuous - a filter that dropped "trash" from its
+    # exclusion set would still pass a fixture with no trash in it.
+    _done_run(b, actions=(("archive", None), ("trash", None), ("unlabel", "UNREAD")))
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
     b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
@@ -764,6 +767,29 @@ def test_keep_in_inbox_removes_archive_and_trash(bot):
     rule = b.prefs.rules()[0]
     kinds = [a.kind for a in rule.actions]
     assert "archive" not in kinds and "trash" not in kinds
+
+
+def test_file_it_away_also_strips_a_coexisting_trash(bot):
+    """The path a review found reachable: a taught teach_trash rule always
+    teaches exactly [trash()]. When that rule later fires, the done item's
+    only action is trash - render_tg offers "Label as..." on any done item
+    with no gate on what it did, so relabel can be tapped on a trashed
+    item. Filing it away must not let that trash ride along: "keep this,
+    file it under X" would otherwise still re-trash future matching mail,
+    the opposite of what was asked."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, actions=(("trash", None),), actor="rule:x")
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("file_away", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    kinds = [a.kind for a in rule.actions]
+    assert "trash" not in kinds, f"trash rode along into the taught rule: {rule.actions!r}"
+    assert kinds.count("archive") == 1
 
 
 def test_file_it_away_adds_archive_when_absent(bot):

@@ -345,10 +345,17 @@ class Bot:
     def _set_filing(self, *, file_away: bool) -> None:
         """Apply the filing answer to the pending actions, then ask scope.
 
-        Symmetric on purpose: keep strips every archive/trash, file ensures
-        exactly one archive (appending it if absent, never duplicating one
-        already there) - the two are exact inverses, and neither is a
-        default the owner has to notice they're accepting.
+        Both branches start by stripping every archive AND trash - not just
+        archive - because a done item's actions are not guaranteed to be
+        the label/archive shape relabel usually sees. A fired teach_trash
+        rule's done item is a bare trash(), and render_tg offers "Label
+        as..." on any done item with no gate on what it did, so relabel can
+        reach a trash action here. Filtering only archive would let that
+        trash survive file_away untouched and ride along into the taught
+        rule - "keep this, file it under X" would still re-trash future
+        mail, the opposite of what was asked. Keep stops there; file adds
+        back exactly one archive. That makes the two genuinely exact
+        inverses of the same starting point, not just of each other's name.
         """
         pending = self._pending
         if pending is None:
@@ -359,12 +366,9 @@ class Bot:
             self._show(edit=True)
             return
         _kind, item = opened
-        actions = pending["actions"]
+        actions = [a for a in pending["actions"] if a.kind not in ("archive", "trash")]
         if file_away:
-            if not any(a.kind == "archive" for a in actions):
-                actions = actions + [ActionTemplate(kind="archive")]
-        else:
-            actions = [a for a in actions if a.kind not in ("archive", "trash")]
+            actions = actions + [ActionTemplate(kind="archive")]
         pending["actions"] = actions
         self._ask_scope(pending["verdict"], item, pending["category"])
 
