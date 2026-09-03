@@ -11,6 +11,7 @@ import base64
 import html as html_mod
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -422,11 +423,26 @@ def _extract_body(payload: dict) -> str:
 # and error handling for a saving we do not need at this size.
 _HYDRATE_WORKERS = 5
 
-# Backoff applies to 429 and 5xx ONLY. A 4xx is a bug in our request - a bad
-# label id, a malformed query - and retrying it just makes the same mistake
+# Backoff applies to 429 and 5xx. A 4xx is otherwise a bug in our request - a
+# bad label id, a malformed query - and retrying it just makes the same mistake
 # more slowly while hiding it from the caller.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# 403 is the exception, and it cost a live run. Gmail signals "you are going
+# too fast" with 403, not 429, so the status alone carries two opposite
+# meanings: a permission denial that will never succeed, and a rate limit that
+# will succeed shortly. The per-error `reason` is what separates them. On
+# 2026-09-03 a live /triage 20 died on "Quota exceeded ... Units per minute
+# per user" after applying 32 actions to the real mailbox, because the policy
+# read the status, saw a 4xx, and gave up.
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+
+# Two schedules, because the two failures clear on different timescales. A 5xx
+# is a blip: 1+2+4 = 7s. A quota is measured per MINUTE, so the short schedule
+# would give up long before it could possibly clear - 2+4+8+16+32 = 62s.
 _MAX_ATTEMPTS = 4
+_QUOTA_ATTEMPTS = 6
+_QUOTA_BASE_DELAY = 2.0
 
 
 def _status_of(error) -> Optional[int]:
@@ -438,24 +454,67 @@ def _status_of(error) -> Optional[int]:
         return None
 
 
+def _reasons_of(error) -> frozenset:
+    """The per-error `reason` codes Google attaches, or empty if there are none.
+
+    googleapiclient parses these off the response body into `error_details`.
+    Absent or malformed, the answer is the empty set, which reads as "not a
+    rate limit" - the safe way round for an ambiguous 403, because surfacing a
+    real permission problem beats silently waiting a minute on one.
+    """
+    details = getattr(error, "error_details", None)
+    if not isinstance(details, list):
+        return frozenset()
+    return frozenset(d.get("reason") for d in details
+                     if isinstance(d, dict) and d.get("reason"))
+
+
+def _is_rate_limit(error, status) -> bool:
+    """Is this Gmail asking us to slow down, whatever status it used to say so?"""
+    if status == 429:
+        return True
+    return status == 403 and bool(_reasons_of(error) & _RATE_LIMIT_REASONS)
+
+
 def _with_backoff(call, *, what: str):
     """Execute a Gmail request, retrying only what is worth retrying.
 
     Everything else propagates. A silently swallowed HttpError against a real
     mailbox is the worst outcome available here: the run reports success and the
     mail was never touched.
+
+    Waits are jittered. Threads are hydrated _HYDRATE_WORKERS at a time against
+    one shared quota, so an un-jittered schedule has all of them fail together,
+    sleep the identical interval and collide again on every retry - which is
+    how 32 actions went out in 12 seconds and exhausted a per-minute limit.
+
+    The jitter only ever lengthens a wait. Textbook full jitter spreads either
+    side of the nominal delay, but half of that range is spent shortening the
+    schedule, and shortening is the wrong direction to err when the server has
+    just said there were too many requests: it would let the quota schedule
+    finish in 31s, well short of the minute the limit is measured over.
     """
+    attempt = 0
     delay = 1.0
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
+    while True:
+        attempt += 1
         try:
             return call()
         except Exception as exc:
             status = _status_of(exc)
-            if status not in _RETRY_STATUSES or attempt == _MAX_ATTEMPTS:
+            if _is_rate_limit(exc, status):
+                limit, delay = _QUOTA_ATTEMPTS, max(delay, _QUOTA_BASE_DELAY)
+            elif status in _RETRY_STATUSES:
+                limit = _MAX_ATTEMPTS
+            else:
                 raise
-            log.warning("gmail %s returned %s, retry %d/%d in %.1fs",
-                        what, status, attempt, _MAX_ATTEMPTS - 1, delay)
-            time.sleep(delay)
+            if attempt >= limit:
+                raise
+            pause = delay * random.uniform(1.0, 1.5)
+            log.warning("gmail %s returned %s (%s), retry %d/%d in %.1fs",
+                        what, status, ",".join(sorted(_reasons_of(exc))) or "-",
+                        attempt, limit - 1, pause)
+            time.sleep(pause)
             delay *= 2
 
 
