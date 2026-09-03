@@ -118,9 +118,10 @@ starting. It resolves nothing itself — it reads back the same functions the
 bot uses, so it can't tell you something the bot wouldn't also see
 (`inbox_agent/doctor.py:9-11`). This is real output, captured from a
 configured checkout with `INBOX_DRY_RUN=false` additionally exported into the
-shell (to demonstrate the warning below); the Telegram token and chat id —
-the only two fields that identify a real person or credential — are replaced
-with placeholders of the same shape:
+shell (to demonstrate the warning below). Three values that were specific to
+that checkout — the Telegram token, the Telegram chat id, and the Context Hub
+commit hash on the `policy` row — are replaced below with placeholders of the
+same shape; everything else is unedited real output:
 
 ```
   INBOX_GMAIL               live   <- dotenv   THE REAL MAILBOX
@@ -135,7 +136,7 @@ with placeholders of the same shape:
 X INBOX_GOOGLE_CREDENTIALS  secrets/credentials.json   <- default   missing, and INBOX_GMAIL=live needs it
 X INBOX_GOOGLE_TOKEN        secrets/token.json   <- default   missing, and INBOX_GMAIL=live needs it
 ! oauth consent             unknown   <- -   consent date unknown (token predates tracking) - re-consent to start predicting the 7-day revocation
-  policy                    hub:13ac11f11da376e588cb84825ed88d05298f27aaaa90c6f694abf572f34161d9   <- context_hub
+  policy                    hub:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789   <- context_hub
 
 2 fatal, 2 warning(s).  Fix the fatals before starting the bot.
 ```
