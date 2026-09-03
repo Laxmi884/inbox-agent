@@ -44,3 +44,7 @@ parsed_output.md
 # Worktrees created for parallel branches. These are full checkouts managed by
 # git itself; committing them would nest the repo inside itself.
 .claude/worktrees/
+
+# Manual verification runs write these; they carry banner output (paths,
+# chat id, the resolved policy commit) that has no business in the repo.
+.manual-test-*

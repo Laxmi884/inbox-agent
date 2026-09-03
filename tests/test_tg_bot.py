@@ -1263,3 +1263,155 @@ def test_a_no_op_record_is_never_offered_as_an_undo_candidate(bot):
     _open_held_none(b)
     b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
     assert all(r.action != "none" for r in log.undo_candidates())
+
+
+# --- correcting a held item, not only approving or refusing it ---------------
+# Held items are the ones the agent stopped to ask about, and were the one place
+# the owner could not answer. The item view offered Approve and Not this and
+# nothing else, so "this is learning, keep it in the inbox" was unsayable - and
+# a bare reject taught `none`, which says what NOT to do and never what to do.
+# Reported from the dev bot: "I have 2 options approve and none, there is no
+# option to change it or add a rule". The teaching flow already existed; it was
+# only ever wired to the done list.
+
+
+def _open_held_for_correction(b, action="trash"):
+    """One held item, opened. Its proposal is what the correction replaces."""
+    b.handle_update(msg("/triage 4"))
+    b.held.add(review_item("h0", action=action), run_id="r1", reason="trash")
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+
+
+def _relabel_held(b, label_index=0, *, keep_inbox=True, scope_wide=False):
+    """The whole correction: category, then filing, then scope."""
+    b.handle_update(cb(encode("relabel", 0, label_index, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep_inbox" if keep_inbox else "file_away", 0,
+                              digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_wide" if scope_wide else "scope_narrow", 0,
+                              digest_id=b._digest_id)))
+
+
+def test_a_held_item_can_be_corrected_not_just_approved(bot):
+    """The whole point. The proposal was trash; the owner says recruiter."""
+    b, t, _ = bot
+    _open_held_for_correction(b)
+    _relabel_held(b)
+    rule = b.prefs.rules()[0]
+    assert [(a.kind, (a.params or {}).get("label")) for a in rule.actions] == \
+           [("label", "recruiter")], "the correction was not what got taught"
+
+
+def test_correcting_a_held_item_applies_it_to_that_thread_now(bot):
+    """A held thread is work in flight, not history. The owner has just said
+    what the work is, so it happens - through the same chokepoint, with the
+    actor recorded as human, because it was."""
+    b, t, log = bot
+    _open_held_for_correction(b)
+    before = len(log.records())
+    _relabel_held(b)
+    written = log.records()[before:]
+    labels = [r for r in written if r.action == "label"]
+    assert labels, "the correction taught a rule but never touched the thread"
+    assert labels[0].actor == "human"
+    assert (labels[0].params or {}).get("label") == "recruiter"
+
+
+def test_correcting_a_held_item_does_not_also_run_what_was_rejected(bot):
+    """The proposal was trash and the owner said no to it. Executing the
+    correction must not execute the thing the correction replaced."""
+    b, t, log = bot
+    _open_held_for_correction(b)
+    before = len(log.records())
+    _relabel_held(b)
+    assert not [r for r in log.records()[before:] if r.action == "trash"]
+
+
+def test_correcting_a_held_item_drains_it_from_the_queue(bot):
+    """Same reason approving drains it: an item the owner has ruled on is no
+    longer in flight, and leaving it asks them the same question tomorrow."""
+    b, t, _ = bot
+    _open_held_for_correction(b)
+    assert len(b.held.all()) == 1
+    _relabel_held(b)
+    assert b.held.all() == []
+
+
+def test_correcting_a_held_item_does_not_claim_the_run_is_over(bot):
+    """The done path signs off "this run is already done", which is true there
+    and false here: this thread was still waiting a moment ago and has just
+    been acted on."""
+    b, t, _ = bot
+    _open_held_for_correction(b)
+    _relabel_held(b)
+    text = t.edited[-1]["text"].lower()
+    assert "already done" not in text
+    assert "learned" in text
+
+
+def test_a_dry_run_correction_does_not_claim_it_reached_gmail(bot):
+    """settings.dry_run is True in this fixture. Same rule as everywhere else:
+    never the word done for something that did not happen."""
+    b, t, _ = bot
+    _open_held_for_correction(b)
+    _relabel_held(b)
+    text = t.edited[-1]["text"].lower()
+    assert "would have" in text, text
+
+
+def test_keeping_a_held_item_in_the_inbox_strips_the_filing(bot):
+    """The proposal archives it; Keep in inbox must teach a rule that does
+    not, and must not archive the thread on the way past."""
+    b, t, log = bot
+    _open_held_for_correction(b, action="archive")
+    before = len(log.records())
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert "archive" not in [a.kind for a in rule.actions]
+    assert not [r for r in log.records()[before:] if r.action == "archive"]
+
+
+def test_filing_a_corrected_held_item_away_archives_it(bot):
+    """The inverse answer, and it must reach the thread as well as the rule."""
+    b, t, log = bot
+    _open_held_for_correction(b)
+    before = len(log.records())
+    _relabel_held(b, keep_inbox=False)
+    rule = b.prefs.rules()[0]
+    assert [a.kind for a in rule.actions] == ["label", "archive"]
+    assert [r.action for r in log.records()[before:]] == ["label", "archive"]
+
+
+def test_correcting_a_rule_held_item_overrides_that_rule(bot):
+    """A correction of what a rule proposed IS an override of that rule. The
+    held branch of _open_item dropped the rule id entirely, so a rule could be
+    corrected from the queue every morning and never lose precision."""
+    b, t, _ = bot
+    rule = Rule(id="r-old", scope="sender", pattern="h0@example.com",
+                actions=[ActionTemplate(kind="trash")],
+                provenance="taught earlier", created_at=NOW)
+    b.prefs.add_rule(rule)
+    b.handle_update(msg("/triage 4"))
+    item = review_item("h0")
+    item.rule_id = "r-old"
+    b.held.add(item, run_id="r1", reason="trash")
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    _relabel_held(b)
+    assert b._rule("r-old").override_count == 1, "the rule was never demoted"
+    taught = [r for r in b.prefs.rules() if r.id != "r-old"][0]
+    assert taught.supersedes == "r-old"
+
+
+def test_a_bare_reject_still_teaches_that_the_action_was_wrong(bot):
+    """Unchanged, and deliberately kept: a reject with no replacement is still
+    signal, and requiring an edit is why skipping never taught anything. It is
+    no longer the ONLY thing a held item can say."""
+    b, t, log = bot
+    _open_held_for_correction(b)
+    before = len(log.records())
+    b.handle_update(cb(encode("reject", 0, digest_id=b._digest_id)))
+    rule = b.prefs.rules()[0]
+    assert rule.rejected_action == "trash"
+    assert [a.kind for a in rule.actions] == ["none"]
+    assert not [r for r in log.records()[before:] if r.action == "trash"]
+    assert b.held.all() == []

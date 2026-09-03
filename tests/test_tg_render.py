@@ -549,13 +549,36 @@ def test_a_done_item_offers_the_correction_verdicts():
     assert "approve" not in kinds, "a done action is not pending approval"
 
 
-def test_a_held_item_offers_verdicts_not_corrections():
-    """A held item has not happened yet, so the question is approve or not. The
-    past-tense verdicts would describe work that does not exist."""
+def test_a_held_item_offers_corrections_as_well_as_verdicts():
+    """A held item is the one the agent STOPPED to ask about, so it is the last
+    place the owner should be unable to answer. It shipped with approve and
+    reject alone, which made "this is learning, keep it in the inbox"
+    unsayable - the correction vocabulary existed and was wired only to the
+    done list. Reject stays, because a refusal with no replacement is still
+    signal; it is no longer the only thing that can be said."""
     _, kb = item_view(**view_args(kind="held"))
     kinds = [decode(d).kind for row in kb for (_, d) in row]
-    assert {"approve", "reject"} <= set(kinds)
-    assert "keep" not in kinds
+    assert {"approve", "reject", "keep", "relabel", "teach_trash"} <= set(kinds)
+
+
+def test_a_held_item_still_leads_with_approve():
+    """The common answer stays the first button. Corrections are the exception,
+    and a keyboard that buries approve makes the ordinary case the slow one."""
+    _, kb = item_view(**view_args(kind="held"))
+    assert decode(kb[0][0][1]).kind == "approve"
+
+
+def test_every_item_view_callback_is_within_the_byte_cap():
+    """The cap test above measures digest and paged and never reached this
+    screen, so the held keyboard grew three buttons outside anything that
+    checks them. Telegram rejects callback_data over 64 bytes at send time,
+    which on a phone is a keyboard that simply does not appear."""
+    for kind in ("done", "held"):
+        _, kb = item_view(**view_args(kind=kind, index=59,
+                                      categories=["newsletter_valuable"] * 11))
+        for row in kb:
+            for _label, data in row:
+                assert len(data.encode()) <= 64, data
 
 
 def test_every_button_carries_the_digest_id():

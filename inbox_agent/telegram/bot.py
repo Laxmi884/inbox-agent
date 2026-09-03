@@ -23,7 +23,8 @@ from langgraph.types import Command
 
 from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from ..config import Settings
-from ..models import ActionTemplate, ReviewItem, ReviewRequest, Rule, Thread
+from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
+                      Thread)
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
 from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
@@ -283,7 +284,15 @@ class Bot:
                 thread_id=held.thread_id, subject=held.item.subject,
                 sender=held.item.sender,
                 actions=[(a.kind, (a.params or {}).get("label"))
-                         for a in held.item.proposed])
+                         for a in held.item.proposed],
+                # Carried, not dropped. _teach only supersedes and demotes a
+                # rule when the item says a rule decided it, and _rule_id_of
+                # can only read that from the run's executed records - which a
+                # held item, by definition, has none of. Without these two
+                # fields a rule could be corrected from the queue every
+                # morning and never lose a point of precision.
+                from_rule=bool(held.item.rule_id),
+                rule_id=held.item.rule_id or "")
         return None
 
     def _item_screen(self) -> tuple[str, list]:
@@ -528,18 +537,28 @@ class Bot:
             [[("↩ Back to the digest",
                encode("list", digest_id=self._digest_id))]])
 
-    def _execute_held(self, item) -> str:
-        """Push one held item's proposed actions through the chokepoint.
+    def _execute_held(self, item, actions: Optional[list] = None) -> str:
+        """Push one held item's actions through the chokepoint.
 
         Returns what it did, in the digest's vocabulary, for the confirmation.
         A refusal is reported rather than raised: the deny-list saying no is an
         answer the owner needs to see, not a crash.
+
+        `actions` replaces the proposal, for a correction. The owner has just
+        said what should happen to this thread, and that - not the proposal
+        they overruled - is what runs. They arrive as ActionTemplate, which is
+        an action with no thread attached, so each is bound to this thread on
+        the way through; the chokepoint audits by thread id and will not take
+        an action that cannot name one.
         """
         if self.client is None or self.log is None:
             return ""
         context = ExecutionContext(policy_version=None, model=None, backend=None)
         did = []
-        for action in item.item.proposed:
+        proposed = item.item.proposed if actions is None else [
+            Action(kind=a.kind, thread_id=item.thread_id, params=dict(a.params or {}))
+            for a in actions]
+        for action in proposed:
             # `none` goes through the chokepoint like everything else. It used
             # to be skipped here, before execute_action ever saw it, which
             # silently exempted the one decision most worth recording: the
@@ -675,15 +694,28 @@ class Bot:
                 actor = str(record.get("actor", ""))
                 if actor.startswith("rule:"):
                     return actor.split(":", 1)[1]
-        return None
+        # A held item has no executed record to read an actor out of - being
+        # held is precisely what stopped it executing - so it carries the rule
+        # id on the item instead. _open_item puts it there.
+        return item.rule_id or None
 
     def _teach(self, *, wide: bool) -> None:
         """Write the rule the pending verdict describes, and say what it says.
 
         The confirmation names the rule in the digest's own vocabulary, because
-        a rule the owner cannot read is one they cannot correct. It never
-        mentions undo: nothing here reverses anything, and under dry-run there
-        was nothing to reverse in the first place.
+        a rule the owner cannot read is one they cannot correct.
+
+        A correction from the DONE list only teaches: the work already
+        happened, and the confirmation says so. A correction from the HELD
+        queue also acts, because a held thread is work in flight rather than
+        history - the owner has just been asked what should happen to it and
+        has answered, and making them tap Approve afterwards would ask the
+        same question twice. It then drains, for the reason approving drains:
+        an item the owner has ruled on is no longer waiting, and leaving it
+        would put the same thread in tomorrow's digest.
+
+        It never mentions undo: nothing here reverses anything, and under
+        dry-run there was nothing to reverse in the first place.
         """
         pending, self._pending = self._pending, None
         if pending is None:
@@ -693,7 +725,7 @@ class Bot:
             self._panel = self._panel_before_item
             self._show(edit=True)
             return
-        _kind, item = opened
+        kind, item = opened
         category = pending["category"]
         actions = pending["actions"]
 
@@ -728,11 +760,26 @@ class Bot:
         extra = (" I will do that without asking again, because a rule you "
                  "taught is your own instruction." if pending["verdict"] == "teach_trash"
                  else "")
+
+        if kind == "held":
+            # Act on the thread that is still waiting, with the corrected
+            # actions rather than the proposal they replaced, then drain it.
+            # Read back from the queue rather than trusted from `item`: the
+            # DoneItem is a view built for the screen and carries no proposal
+            # to execute, and the queue is the thing _execute_held audits by.
+            held = self.held.get(item.thread_id)
+            did = self._execute_held(held, actions) if held is not None else ""
+            self.held.remove(item.thread_id)
+            verb = "Would have run" if self.settings.dry_run else "Ran"
+            tail = (f"{verb}: {did}." if did else "Nothing to do.") + \
+                   f"\n{len(self.held.all())} left waiting."
+        else:
+            tail = "That is for next time; this run is already done."
+
         self._panel = self._panel_before_item
         self.transport.edit_message(
             self.chat_id, self._message_id,
-            f"Learned: {reach} → {rule.summary}.{extra}\n\n"
-            f"That is for next time; this run is already done.",
+            f"Learned: {reach} → {rule.summary}.{extra}\n\n{tail}",
             [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
 
     def _thread_for(self, item: DoneItem) -> Thread:

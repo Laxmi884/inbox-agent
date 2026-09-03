@@ -624,9 +624,22 @@ def item_view(subject: str, sender: str, actions_text: str, why: str, *,
     text = "\n".join(lines)[:TG_MAX_TEXT]
 
     if kind == "held":
-        keyboard: list[list[tuple[str, str]]] = [[
-            ("✅ Approve", encode("approve", index, digest_id=digest_id)),
-            ("✖ Not this", encode("reject", index, digest_id=digest_id))]]
+        # Approve leads, because approving is the ordinary answer and a
+        # keyboard that buries it makes the common case the slow one. The
+        # corrections below it are the same three the done list has always
+        # offered: a held item is the one the agent STOPPED to ask about, so
+        # it was the worst possible place to be unable to say anything but
+        # yes or no. "Just don't" is the old bare reject, kept because a
+        # refusal with no replacement is still signal - it teaches what NOT
+        # to do - it simply is no longer the only sentence available.
+        keyboard: list[list[tuple[str, str]]] = [
+            [("✅ Approve", encode("approve", index, digest_id=digest_id)),
+             ("✖ Just don't", encode("reject", index, digest_id=digest_id))],
+            [("📥 Keep in inbox", encode("keep", index, digest_id=digest_id)),
+             ("🏷 Label as …", encode("relabel", index, digest_id=digest_id))],
+            [("🗑 Trash instead",
+              encode("teach_trash", index, digest_id=digest_id))],
+        ]
     else:
         keyboard = [
             [("📥 Keep in inbox", encode("keep", index, digest_id=digest_id)),
