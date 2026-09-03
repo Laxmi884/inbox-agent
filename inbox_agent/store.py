@@ -415,8 +415,8 @@ class HeldQueue:
     backend.
 
     Callers wire them with two separate store instances instead. Rules go in
-    a store built with embeddings (`build_store(get_embeddings())`) so rule
-    text is semantically searchable; a held item's payload has no `text`
+    a store built with embeddings (`open_store(path, build_embeddings(...)[1])`)
+    so rule text is semantically searchable; a held item's payload has no `text`
     field for that index to key off, so sharing that store would spend real
     embedding calls on a payload the index has nothing to do with. One
     interface, one persistence mechanism to reason about later - just not one

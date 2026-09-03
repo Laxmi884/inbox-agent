@@ -164,9 +164,12 @@ def _resolve_embeddings() -> str:
     """Whether rule text gets a vector index, and what happens when Ollama is
     absent. See the design spec section 3.
 
-    `auto` is the same contract resolve_backend() already offers for
-    INBOX_LLM_BACKEND against the same daemon - probe, degrade, say so - so
-    there is one story about a missing Ollama rather than two.
+    `auto` mirrors what resolve_backend() does when INBOX_LLM_BACKEND is
+    pinned to "ollama" against the same daemon: probe, and if it is down,
+    print a warning and degrade rather than fail. (resolve_backend()'s other
+    paths differ - an unset INBOX_LLM_BACKEND that finds nothing live
+    degrades to "offline" with no print - so the parallel is with that one
+    pinned case, not with the function as a whole.)
     """
     raw = os.getenv("INBOX_EMBEDDINGS", "auto").strip().lower()
     if raw not in VALID_EMBEDDINGS:
@@ -369,6 +372,14 @@ def get_embeddings(kind: Optional[str] = None):
     `kind` is the configured value (auto|ollama|none); omit it to read the
     environment. Returns None whenever the resolved mode is "none", which is
     exactly what _index() already expects (store.py).
+
+    Prefer `build_embeddings` over this in production code: it resolves once
+    and hands back both the resolved mode and the object, so the caller can
+    report what actually happened (doctor, the startup banner). This function
+    discards the resolved mode after using it, so a caller that also needs to
+    know what was resolved ends up probing Ollama a second time to find out.
+    Kept for its own test coverage of resolve_embeddings' contract, not
+    because anything in inbox_agent/ still calls it.
     """
     if resolve_embeddings(kind) == "none":
         return None
