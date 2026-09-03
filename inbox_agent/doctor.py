@@ -67,17 +67,36 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
         _setting("INBOX_BODY_BUDGET", s.body_budget),
         _setting("INBOX_TRIAGED_LABEL", s.triaged_label),
         _setting("INBOX_STORE_DIR", s.store_dir),
+        # Mailbox-affecting safety settings: additive to the deny-list, and
+        # the sink an operator checks when they think nothing happened. Both
+        # are spec 1.4's failure applied to a different variable - a value
+        # set in the shell and lost on restart - so both get a row for the
+        # same reason INBOX_GMAIL and INBOX_DRY_RUN do.
+        _setting("INBOX_FORBIDDEN_ACTIONS", ", ".join(sorted(s.forbidden_actions))),
+        _setting("INBOX_AUDIT_LOG", s.audit_log),
     ]
 
     # Resolved, not configured. On a machine whose Ollama has died these differ,
     # and the resolved one is what the store is actually doing.
-    resolved = config_mod.resolve_embeddings(s.embeddings)
-    degraded = resolved == "none" and s.embeddings == "auto"
-    checks.append(Check(
-        name="INBOX_EMBEDDINGS", value=resolved, source=source_of("INBOX_EMBEDDINGS"),
-        level="warn" if degraded else "ok",
-        note=("configured auto, but nothing is listening on Ollama - rules are "
-              "still matched exactly, so nothing is broken" if degraded else "")))
+    #
+    # resolve_embeddings() raises RuntimeError when INBOX_EMBEDDINGS is pinned
+    # to "ollama" and nothing answers - by design, since "ollama" (unlike
+    # "auto") is a request to fail loudly rather than degrade. That is the
+    # right contract for the bot and the wrong one for doctor: doctor never
+    # lets a fatal *condition* stop it from reporting the *other* eleven rows
+    # (see the policy try/except below), so this one call is caught the same
+    # way rather than propagating out of run_checks as a bare traceback.
+    try:
+        resolved = config_mod.resolve_embeddings(s.embeddings)
+        degraded = resolved == "none" and s.embeddings == "auto"
+        checks.append(Check(
+            name="INBOX_EMBEDDINGS", value=resolved, source=source_of("INBOX_EMBEDDINGS"),
+            level="warn" if degraded else "ok",
+            note=("configured auto, but nothing is listening on Ollama - rules are "
+                  "still matched exactly, so nothing is broken" if degraded else "")))
+    except RuntimeError as exc:
+        checks.append(Check("INBOX_EMBEDDINGS", "unavailable",
+                            source_of("INBOX_EMBEDDINGS"), "fatal", str(exc)))
 
     # INBOX_TG_TOKEN is a secret key; pass its raw value straight to
     # _setting() so mask() sees the true absence and returns "not set"

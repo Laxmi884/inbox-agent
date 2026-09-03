@@ -112,16 +112,24 @@ You'll also need:
 inbox-agent doctor
 ```
 
-prints the effective value of every setting, where it came from
-(`environment` / `dotenv` / `default`), and what would stop the bot from
-starting. It resolves nothing itself — it reads back the same functions the
+prints the effective value of the settings that decide what the bot can do to
+your mailbox and whether it starts at all - the mode (`INBOX_GMAIL`,
+`INBOX_DRY_RUN`), the deny-list (`INBOX_FORBIDDEN_ACTIONS`), where the audit
+trail goes (`INBOX_AUDIT_LOG`), the backend and embeddings mode, credentials,
+and OAuth expiry - where each came from (`environment` / `dotenv` /
+`default`), and what would stop the bot from starting. It is a curated set,
+not every environment variable the agent reads: see `run_checks()` in
+`inbox_agent/doctor.py` for the exact list. It resolves nothing itself — it reads back the same functions the
 bot uses, so it can't tell you something the bot wouldn't also see
 (`inbox_agent/doctor.py:9-11`). This is real output, captured from a
 configured checkout with `INBOX_DRY_RUN=false` additionally exported into the
 shell (to demonstrate the warning below). Three values that were specific to
 that checkout — the Telegram token, the Telegram chat id, and the Context Hub
 commit hash on the `policy` row — are replaced below with placeholders of the
-same shape; everything else is unedited real output:
+same shape; everything else is unedited real output, except that the
+`INBOX_FORBIDDEN_ACTIONS` and `INBOX_AUDIT_LOG` rows below were added by hand
+to reflect a later update to `doctor` — they were not yet reported when this
+capture was taken:
 
 ```
   INBOX_GMAIL               live   <- dotenv   THE REAL MAILBOX
@@ -130,6 +138,8 @@ same shape; everything else is unedited real output:
   INBOX_BODY_BUDGET         0   <- default
   INBOX_TRIAGED_LABEL       agent/triaged   <- default
   INBOX_STORE_DIR           inbox_agent/store   <- default
+  INBOX_FORBIDDEN_ACTIONS   delete_forever, send_message   <- default
+  INBOX_AUDIT_LOG           inbox_agent/audit.jsonl   <- default
   INBOX_EMBEDDINGS          ollama   <- default
   INBOX_TG_TOKEN            AAAAAAA...ZZZZ  (46 chars)   <- dotenv
   INBOX_TG_CHAT_ID          000000000   <- dotenv

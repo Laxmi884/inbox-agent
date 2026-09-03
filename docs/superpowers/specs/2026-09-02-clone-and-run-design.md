@@ -262,8 +262,10 @@ the same thing the file says" from "the file won". Capturing the key set before
 the merge can. The snapshot must be taken on the line above `load_dotenv`, and
 that ordering is the whole mechanism, so it carries a comment saying so.
 
-`inbox-agent doctor` reports, for every setting: name, value (through the
-existing `mask()` for secrets), and source. It flags:
+`inbox-agent doctor` reports, for a curated set of settings - the ones that
+decide what the bot can do to the mailbox and whether it starts at all, not
+every environment variable it reads: name, value (through the existing
+`mask()` for secrets), and source. It flags:
 
 - **⚠ override** — an environment value shadowing a *different* `.env` value.
   This is 1.4, made visible in one line.

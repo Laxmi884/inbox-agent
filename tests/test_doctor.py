@@ -14,6 +14,17 @@ def never_reach_context_hub(monkeypatch):
     monkeypatch.setenv("LANGSMITH_API_KEY", "")
 
 
+@pytest.fixture(autouse=True)
+def never_probe_ollama(monkeypatch):
+    """run_checks() resolves INBOX_EMBEDDINGS (default "auto"), which calls
+    the real ollama_available() unless something stubs it. Invisible on a dev
+    machine with Ollama up; on CI it is a real HTTP call per test with a 1.5s
+    timeout on every one that doesn't already override this. Individual tests
+    that care about the resolved value (e.g. the "false" and "ollama pinned"
+    cases) monkeypatch over this default within the test."""
+    monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: True)
+
+
 def _checks(monkeypatch, **env):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -71,6 +82,53 @@ def test_embeddings_reports_the_resolved_mode_not_the_configured_one(monkeypatch
     check = _checks(monkeypatch)["INBOX_EMBEDDINGS"]
     assert check.value == "none"
     assert check.level == "warn"
+
+
+def test_embeddings_pinned_to_ollama_with_ollama_down_reports_fatal_not_a_crash(monkeypatch, capsys):
+    """resolve_embeddings("ollama") raises RuntimeError by design when nothing
+    answers on Ollama - "ollama" (unlike "auto") is a request to fail loudly.
+    Before the fix that RuntimeError propagated out of run_checks -> main ->
+    the console script as a bare traceback, so NONE of the other rows (the
+    backend, the Telegram credentials, OAuth expiry) ever printed. This
+    reproduces exactly that state and checks doctor survives it, reports a
+    fatal row, and still returns the non-zero exit code."""
+    monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: False)
+    monkeypatch.setenv("INBOX_EMBEDDINGS", "ollama")
+    checks = _checks(monkeypatch)
+    check = checks["INBOX_EMBEDDINGS"]
+    assert check.level == "fatal"
+    assert "ollama" in check.note.lower()
+    # The whole point: every other row still rendered.
+    assert "INBOX_GMAIL" in checks
+    assert "INBOX_TG_TOKEN" in checks
+    assert doctor.main([]) == 1
+
+
+def test_forbidden_actions_row_is_reported_with_provenance(monkeypatch):
+    """A mailbox-affecting safety setting, additive to the deny-list. Lost on
+    restart the same way INBOX_GMAIL/INBOX_DRY_RUN were (spec 1.4) - an
+    operator who adds to it in the shell and restarts silently loses the
+    export, and doctor must be the thing that shows that, not hide it."""
+    # source_of() distinguishes "environment" from "dotenv" by checking
+    # membership in _ENV_AT_IMPORT (frozen at import time) and in the real
+    # .env found by find_dotenv() - which, run from inside this repo, can
+    # walk up to a real, ambient .env that has nothing to do with this test.
+    # Control both directly, the same way test_an_environment_override_of_a_*
+    # does above, so this test's pass/fail depends only on this test.
+    monkeypatch.setattr(config_mod, "_ENV_AT_IMPORT",
+                        frozenset({"INBOX_FORBIDDEN_ACTIONS"}))
+    monkeypatch.setattr(config_mod, "dotenv_values", lambda *a, **k: {})
+    monkeypatch.setenv("INBOX_FORBIDDEN_ACTIONS", "trash")
+    check = _checks(monkeypatch)["INBOX_FORBIDDEN_ACTIONS"]
+    assert "trash" in check.value
+    assert "send_message" in check.value  # ALWAYS_FORBIDDEN is additive, not replaced
+    assert check.source == "environment"
+
+
+def test_audit_log_row_is_reported(monkeypatch):
+    checks = _checks(monkeypatch)
+    assert "INBOX_AUDIT_LOG" in checks
+    assert checks["INBOX_AUDIT_LOG"].value  # non-empty path
 
 
 def test_an_unset_token_renders_plainly_not_as_a_masked_secret(monkeypatch):
