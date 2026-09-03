@@ -5,8 +5,11 @@ so every test here runs with no network and no credentials. It is the piece
 that makes the live client testable at all.
 """
 import base64
+import ssl
+
 import pytest
 
+from inbox_agent import gmail
 from inbox_agent.gmail import LiveGmailClient
 
 
@@ -438,3 +441,91 @@ def test_the_transport_reaches_the_api_call(api):
     api.users = lambda: Users(api)
     LiveGmailClient(api, http_factory=lambda: sentinel).list_threads(limit=5)
     assert got == [sentinel]
+
+
+# --- a dead keepalive socket, end to end ------------------------------------
+# _with_backoff's own tests prove the policy. These prove the CLIENT is wired
+# to it: that a retry actually gets a NEW transport rather than writing to the
+# same dead socket, and that drafts.create opts out. Without this pair, the
+# whole fix could be silently undone by dropping one keyword argument.
+
+def _raising(api, errors):
+    """Make threads.list raise each error in turn, then succeed."""
+    seq = list(errors)
+    real = FakeThreads(api).list
+
+    class Threads(FakeThreads):
+        def list(self, userId="me", q="", maxResults=50):
+            if seq:
+                raise seq.pop(0)
+            return real(userId=userId, q=q, maxResults=maxResults)
+
+    class Users(FakeUsers):
+        def threads(self):
+            return Threads(api)
+
+    api.users = lambda: Users(api)
+    return api
+
+
+def test_reset_http_actually_drops_the_cached_transport(api):
+    """_http caches per thread for the thread's life. This is the escape hatch,
+    and if it stops clearing the cache the retry writes to the same corpse."""
+    built = []
+
+    def factory():
+        built.append(object())
+        return built[-1]
+
+    client = LiveGmailClient(api, http_factory=factory)
+    first = client._http()
+    assert client._http() is first, "the transport was not cached at all"
+    client._reset_http()
+    assert client._http() is not first, "the dead transport was handed back"
+
+
+def test_a_dead_socket_is_retried_on_a_fresh_transport(api, monkeypatch):
+    """The live failure of 2026-09-03 15:18, end to end.
+
+    Asserts the client ASKED for a new transport, not that transports were
+    built. Counting `http_factory` calls looks like the same test and is not:
+    list_threads hydrates through a ThreadPoolExecutor and _http caches per
+    THREAD, so each worker builds one anyway and the count passes whether the
+    fix is present or not. It did, until the mutation run said so.
+    """
+    monkeypatch.setattr(gmail.time, "sleep", lambda _s: None)
+    client = LiveGmailClient(
+        _raising(api, [ssl.SSLEOFError("EOF occurred in violation of protocol")]),
+        http_factory=lambda: object())
+    dropped = []
+    real = client._reset_http
+    monkeypatch.setattr(client, "_reset_http",
+                        lambda: (dropped.append(1), real()) and None)
+
+    assert [t.id for t in client.list_threads(limit=10)] == ["t1", "t2"]
+    assert dropped, "the retry reused the socket that had just died"
+
+
+def test_a_draft_is_not_repeated_after_a_dead_socket(api, monkeypatch):
+    """The one wrapped call that is not safe to repeat.
+
+    Labelling twice lands in the same state; drafting twice puts a second draft
+    in the mailbox. A transport error cannot say whether Gmail acted before the
+    connection died, so this one does not guess.
+    """
+    monkeypatch.setattr(gmail.time, "sleep", lambda _s: None)
+    calls = []
+
+    class Drafts:
+        def create(self, userId="me", body=None):
+            calls.append(body)
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+    class Users(FakeUsers):
+        def drafts(self):
+            return Drafts()
+
+    api.users = lambda: Users(api)
+    with pytest.raises(ssl.SSLEOFError):
+        LiveGmailClient(api).create_draft("t1", "hello")
+    assert len(calls) == 1, f"the draft was attempted {len(calls)} times"

@@ -1,5 +1,8 @@
 # tests/test_gmail.py
+import http.client
 import json
+import ssl
+
 import pytest
 
 from inbox_agent import gmail
@@ -293,3 +296,84 @@ def test_a_non_http_error_is_not_retried(no_sleep):
     with pytest.raises(ValueError):
         gmail._with_backoff(_flaky([ValueError("mine")]), what="get")
     assert no_sleep == []
+
+
+# --- connections that die before there is a status --------------------------
+# 2026-09-03 15:18:48.429 triage start; 15:18:48.664 triage failed. 235ms, in
+# `fetch`, on ssl.SSLEOFError. The bot had been idle since 14:02 - 76 minutes -
+# and _http caches one httplib2.Http per thread forever, so the keepalive
+# socket Gmail had long since closed was still the one it wrote to.
+#
+# _status_of returns None for a transport error, and None is in no status set,
+# so the policy re-raised immediately. Exactly the 403 mistake one layer down:
+# keyed on HTTP status, and this failed before there was a status.
+
+def test_a_dropped_connection_is_retried(no_sleep):
+    """The socket died mid-write. The request never reached Gmail."""
+    assert gmail._with_backoff(
+        _flaky([ssl.SSLEOFError("EOF occurred in violation of protocol")]),
+        what="threads.list") == "ok"
+
+
+@pytest.mark.parametrize("exc", [
+    ssl.SSLEOFError("EOF occurred in violation of protocol"),
+    ConnectionResetError("Connection reset by peer"),
+    http.client.RemoteDisconnected("Remote end closed connection"),
+    OSError("Network is unreachable"),
+])
+def test_every_shape_of_dropped_connection_is_retried(exc, no_sleep):
+    """One idle socket produces several different exceptions depending on where
+    it dies. Catching only the one we happened to see would leave the rest."""
+    assert gmail._with_backoff(_flaky([exc]), what="threads.get") == "ok"
+
+
+def test_a_dropped_connection_discards_the_stale_transport(no_sleep):
+    """The whole fix. Retrying is useless if the retry reuses the dead socket -
+    httplib2 keeps it in its connection pool and writes to it again."""
+    reset = []
+    assert gmail._with_backoff(
+        _flaky([ssl.SSLEOFError("boom")]), what="threads.get",
+        reset=lambda: reset.append(1)) == "ok"
+    assert reset, "the stale transport was never discarded"
+
+
+def test_a_rate_limit_does_not_discard_the_transport(no_sleep):
+    """A 403 came back over a healthy connection. Throwing it away would make
+    every quota retry pay a fresh TLS handshake for nothing."""
+    reset = []
+    gmail._with_backoff(_flaky([_http_error(403, "rateLimitExceeded")]),
+                        what="threads.get", reset=lambda: reset.append(1))
+    assert reset == []
+
+
+def test_a_dropped_connection_keeps_the_short_schedule(no_sleep):
+    """A dead socket is not a quota. Reconnecting takes a handshake, not a
+    minute, and waiting 62s to find that out would hang a run for no reason."""
+    with pytest.raises(ssl.SSLEOFError):
+        gmail._with_backoff(_flaky([ssl.SSLEOFError("boom")] * 20),
+                            what="threads.get")
+    assert sum(no_sleep) < 30, f"a dead socket waited {sum(no_sleep):.0f}s"
+
+
+def test_a_non_idempotent_call_is_not_retried_on_a_dropped_connection(no_sleep):
+    """drafts.create is the one call that is not safe to repeat.
+
+    A transport error is ambiguous: the request may have died on the way out,
+    or after Gmail had already acted on it. Every other wrapped call is
+    idempotent - labelling a thread twice, or trashing it twice, lands in the
+    same state - so repeating them costs nothing. Repeating this one puts a
+    second draft in the owner's mailbox, and a missing draft they can ask for
+    again is a smaller harm than a duplicate they have to find and delete.
+    """
+    with pytest.raises(ssl.SSLEOFError):
+        gmail._with_backoff(_flaky([ssl.SSLEOFError("boom")]),
+                            what="drafts.create", idempotent=False)
+    assert no_sleep == []
+
+
+def test_a_non_idempotent_call_is_still_retried_on_a_rate_limit(no_sleep):
+    """Because a 403 is not ambiguous. Gmail REFUSED the request - it did not
+    half-perform it - so nothing was created and retrying is safe."""
+    assert gmail._with_backoff(
+        _flaky([_http_error(403, "rateLimitExceeded")]),
+        what="drafts.create", idempotent=False) == "ok"

@@ -10,9 +10,11 @@ from __future__ import annotations
 import base64
 import html as html_mod
 import json
+import http.client
 import logging
 import random
 import re
+import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -437,9 +439,20 @@ _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 # read the status, saw a 4xx, and gave up.
 _RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
+# And below the statuses there is a third failure: no status at all. A keepalive
+# socket that has gone stale dies on the next write, and _status_of returns None
+# for that, which is in no status set - so the policy re-raised instantly. Seen
+# live on 2026-09-03: idle from 14:02, a /triage at 15:18:48.429 failed at
+# 15:18:48.664. 235ms, in `fetch`, before a single thread was read.
+#
+# One dead socket surfaces as several different exceptions depending on where it
+# dies, so catching only the SSLEOFError we happened to see would leave the rest.
+_TRANSPORT_ERRORS = (ssl.SSLError, http.client.HTTPException, OSError)
+
 # Two schedules, because the two failures clear on different timescales. A 5xx
 # is a blip: 1+2+4 = 7s. A quota is measured per MINUTE, so the short schedule
 # would give up long before it could possibly clear - 2+4+8+16+32 = 62s.
+# A dead socket takes a handshake, not a minute, so it keeps the short one.
 _MAX_ATTEMPTS = 4
 _QUOTA_ATTEMPTS = 6
 _QUOTA_BASE_DELAY = 2.0
@@ -476,7 +489,18 @@ def _is_rate_limit(error, status) -> bool:
     return status == 403 and bool(_reasons_of(error) & _RATE_LIMIT_REASONS)
 
 
-def _with_backoff(call, *, what: str):
+def _is_transport_error(error) -> bool:
+    """Did the connection die, rather than the server answer?
+
+    No HttpError guard is needed, and one was written here before being
+    checked: googleapiclient's HttpError derives from Exception directly, not
+    from OSError or ssl.SSLError, so it cannot reach this test. The status
+    branches above would take it first in any case.
+    """
+    return isinstance(error, _TRANSPORT_ERRORS)
+
+
+def _with_backoff(call, *, what: str, reset=None, idempotent: bool = True):
     """Execute a Gmail request, retrying only what is worth retrying.
 
     Everything else propagates. A silently swallowed HttpError against a real
@@ -493,6 +517,20 @@ def _with_backoff(call, *, what: str):
     schedule, and shortening is the wrong direction to err when the server has
     just said there were too many requests: it would let the quota schedule
     finish in 31s, well short of the minute the limit is measured over.
+
+    `reset` discards the caller's cached transport, and a retry after a dead
+    socket is worthless without it: httplib2 keeps the connection in its own
+    pool and writes to the same corpse again. Called only for transport
+    errors - a 403 arrived over a healthy connection, and throwing that away
+    would buy a fresh TLS handshake on every quota retry for nothing.
+
+    `idempotent=False` refuses to repeat a call after a TRANSPORT error only.
+    Such an error is ambiguous: the request may have died on the way out, or
+    after Gmail had already acted on it. Every other wrapped call is
+    idempotent - labelling or trashing a thread twice lands in the same state
+    - so repeating them costs nothing, while repeating drafts.create puts a
+    second draft in the owner's mailbox. A rate limit stays retryable even
+    then, because a refusal is not ambiguous: nothing was created.
     """
     attempt = 0
     delay = 1.0
@@ -506,14 +544,24 @@ def _with_backoff(call, *, what: str):
                 limit, delay = _QUOTA_ATTEMPTS, max(delay, _QUOTA_BASE_DELAY)
             elif status in _RETRY_STATUSES:
                 limit = _MAX_ATTEMPTS
+            elif _is_transport_error(exc) and idempotent:
+                limit = _MAX_ATTEMPTS
+                if reset is not None:
+                    reset()
             else:
                 raise
             if attempt >= limit:
                 raise
             pause = delay * random.uniform(1.0, 1.5)
-            log.warning("gmail %s returned %s (%s), retry %d/%d in %.1fs",
-                        what, status, ",".join(sorted(_reasons_of(exc))) or "-",
-                        attempt, limit - 1, pause)
+            # "returned None" would be a lie for a dropped connection: nothing
+            # was returned, the socket died. Name the exception instead - it is
+            # the only thing that tells the reader which failure this was.
+            cause = (f"returned {status} "
+                     f"({','.join(sorted(_reasons_of(exc))) or '-'})"
+                     if status is not None else
+                     f"connection died ({type(exc).__name__})")
+            log.warning("gmail %s %s, retry %d/%d in %.1fs",
+                        what, cause, attempt, limit - 1, pause)
             time.sleep(pause)
             delay *= 2
 
@@ -584,6 +632,18 @@ class LiveGmailClient:
             http = self._local.http = self._http_factory()
         return http
 
+    def _reset_http(self) -> None:
+        """Throw this thread's transport away, so the next call reconnects.
+
+        Cached above for the lifetime of the thread, which is right until the
+        socket underneath it dies. Gmail closes an idle keepalive, httplib2
+        keeps the dead connection in its own pool, and the next write raises
+        SSLEOFError - then the retry writes to the same corpse and raises
+        again. Retrying without this is not a fix, it is the same failure
+        three more times.
+        """
+        self._local.http = None
+
     # --- reads --------------------------------------------------------------
 
     def _threads_resource(self):
@@ -601,7 +661,7 @@ class LiveGmailClient:
             lambda: self._threads_resource().list(
                 userId="me", q=query,
                 maxResults=limit).execute(http=self._http()),
-            what="threads.list")
+            what="threads.list", reset=self._reset_http)
         ids = [t["id"] for t in (result.get("threads") or [])]
         if not ids:
             return []
@@ -621,7 +681,7 @@ class LiveGmailClient:
             lambda: self._threads_resource().get(
                 userId="me", id=thread_id,
                 format="full").execute(http=self._http()),
-            what="threads.get")
+            what="threads.get", reset=self._reset_http)
         return self._to_thread(raw)
 
     def _to_thread(self, raw: dict) -> Thread:
@@ -661,7 +721,7 @@ class LiveGmailClient:
             lambda: self._threads_resource().modify(
                 userId="me", id=thread_id,
                 body=body).execute(http=self._http()),
-            what="threads.modify")
+            what="threads.modify", reset=self._reset_http)
         return {"thread_id": thread_id, **body}
 
     def apply_label(self, thread_id: str, label: str) -> dict[str, Any]:
@@ -691,7 +751,7 @@ class LiveGmailClient:
         _with_backoff(
             lambda: self._threads_resource().trash(
                 userId="me", id=thread_id).execute(http=self._http()),
-            what="threads.trash")
+            what="threads.trash", reset=self._reset_http)
         return {"thread_id": thread_id, "action": "trash"}
 
     def create_draft(self, thread_id: str, body: str) -> dict[str, Any]:
@@ -705,7 +765,7 @@ class LiveGmailClient:
             lambda: self._threads_resource().get(
                 userId="me", id=thread_id,
                 format="full").execute(http=self._http()),
-            what="threads.get")
+            what="threads.get", reset=self._reset_http)
         messages = thread.get("messages") or []
         headers = ((messages[-1].get("payload") or {}).get("headers") or []
                    if messages else [])
@@ -727,6 +787,9 @@ class LiveGmailClient:
                 userId="me",
                 body={"message": {"threadId": thread_id, "raw": encoded}}
             ).execute(http=self._http()),
-            what="drafts.create")
+            # Not idempotent: a transport error is ambiguous, and a duplicate
+            # draft in the owner's mailbox is worse than one they can ask for
+            # again. A rate limit is still retried - a refusal creates nothing.
+            what="drafts.create", reset=self._reset_http, idempotent=False)
         return {"thread_id": thread_id, "draft_id": created.get("id"),
                 "draft_chars": len(body)}
