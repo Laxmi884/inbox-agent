@@ -256,7 +256,7 @@ def test_a_naive_timestamp_in_the_sidecar_reads_as_unknown_rather_than_raising(t
     """record_consent always writes an aware, UTC timestamp; a naive one can
     only come from a hand-edit - the likeliest one being exactly this field.
     fromisoformat() parses a naive value without error, so without a tzinfo
-    check this would return a naive datetime that doctor._oauth_check then
+    check this would return a naive datetime that doctor.oauth_check then
     subtracts from an aware datetime.now(timezone.utc), raising TypeError
     instead of doctor reporting anything at all. Treat it as unknown, the
     same as a corrupt or missing sidecar."""

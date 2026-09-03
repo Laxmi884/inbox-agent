@@ -127,7 +127,7 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
             level="fatal" if needs_it else "ok",
             note="missing, and INBOX_GMAIL=live needs it" if needs_it else ""))
 
-    checks.append(_oauth_check(s))
+    checks.append(oauth_check(s))
 
     try:
         policy = load_policy(s)
@@ -141,7 +141,7 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
     return checks
 
 
-def _oauth_check(s: Settings) -> Check:
+def oauth_check(s: Settings) -> Check:
     """How long until Google stops accepting the refresh token.
 
     Unknown is reported as unknown. Inventing a date would produce a confident
@@ -150,7 +150,7 @@ def _oauth_check(s: Settings) -> Check:
     """
     granted = consented_at(s.google_token)
     if granted is None:
-        return Check("oauth consent", "unknown", "-", "warn",
+        return Check("oauth consent", OAUTH_UNKNOWN, "-", "warn",
                      "consent date unknown (token predates tracking) - "
                      "re-consent to start predicting the 7-day revocation")
     dies = granted + TESTING_TOKEN_LIFETIME
@@ -162,6 +162,62 @@ def _oauth_check(s: Settings) -> Check:
     return Check("oauth consent", granted.date().isoformat(), "-", level,
                  f"expires ~{dies.date()} ({left.days}d left) if the app is "
                  f"still in Testing")
+
+
+OAUTH_UNKNOWN = "unknown"
+
+
+def health_alerts(settings: Settings, *, policy=None,
+                  recurring: bool = False) -> list[Check]:
+    """The checks worth interrupting the owner about, and nothing else.
+
+    `run_checks` is a screen you go and look at. Nobody looks. Every incident
+    this project has had was information that existed and never travelled: the
+    403 was logged, drift is computed and printed, and the refresh-token
+    countdown below has been correct since the day it was written while sitting
+    on a terminal the owner does not read. This is the subset that goes to the
+    phone instead.
+
+    Two things make that safe to call on every run. It is cheap - `oauth_check`
+    reads one small local file and `run_checks`'s hub round-trip is not here, so
+    the caller passes the policy it already loaded rather than making this fetch
+    one. And it returns only warn and fatal, because a notification that fires
+    when everything is fine is one the owner learns to swipe away, which is the
+    same failure `tools/secret_scan.py` is built around.
+
+    `policy` is optional because drift cannot change while the process runs -
+    it is loaded once at startup - so a per-run caller has nothing to re-check
+    and passes nothing. The countdown, being a function of the clock, does.
+
+    `recurring=True` is for a caller that fires after every run, and drops the
+    checks that cannot change between two runs of the same process. Today that
+    is an unrecorded consent date: it is a real warning, and it is also a
+    permanent state for any token issued before the sidecar existed, so a
+    recurring notice about it would fire forever and train the owner to dismiss
+    the message that will one day carry the actual deadline. Startup says it
+    once; `/status` answers it on demand.
+    """
+    checks = [oauth_check(settings)]
+    if recurring:
+        checks = [c for c in checks if c.value != OAUTH_UNKNOWN]
+    if policy is not None and getattr(policy, "drifted", False):
+        checks.append(Check("policy", policy.version, "context_hub", "warn",
+                            "the hub and policies/default.md have diverged; "
+                            "runs use the hub's copy until you push"))
+    return [c for c in checks if c.level in ("warn", "fatal")]
+
+
+def alert_text(checks: Sequence[Check]) -> str:
+    """Alerts as a short message for a phone. Empty string when all is well.
+
+    Deliberately not `render`: that aligns columns for a terminal, and a
+    wrapped column on a phone is harder to read than a sentence.
+    """
+    if not checks:
+        return ""
+    lines = [f"{'⛔' if c.level == 'fatal' else '⚠️'} {c.name}: {c.note or c.value}"
+             for c in checks]
+    return "\n".join(lines)
 
 
 _MARK = {"ok": "  ", "warn": "! ", "fatal": "X "}

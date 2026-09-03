@@ -23,6 +23,7 @@ from langgraph.types import Command
 
 from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from ..config import Settings
+from ..doctor import alert_text, health_alerts, oauth_check
 from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
                       Thread)
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
@@ -868,16 +869,45 @@ class Bot:
         log.info("triage done in %.1fs: %s executed, %s held", elapsed,
                  len(self._last_run.get("executed", [])), len(self.held.all()))
         self._show(edit=False)
+        self._send_health_alerts()
+
+    def _send_health_alerts(self) -> None:
+        """Put anything at warn or fatal in front of the owner, on the phone.
+
+        Only the clock-dependent checks: policy drift is settled at startup
+        (the policy is loaded once per process and cannot change under a
+        running bot), so re-reporting it after every run would be noise that
+        teaches the owner to ignore the notice. The refresh-token countdown is
+        a function of the date and does change, which is the one that has an
+        actual deadline attached to it.
+
+        Never raises. A triage run that worked must not be reported as failed
+        because a diagnostic could not be delivered.
+        """
+        try:
+            text = alert_text(health_alerts(self.settings, recurring=True))
+            if text:
+                self.transport.send_message(self.chat_id, text)
+        except Exception:
+            log.exception("could not send health alerts")
 
     def _status(self) -> None:
         request = self._request()
         if request is None:
-            self.transport.send_message(self.chat_id, "No run is waiting. /triage to start.")
+            body = "No run is waiting. /triage to start."
         else:
-            self.transport.send_message(
-                self.chat_id,
-                f"A run is waiting for review: {len(request.items)} threads, "
-                f"policy {request.policy_version}.")
+            body = (f"A run is waiting for review: {len(request.items)} threads, "
+                    f"policy {request.policy_version}.")
+        # /status is the "how are you" command, so it answers that question in
+        # full rather than only naming a parked run - and unlike the post-run
+        # notice it reports the countdown even when it is comfortable, because
+        # here the owner asked.
+        try:
+            check = oauth_check(self.settings)
+            body += f"\n\noauth: {check.note or check.value}"
+        except Exception:
+            log.exception("could not read the oauth countdown for /status")
+        self.transport.send_message(self.chat_id, body)
 
     def _cancel(self) -> None:
         """Abandon the parked run by moving to a fresh graph thread id.

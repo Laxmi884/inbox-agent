@@ -69,6 +69,12 @@ def bot(tmp_path, snapshot_file):
                         snapshot_size=50, audit_log=tmp_path / "audit.jsonl",
                         forbidden_actions=ALWAYS_FORBIDDEN,
                         context_hub_skill="s", context_hub_tag="dev",
+                        # Under tmp_path on purpose. The bot now reads the OAuth
+                        # consent sidecar next to this file, and the default
+                        # points at the developer's real secrets/ - which would
+                        # make these tests pass or fail according to when
+                        # somebody last clicked through Google's consent screen.
+                        google_token=tmp_path / "token.json",
                         tg_token="tok", tg_chat_id="42", tg_mode="digest")
     log = AuditLog(settings.audit_log)
     # One queue, shared by the graph that fills it and the bot that renders it.
@@ -1415,3 +1421,76 @@ def test_a_bare_reject_still_teaches_that_the_action_was_wrong(bot):
     assert [a.kind for a in rule.actions] == ["none"]
     assert not [r for r in log.records()[before:] if r.action == "trash"]
     assert b.held.all() == []
+
+
+# --- health alerts reach the phone, not a terminal --------------------------
+#
+# The banner already stated the OAuth countdown and the policy drift, on a
+# terminal, correctly, for weeks - and every incident this project has had was
+# still found by the owner noticing something rather than by the bot saying it.
+# These pin the delivery, which is the part that was missing.
+
+from datetime import timedelta
+
+from inbox_agent.google_auth import record_consent
+
+
+def _consent(bot_tuple, *, days_ago):
+    b, _, _ = bot_tuple
+    record_consent(b.settings.google_token,
+                   now=datetime.now(timezone.utc) - timedelta(days=days_ago))
+
+
+def test_a_run_warns_when_the_refresh_token_is_nearly_dead(bot):
+    b, t, _ = bot
+    _consent(bot, days_ago=5)
+    b.handle_update(msg("/triage 4"))
+    assert any("oauth consent" in m["text"] for m in t.sent), \
+        "the run finished without mentioning a token that dies in two days"
+
+
+def test_a_healthy_run_says_nothing_about_health(bot):
+    """The digest, and only the digest. An alert on a good day is an alert the
+    owner learns to swipe away."""
+    b, t, _ = bot
+    _consent(bot, days_ago=1)
+    b.handle_update(msg("/triage 4"))
+    assert not any("oauth consent" in m["text"] for m in t.sent)
+
+
+def test_an_unrecorded_consent_date_does_not_nag_after_every_run(bot):
+    """Permanent state for any token predating the sidecar - see health_alerts."""
+    b, t, _ = bot                       # the fixture writes no consent sidecar
+    b.handle_update(msg("/triage 4"))
+    assert not any("oauth" in m["text"] for m in t.sent)
+
+
+def test_the_digest_still_arrives_when_the_health_notice_fails(bot, monkeypatch):
+    """A diagnostic that cannot be delivered must not turn a good run into a
+    failed one - the same rule doctor follows about never being the thing that
+    breaks."""
+    b, t, _ = bot
+    _consent(bot, days_ago=5)
+    import inbox_agent.telegram.bot as bot_mod
+    monkeypatch.setattr(bot_mod, "health_alerts",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    b.handle_update(msg("/triage 4"))
+    assert any("DONE" in m["text"] for m in t.sent), "the digest was lost"
+
+
+def test_status_reports_the_countdown_even_when_it_is_comfortable(bot):
+    """/status is the owner asking. An answer that omits the deadline because
+    it is not urgent yet is the terminal banner's failure all over again."""
+    b, t, _ = bot
+    _consent(bot, days_ago=1)
+    b.handle_update(msg("/status"))
+    assert "oauth" in t.sent[-1]["text"]
+
+
+def test_status_still_answers_when_the_countdown_cannot_be_read(bot, monkeypatch):
+    b, t, _ = bot
+    import inbox_agent.telegram.bot as bot_mod
+    monkeypatch.setattr(bot_mod, "oauth_check",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    b.handle_update(msg("/status"))
+    assert "No run is waiting" in t.sent[-1]["text"]

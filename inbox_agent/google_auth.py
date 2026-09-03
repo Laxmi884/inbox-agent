@@ -149,7 +149,7 @@ def consented_at(token_path: Path) -> Optional[datetime]:
     record_consent always writes an aware, UTC timestamp, so a naive one here
     can only come from a hand-edited sidecar - the likeliest hand-edit being
     exactly this field. A naive value cannot be safely assumed to be UTC (or
-    any other zone), and doctor._oauth_check subtracts it from an aware
+    any other zone), and doctor.oauth_check subtracts it from an aware
     `datetime.now(timezone.utc)`; guessing a zone would risk a confident wrong
     revocation date, and mixing aware/naive raises TypeError instead of
     degrading. So a naive value is treated the same as an unreadable one:

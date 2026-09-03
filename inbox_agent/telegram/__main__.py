@@ -14,6 +14,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from ..audit import AuditLog
 from ..config import (build_embeddings, build_gmail_client, load_settings,
                       mask, use_model)
+from ..doctor import alert_text, health_alerts, oauth_check
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -127,7 +128,25 @@ def main() -> int:
           f"{len(_live)} rules carried over"
           + (f", {_retired} retired)" if _retired else ")"))
     print(_embeddings_banner(settings, embeddings_mode))
+    # The refresh token dies seven days after consent whatever the bot does, and
+    # this countdown has been computed correctly since it was written - on a
+    # screen nobody opens. Say it here, and say it again on the phone below.
+    _oauth = oauth_check(settings)
+    print(f"oauth     : {_oauth.value}" + (f"   {_oauth.note}" if _oauth.note else ""))
     print("\nSend /triage in Telegram. Ctrl-C to stop.")
+
+    # Everything above this line is a terminal banner, and the lesson this repo
+    # keeps relearning is that a terminal banner is not where the owner is: the
+    # same argument bot.py already makes about dry_run. Anything at warn or
+    # fatal goes to the phone as well, once, at startup.
+    try:
+        alerts = alert_text(health_alerts(settings, policy=policy))
+        if alerts:
+            transport.send_message(settings.tg_chat_id, f"Bot started.\n{alerts}")
+    except Exception:                 # never let the health notice stop the bot
+        # `log` in this function is the AuditLog, not a logger.
+        logging.getLogger(__name__).exception(
+            "could not send the startup health alert")
 
     try:
         run_polling(bot, transport)

@@ -194,3 +194,89 @@ def test_exit_code_is_zero_when_everything_is_at_worst_a_warning(monkeypatch, ca
     monkeypatch.setenv("INBOX_GMAIL", "snapshot")
     monkeypatch.setattr(config_mod, "ollama_available", lambda *a, **k: True)
     assert doctor.main([]) == 0
+
+
+# --- health_alerts: the subset that travels to the phone --------------------
+#
+# Every incident this project has had was information that existed and never
+# reached the owner. run_checks is a screen nobody opens; these are the checks
+# that go looking for them instead, so what they leave OUT matters as much as
+# what they include - a notice that fires when nothing is wrong is one the
+# owner learns to swipe away.
+
+from datetime import datetime, timedelta, timezone
+
+from inbox_agent.doctor import alert_text, health_alerts
+from inbox_agent.google_auth import record_consent
+
+
+class _Policy:
+    def __init__(self, drifted, version="v1"):
+        self.drifted, self.version = drifted, version
+
+
+def _settings_with_consent(tmp_path, *, days_ago):
+    """Settings whose consent sidecar was stamped `days_ago` days back."""
+    token = tmp_path / "token.json"
+    record_consent(token, now=datetime.now(timezone.utc) - timedelta(days=days_ago))
+    return load_settings().__class__(**{**load_settings().__dict__,
+                                        "google_token": token})
+
+
+def test_a_comfortable_countdown_raises_no_alert(tmp_path):
+    """Four days left is fine, and silence is the correct output."""
+    assert health_alerts(_settings_with_consent(tmp_path, days_ago=3)) == []
+
+
+def test_a_countdown_inside_the_warning_window_alerts(tmp_path):
+    alerts = health_alerts(_settings_with_consent(tmp_path, days_ago=5))
+    assert [c.level for c in alerts] == ["warn"]
+
+
+def test_an_expired_token_is_fatal(tmp_path):
+    alerts = health_alerts(_settings_with_consent(tmp_path, days_ago=9))
+    assert [c.level for c in alerts] == ["fatal"]
+
+
+def test_drift_is_reported_when_the_policy_is_offered(tmp_path):
+    s = _settings_with_consent(tmp_path, days_ago=1)
+    names = [c.name for c in health_alerts(s, policy=_Policy(drifted=True))]
+    assert "policy" in names
+
+
+def test_a_policy_that_has_not_drifted_is_silent(tmp_path):
+    s = _settings_with_consent(tmp_path, days_ago=1)
+    assert health_alerts(s, policy=_Policy(drifted=False)) == []
+
+
+def test_a_per_run_caller_passes_no_policy_and_gets_no_drift(tmp_path):
+    """Drift cannot change under a running bot - the policy is loaded once at
+    startup - so re-reporting it after every run would be pure noise."""
+    s = _settings_with_consent(tmp_path, days_ago=1)
+    assert health_alerts(s) == []
+
+
+def test_an_unknown_consent_date_warns_once_but_does_not_recur(tmp_path):
+    """A token predating the sidecar is permanently 'unknown'. Worth saying at
+    startup; said after every run it becomes the notice you stop reading, and
+    one day it is carrying the real deadline."""
+    s = load_settings().__class__(**{**load_settings().__dict__,
+                                     "google_token": tmp_path / "absent.json"})
+    assert [c.level for c in health_alerts(s)] == ["warn"]
+    assert health_alerts(s, recurring=True) == []
+
+
+def test_a_real_deadline_still_recurs(tmp_path):
+    """The suppression above must not swallow the countdown itself."""
+    s = _settings_with_consent(tmp_path, days_ago=5)
+    assert health_alerts(s, recurring=True) != []
+
+
+def test_alert_text_is_empty_when_all_is_well():
+    """The caller sends nothing on an empty string; it must not send a blank."""
+    assert alert_text([]) == ""
+
+
+def test_alert_text_names_the_check_and_its_note(tmp_path):
+    text = alert_text(health_alerts(_settings_with_consent(tmp_path, days_ago=5)))
+    assert "oauth consent" in text and "expires" in text
