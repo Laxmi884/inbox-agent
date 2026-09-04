@@ -13,10 +13,19 @@ from typing import Optional
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
+from .config import BODY_FULL
 from .models import Action, ActionKind, Decision, Thread
 from .policy import Policy
 
-# One thread must never eat the window. Gemma runs at num_ctx=8192.
+# One thread must never eat the window. Gemma runs at num_ctx=8192, which is
+# roughly 32 000 characters of context for EVERYTHING - the policy, the standing
+# instructions, the schema and the email. 4000 is the long-standing default and
+# still the recommended value; it is no longer a hidden second ceiling.
+#
+# It used to be applied twice: the budget selected the field and then _fence
+# silently re-truncated to this, so INBOX_BODY_BUDGET=20000 quietly delivered
+# 4000. There is now exactly one cap and the budget is it, because a limit you
+# cannot raise from configuration is a limit nobody can A/B.
 MAX_BODY_CHARS = 4000
 
 # Every instruction ever given, appended forever, is an unbounded prompt - the
@@ -213,9 +222,16 @@ Return a single JSON object and nothing else, with EXACTLY these six keys:
   "confidence"   - a number from 0.0 to 1.0
 """
 
-def _fence(body: str) -> str:
-    """Truncate, and neutralise any attempt to open OR close the fence from inside it."""
-    clipped = body[:MAX_BODY_CHARS]
+def _fence(body: str, cap: Optional[int] = None) -> str:
+    """Neutralise any attempt to open OR close the fence from inside it.
+
+    Truncation is now the caller's decision. It used to happen here as well as
+    in _prompt_text, which meant the body was capped twice and the second cap
+    was invisible - a configured budget above MAX_BODY_CHARS did nothing at all.
+    Escaping is unconditional and always was: that is the security property, and
+    it does not depend on how much text got through.
+    """
+    clipped = body if cap is None else body[:cap]
     clipped = clipped.replace("<email_body>", "&lt;email_body&gt;")
     clipped = clipped.replace("</email_body>", "&lt;/email_body&gt;")
     return clipped
@@ -254,12 +270,26 @@ def _prompt_text(thread: Thread, body_budget: int) -> str:
     and stored either way, so that comparison needs no second fetch over a
     21,058-thread mailbox.
 
-    _fence still applies MAX_BODY_CHARS on top of this: the budget selects the
-    FIELD, the fence caps the absolute size.
+    BODY_FULL sends the whole body, however long it is. That is a real risk
+    and a deliberate one: Gemma at num_ctx=8192 has roughly 32 000 characters
+    for the entire prompt, so a long newsletter can push the policy and the
+    schema out of the window, and an overflowing prompt is how the 16 384-token
+    runaway of 2026-09-03 happened. tools/ab_body.py measures the distribution
+    before anything runs live, and classify_batch warns per thread past
+    SLOW_CLASSIFY_SECONDS if it does happen anyway.
+
+    This is the ONLY place the body is truncated. _fence escapes but no longer
+    caps, so what the budget says is what the model gets.
     """
+    if body_budget == BODY_FULL:
+        return thread.body or thread.snippet
     if body_budget > 0 and thread.body:
         return thread.body[:body_budget]
-    return thread.snippet
+    # The snippet is capped too. Gmail caps it near 201 characters in practice,
+    # but it is derived from the body and therefore just as attacker-influenced,
+    # and this is the DEFAULT configuration - the one that actually ships. Only
+    # an explicit "full" opts out of a ceiling.
+    return thread.snippet[:MAX_BODY_CHARS]
 
 
 def build_prompt(thread: Thread, policy: Policy, instructions=None,

@@ -12,8 +12,8 @@ import sys
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from ..audit import AuditLog
-from ..config import (build_embeddings, build_gmail_client, load_settings,
-                      mask, use_model)
+from ..config import (build_embeddings, build_gmail_client,
+                      describe_body_budget, load_settings, mask, use_model)
 from ..doctor import alert_text, health_alerts, oauth_check
 from ..graph import build_graph
 from ..policy import load_policy
@@ -110,8 +110,7 @@ def main() -> int:
     print(f"gmail     : {settings.gmail}"
           + ("   <- THE REAL MAILBOX" if settings.gmail == "live" else ""))
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
-    print(f"body      : {settings.body_budget} chars into the prompt"
-          + ("  (snippet only)" if settings.body_budget == 0 else ""))
+    print(f"body      : {describe_body_budget(settings.body_budget)}")
     print(f"policy    : {policy.version}"
           + ("   <- DRIFTED from the committed policies/default.md"
              if policy.drifted else ""))

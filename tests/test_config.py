@@ -263,3 +263,36 @@ def test_environment_wins_even_when_the_file_agrees(monkeypatch):
     monkeypatch.setattr(config_mod, "dotenv_values",
                         lambda *a, **k: {"INBOX_GMAIL": "live"})
     assert config_mod.source_of("INBOX_GMAIL") == "environment"
+
+
+# --- INBOX_BODY_BUDGET=full --------------------------------------------------
+
+def test_full_resolves_to_the_sentinel(monkeypatch):
+    from inbox_agent.config import BODY_FULL, _resolve_body_budget
+    monkeypatch.setenv("INBOX_BODY_BUDGET", "full")
+    assert _resolve_body_budget() == BODY_FULL
+
+
+def test_full_is_case_insensitive(monkeypatch):
+    from inbox_agent.config import BODY_FULL, _resolve_body_budget
+    monkeypatch.setenv("INBOX_BODY_BUDGET", "FULL")
+    assert _resolve_body_budget() == BODY_FULL
+
+
+def test_a_bare_negative_is_still_refused(monkeypatch):
+    """The sentinel is reachable only through the word. A raw -1 is far more
+    likely to be a typo than a request to send an unbounded prompt to a model
+    with an 8192-token window."""
+    import pytest as _pytest
+    from inbox_agent.config import _resolve_body_budget
+    monkeypatch.setenv("INBOX_BODY_BUDGET", "-1")
+    with _pytest.raises(ValueError, match="negative"):
+        _resolve_body_budget()
+
+
+def test_the_error_mentions_full_as_an_option(monkeypatch):
+    import pytest as _pytest
+    from inbox_agent.config import _resolve_body_budget
+    monkeypatch.setenv("INBOX_BODY_BUDGET", "everything")
+    with _pytest.raises(ValueError, match="full"):
+        _resolve_body_budget()

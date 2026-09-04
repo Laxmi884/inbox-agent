@@ -182,20 +182,55 @@ def _resolve_embeddings() -> str:
     return raw
 
 
+# INBOX_BODY_BUDGET=full. A sentinel rather than a huge number so the banner,
+# doctor and traces can say "full" instead of reporting a made-up ceiling that
+# was never really the limit. Defined here rather than in classify.py because
+# config is the base layer that imports nothing else in the package, and
+# classify -> policy -> config already: the other direction would be a cycle.
+BODY_FULL = -1
+
+
+def describe_body_budget(budget: int) -> str:
+    """How the banner, doctor and a trace should name the budget.
+
+    One formatter so the three cannot disagree. "full" must never be reported
+    as a number: the whole point of the sentinel is that there is no ceiling to
+    name, and printing one would be the same class of lie as reporting a masked
+    placeholder as a loaded token.
+    """
+    if budget == BODY_FULL:
+        return "full body, uncapped"
+    if budget == 0:
+        return "0 chars into the prompt  (snippet only)"
+    return f"{budget} chars of body into the prompt"
+
+
 def _resolve_body_budget() -> int:
-    """Characters of body into the prompt. Negative is refused rather than
-    clamped: clamping to 0 would look exactly like "snippet only was chosen",
-    when what actually happened is a misconfiguration nobody was told about."""
+    """Characters of body into the prompt.
+
+    0 is snippet only, a positive number is that many characters of body, and
+    "full" is the entire body however long it is. Negative is refused rather
+    than clamped: clamping to 0 would look exactly like "snippet only was
+    chosen", when what actually happened is a misconfiguration nobody was told
+    about. That is also why the sentinel is reachable ONLY through the word
+    "full" - a bare -1 in the environment is far more likely to be a mistake
+    than a request to send an unbounded prompt to a model with an 8192-token
+    window.
+    """
     raw = os.getenv("INBOX_BODY_BUDGET", "0").strip()
+    if raw.lower() == "full":
+        return BODY_FULL
     try:
         value = int(raw or "0")
     except ValueError:
         raise ValueError(
             f"INBOX_BODY_BUDGET={raw!r} is not an integer. Use 0 for snippet "
-            "only, or a character budget such as 2000.") from None
+            "only, a character budget such as 2000, or 'full' for the whole "
+            "body.") from None
     if value < 0:
         raise ValueError(
-            f"INBOX_BODY_BUDGET={value} is negative. Use 0 for snippet only.")
+            f"INBOX_BODY_BUDGET={value} is negative. Use 0 for snippet only, "
+            "or 'full' for the whole body.")
     return value
 
 
