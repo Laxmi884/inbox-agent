@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging as log_module
 import operator
+import time
 import uuid
 from typing import Annotated, Optional, TypedDict, get_args
 
@@ -144,6 +145,11 @@ def learn_from_response(
         learned.append(rule.id)
 
     return learned, skipped
+
+
+# `log` throughout build_graph is the AuditLog, so the progress logger needs a
+# name of its own rather than shadowing it.
+_log = log_module.getLogger(__name__)
 
 
 def _run_actions(actions, *, decision, verdict, client, settings, log, context):
@@ -332,16 +338,27 @@ def build_graph(
         decisions = {d["thread_id"]: Decision.model_validate(d)
                      for d in state["decisions"]}
         executed, refused = [], []
-        for raw in state.get("auto", []):
+        auto = state.get("auto", [])
+        total = len(auto)
+        for index, raw in enumerate(auto, 1):
             item = ReviewItem.model_validate(raw)
             decision = decisions.get(item.thread_id)
             if decision is None:
                 continue
+            started = time.monotonic()
             ran, refused_here = _run_actions(
                 decision.actions, decision=decision, verdict="approve",
                 client=client, settings=settings, log=log, context=context)
             executed += ran
             refused += refused_here
+            # Progress only, with no slow-action threshold. Gmail already says
+            # when it is struggling: _with_backoff logs every rate-limit retry,
+            # on a 62s schedule, so a single action can legitimately take over a
+            # minute while the quota clears. A second threshold here would fire
+            # during exactly that healthy backoff and mean nothing.
+            _log.info("execute %d/%d %s %s in %.1fs", index, total,
+                      item.thread_id, [a.kind for a in decision.actions],
+                      time.monotonic() - started)
         return {"executed": executed, "refused": refused}
 
     def enqueue_held(state: TriageState) -> dict:
@@ -388,12 +405,22 @@ def build_graph(
         """
         context = _context(config)
         refused_ids = []
-        for thread_id in state.get("thread_ids", []):
+        thread_ids = state.get("thread_ids", [])
+        total = len(thread_ids)
+        # Announced before the loop, not only after it. This is the second of
+        # the two silent Gmail phases: one label per thread, both tiers, so on
+        # a twenty-thread run it is another twenty round trips after the digest
+        # already looks ready.
+        _log.info("mark_triaged: labelling %d thread(s)", total)
+        for index, thread_id in enumerate(thread_ids, 1):
             action = Action(kind="label", thread_id=thread_id,
                             params={"label": settings.triaged_label})
+            started = time.monotonic()
             try:
                 execute_action(action, client=client, settings=settings, log=log,
                                actor="agent", context=context)
+                _log.info("mark_triaged %d/%d %s in %.1fs", index, total,
+                          thread_id, time.monotonic() - started)
             except ForbiddenActionError:
                 # Configured out. Not fatal: the run's real work already
                 # happened. Surfaced into `skipped`, not `refused` - `refused`

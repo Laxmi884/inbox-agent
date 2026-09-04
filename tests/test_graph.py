@@ -799,3 +799,48 @@ def test_a_thread_the_rerun_never_saw_stays_held(wiring):
     graph = build_graph(**wiring, checkpointer=InMemorySaver())
     graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-1"}})
     assert [h.thread_id for h in wiring["held"].all()] == ["not-in-this-run"]
+
+
+# --- the execute phases report progress too ---------------------------------
+#
+# Slice 1 instrumented classify and moved the blind spot downstream rather than
+# removing it: on 2026-09-04 classify finished at 12:04:32 and the digest
+# arrived at 12:06:19, 107 seconds later, with not one log line in between. Two
+# Gmail phases run in that gap - auto_execute and mark_triaged - and a run
+# stalled in either looked exactly like one about to finish.
+
+import logging as _logging
+
+
+def _run_incremental(wiring):
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring, checkpointer=InMemorySaver())
+    return graph.invoke({"limit": 10, "mode": "incremental"},
+                        {"configurable": {"thread_id": "progress-1"}})
+
+
+def _messages(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_auto_execute_reports_which_item_it_is_on(wiring, caplog):
+    with caplog.at_level(_logging.INFO, logger="inbox_agent.graph"):
+        _run_incremental(wiring)
+    lines = [m for m in _messages(caplog) if m.startswith("execute ")]
+    assert lines, "auto_execute ran silently"
+    assert "/" in lines[0], "no N/M progress in the execute line"
+
+
+def test_mark_triaged_announces_the_work_before_doing_it(wiring, caplog):
+    """Announced up front: on a twenty-thread run this is twenty more round
+    trips after the digest already looks ready."""
+    with caplog.at_level(_logging.INFO, logger="inbox_agent.graph"):
+        _run_incremental(wiring)
+    assert any(m.startswith("mark_triaged: labelling") for m in _messages(caplog))
+
+
+def test_mark_triaged_reports_each_thread(wiring, caplog):
+    with caplog.at_level(_logging.INFO, logger="inbox_agent.graph"):
+        _run_incremental(wiring)
+    assert any(m.startswith("mark_triaged ") and "/" in m
+               for m in _messages(caplog))

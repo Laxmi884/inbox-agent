@@ -532,10 +532,13 @@ def test_replaying_a_digest_callback_executes_nothing(bot):
 def test_paging_the_digest_edits_one_message_instead_of_sending_many(bot):
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    assert len(t.sent) == 1
+    # A run now sends an acknowledgement before the digest, so the count after
+    # the run is the baseline rather than a literal 1. The guarantee under test
+    # was never "one message ever" - it is that paging adds none.
+    after_run = len(t.sent)
     b.handle_update(cb(encode("next", digest_id=b._digest_id)))
     b.handle_update(cb(encode("prev", digest_id=b._digest_id)))
-    assert len(t.sent) == 1, "paging sent extra messages"
+    assert len(t.sent) == after_run, "paging sent extra messages"
     assert len(t.edited) == 2, "paging did not edit in place"
 
 
@@ -1557,3 +1560,39 @@ def test_a_real_run_goes_through_the_traced_config(bot):
     b.handle_update(msg("/triage 4"))
     assert seen.get("run_name", "").startswith("triage-")
     assert seen["configurable"]["thread_id"]
+
+
+# --- a run says it started, not only that it finished ------------------------
+#
+# graph.invoke is one blocking call and a real run is minutes long: ~5s per
+# thread to classify, then two silent Gmail phases at ~2s per action. On
+# 2026-09-04 a 19-thread run took 247s and sent nothing at all for the first
+# 235 of them, and the owner asked whether the bot was dead. It was not.
+
+def test_a_run_acknowledges_before_it_starts_working(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert "Triaging" in t.sent[0]["text"], \
+        "the first thing the owner saw was still the digest, minutes later"
+
+
+def test_the_acknowledgement_says_how_much_was_asked_for(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 7"))
+    assert "7" in t.sent[0]["text"]
+
+
+def test_the_digest_still_follows_the_acknowledgement(bot):
+    """The ack must be an addition, not a replacement."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert any("DONE" in m["text"] for m in t.sent[1:])
+
+
+def test_a_failed_run_still_reports_the_failure_after_acknowledging(bot):
+    """The ack must not leave a dead run looking merely slow."""
+    b, t, _ = bot
+    b.graph.invoke = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    b.handle_update(msg("/triage 4"))
+    assert "Triaging" in t.sent[0]["text"]
+    assert "Triage failed" in t.sent[-1]["text"]

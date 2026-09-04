@@ -879,6 +879,14 @@ class Bot:
         self._done_page = 0
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
+        # Say something before the four minutes of silence, not after. A run is
+        # one blocking graph.invoke: classify is seconds per thread and the two
+        # Gmail phases are seconds per action, so a twenty-thread run is minutes
+        # long and, until this line, sent nothing at all until the digest. The
+        # owner cannot tell that from a bot that has died, and asked.
+        self.transport.send_message(
+            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
+                          f"minutes; the digest arrives when it is done.")
         started = time.monotonic()
         # mode="incremental": /triage ACTS. The confident, reversible majority
         # is executed and only what genuinely needs the owner goes to the queue,
