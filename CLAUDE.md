@@ -44,13 +44,33 @@ started at 18:12 kept sending LangSmith traces for seventeen hours after the
 file was set to `false` at 18:40. The banner is the honest source — it is
 printed by the process — so check it, and restart after a `.env` edit.
 
-**Start the live bot double-forked**, so it lands on PPID 1 and does not die
-with the shell that spawned it:
+**launchd runs the live bot; do not start one by hand.**
 
-    nohup python3 -u -m inbox_agent.telegram >> /private/tmp/inbox_agent_live.log 2>&1 &
+    launchctl print gui/$(id -u)/com.inbox-agent.bot    # state, restarts, exit code
+    bash tools/install-launchd.sh                       # install or re-render
+    bash tools/install-launchd.sh --uninstall           # hand it back
 
-An agent tool call's process group killed the live bot for an hour once. macOS
-has no `setsid(1)`.
+It restarts on its own, including after SIGKILL, and `tools/run_bot.sh` runs
+`doctor` first and refuses to start a misconfigured bot. A second bot is
+refused by an flock with exit 3 — two processes on one Telegram token split the
+updates and the owner's taps reach whichever one got them.
+
+Logs are in two places on purpose: `~/Library/Logs/inbox-agent/boot.log` has
+the banner, the preflight and any traceback, and `INBOX_LOG_FILE` has the
+rotating operational log. Nothing rotates the first, which is why it only ever
+receives startup output.
+
+If you must run one by hand, stop the job first, and double-fork so it lands on
+PPID 1: `( nohup python3 -u -m inbox_agent.telegram >> /tmp/bot.log 2>&1 & )`.
+An agent tool call's process group killed the live bot for an hour once, and
+macOS has no `setsid(1)`.
+
+**This checkout must stay out of `~/Documents`, `~/Desktop` and `~/Downloads`.**
+Those are TCC-protected, and a launchd agent has no consent grant for them: the
+job exits 126 "Operation not permitted" before any Python runs and respawns
+every 60s saying nothing. The repo was moved out of `~/Documents/Projects` on
+2026-09-05 for exactly this. `install-launchd.sh` refuses rather than let it
+happen again.
 
 **Policy lives in two places on purpose.** `inbox_agent/policies/default.md` is
 the authoring surface; Context Hub is the publish target. Run
