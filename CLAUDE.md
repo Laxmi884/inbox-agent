@@ -6,7 +6,7 @@ package, `tests/` the suite, `docs/superpowers/` the specs and plans.
 
 ## Verify
 
-    python -m pytest        # 677 tests, ~3s, no network, no credentials needed
+    python -m pytest        # 797 tests, ~4s, no network, no credentials needed
 
 That is the whole feedback loop. It is fast enough to run after every change,
 so run it — a change is not done until it is green.
@@ -26,7 +26,7 @@ escapes and produces a several-hundred-line diff with no content change — thro
 that away, don't commit it.
 
 **`/backlog` must stay unwired.** `Bot._resume` is unreached and deliberately
-broken; read the WARNING above it in `telegram/bot.py:1011`. `to_response()`
+broken; read the WARNING above it in `telegram/bot.py:1086`. `to_response()`
 defaults every unnamed thread to *approve*, so resuming today would blanket-
 approve a 500-thread historical sweep — the exact outcome previewing exists to
 prevent. Wiring the command is one line and the most destructive edit available
@@ -35,6 +35,14 @@ in this repo. Plan 3 rebuilds verdict collection first.
 **Never `export` `INBOX_*`.** `.env` already carries `INBOX_GMAIL=live` and
 `INBOX_DRY_RUN=false`. A shell export beats the file, does not survive a
 restart, and has silently changed which mailbox a run wrote to.
+
+**And editing `.env` does not reach a bot that is already running.**
+`load_dotenv` runs once, at import, so a long-running process holds the file as
+it was when it started. `inbox-agent doctor` reads the file and will
+confidently tell you the opposite of what the bot is doing. On 2026-09-04 a bot
+started at 18:12 kept sending LangSmith traces for seventeen hours after the
+file was set to `false` at 18:40. The banner is the honest source — it is
+printed by the process — so check it, and restart after a `.env` edit.
 
 **Start the live bot double-forked**, so it lands on PPID 1 and does not die
 with the shell that spawned it:
