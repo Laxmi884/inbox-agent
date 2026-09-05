@@ -15,6 +15,8 @@ from ..audit import AuditLog
 from ..config import (build_embeddings, build_gmail_client,
                       describe_body_budget, load_settings, mask, use_model)
 from ..doctor import alert_text, health_alerts, oauth_check, tracing_check
+from ..logging_setup import configure as configure_logging
+from ..single_instance import AlreadyRunning, acquire
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -66,8 +68,7 @@ def _embeddings_banner(settings, resolved: str) -> str:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging()
     settings = load_settings()
 
     missing = [n for n, v in (("INBOX_TG_TOKEN", settings.tg_token),
@@ -77,6 +78,15 @@ def main() -> int:
               "Get a token from @BotFather, and set INBOX_TG_CHAT_ID to your own\n"
               "Telegram user id - the bot answers that id and no other.")
         return 2
+
+    # Held for the life of the process. This local is the only reference, and
+    # dropping it releases the lock and silently permits a second bot - which
+    # is why it is not an underscore-prefixed throwaway.
+    try:
+        instance_lock = acquire(settings.store_dir)      # noqa: F841 - see above
+    except AlreadyRunning as exc:
+        print(f"Refusing to start: {exc}")
+        return 3
 
     policy = load_policy(settings)
     client = build_gmail_client(settings)
