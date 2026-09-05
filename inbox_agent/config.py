@@ -321,6 +321,22 @@ def source_of(key: str) -> str:
     return "default"
 
 
+def dotenv_value(key: str) -> Optional[str]:
+    """What the .env FILE says for `key` right now, ignoring this process.
+
+    source_of() answers "shell, file, or default", which covers the override
+    that cost a live run in spec 1.4. It cannot answer a different question:
+    is the file NEWER than the process reading it. load_dotenv runs once, at
+    import, so a long-running bot holds whatever the file said when it
+    started, and every later edit is invisible to it.
+
+    Comparing this against os.environ is the only way to see that gap. See
+    doctor.tracing_check, which was written after a bot spent 17 hours sending
+    traces that .env had said to stop sending.
+    """
+    return dotenv_values(find_dotenv()).get(key)
+
+
 def get_llm(backend: Optional[str] = None):
     """Build the chat model for the resolved backend. Always a BaseChatModel."""
     backend = backend or resolve_backend()

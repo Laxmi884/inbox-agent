@@ -14,7 +14,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from ..audit import AuditLog
 from ..config import (build_embeddings, build_gmail_client,
                       describe_body_budget, load_settings, mask, use_model)
-from ..doctor import alert_text, health_alerts, oauth_check
+from ..doctor import alert_text, health_alerts, oauth_check, tracing_check
 from ..graph import build_graph
 from ..policy import load_policy
 from ..store import HeldQueue, PreferenceStore, open_store
@@ -32,6 +32,20 @@ def policy_categories(policy) -> list[str]:
         return []
     body = section[1].split("\n## ", 1)[0]
     return re.findall(r"^-\s+`([a-z_]+)`", body, re.M)
+
+
+def _tracing_banner() -> str:
+    """The banner's tracing line, as a string so it can be tested.
+
+    Same reasoning as _embeddings_banner: a mode nobody can see is the failure
+    this banner exists to prevent. The banner is printed BY the process, which
+    makes it the only place that can honestly report what THIS process is
+    doing rather than what .env currently says - and on 2026-09-04 those were
+    different for seventeen hours. See doctor.tracing_check.
+    """
+    check = tracing_check()
+    return (f"tracing   : {check.value}"
+            + (f"   <- {check.note}" if check.level != "ok" else ""))
 
 
 def _embeddings_banner(settings, resolved: str) -> str:
@@ -111,6 +125,7 @@ def main() -> int:
           + ("   <- THE REAL MAILBOX" if settings.gmail == "live" else ""))
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
     print(f"body      : {describe_body_budget(settings.body_budget)}")
+    print(_tracing_banner())
     print(f"policy    : {policy.version}"
           + ("   <- DRIFTED from the committed policies/default.md"
              if policy.drifted else ""))

@@ -280,3 +280,92 @@ def test_alert_text_is_empty_when_all_is_well():
 def test_alert_text_names_the_check_and_its_note(tmp_path):
     text = alert_text(health_alerts(_settings_with_consent(tmp_path, days_ago=5)))
     assert "oauth consent" in text and "expires" in text
+
+
+# --- tracing ----------------------------------------------------------------
+#
+# The row exists because on 2026-09-04 a bot started at 18:12 with tracing on,
+# .env was set to false at 18:40, and the bot went on tracing for another
+# seventeen hours with nothing anywhere saying so.
+
+def _tracing(monkeypatch, *, env=None, file=None):
+    for k, v in (env or {}).items():
+        if v is None:
+            monkeypatch.delenv(k, raising=False)
+        else:
+            monkeypatch.setenv(k, v)
+    monkeypatch.setattr(config_mod, "dotenv_value", lambda key: (file or {}).get(key))
+    monkeypatch.setattr(doctor, "dotenv_value", lambda key: (file or {}).get(key))
+    return doctor.tracing_check()
+
+
+def test_tracing_off_is_reported_plainly(monkeypatch):
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": "false"},
+                 file={"LANGSMITH_TRACING": "false"})
+    assert c.value == "off"
+    assert c.level == "ok"
+
+
+def test_tracing_on_names_the_project(monkeypatch):
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": "true",
+                                   "LANGSMITH_PROJECT": "inbox-agent",
+                                   "LANGSMITH_API_KEY": "lsv2_x"},
+                 file={"LANGSMITH_TRACING": "true"})
+    assert c.value == "on -> inbox-agent"
+    assert c.level == "ok"
+
+
+def test_a_file_edited_after_the_process_started_is_a_warning(monkeypatch):
+    """The whole point. The file says stop, the process is still going, and
+    only a restart closes the gap - source_of cannot say this, because the
+    third source is time rather than shell-or-file."""
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": "true",
+                                   "LANGSMITH_API_KEY": "lsv2_x"},
+                 file={"LANGSMITH_TRACING": "false"})
+    assert c.level == "warn"
+    assert c.value.startswith("on")
+    assert "restart" in c.note
+
+
+def test_the_stale_warning_works_in_the_other_direction_too(monkeypatch):
+    """A process started before tracing was turned ON is equally misleading:
+    the file promises traces that are not being sent."""
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": "false"},
+                 file={"LANGSMITH_TRACING": "true"})
+    assert c.level == "warn"
+    assert c.value == "off"
+
+
+def test_tracing_on_with_no_api_key_is_a_warning(monkeypatch):
+    """On and going nowhere looks exactly like off, until someone needs the
+    trace."""
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": "true",
+                                   "LANGSMITH_API_KEY": ""},
+                 file={"LANGSMITH_TRACING": "true"})
+    assert c.level == "warn"
+    assert "go nowhere" in c.note
+
+
+def test_an_unset_variable_is_off_not_an_error(monkeypatch):
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": None}, file={})
+    assert c.value == "off"
+    assert c.level == "ok"
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", " yes ", "on"])
+def test_the_spellings_langsmith_accepts_all_read_as_on(monkeypatch, raw):
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": raw,
+                                   "LANGSMITH_API_KEY": "lsv2_x"}, file={})
+    assert c.value.startswith("on")
+
+
+@pytest.mark.parametrize("raw", ["false", "0", "no", "", "off", "maybe"])
+def test_everything_else_reads_as_off(monkeypatch, raw):
+    c = _tracing(monkeypatch, env={"LANGSMITH_TRACING": raw}, file={})
+    assert c.value == "off"
+
+
+def test_doctor_reports_a_tracing_row_at_all(monkeypatch):
+    """It reported twelve settings and not this one, which is why nobody could
+    see it without reading process start times off ps."""
+    assert "LANGSMITH_TRACING" in _checks(monkeypatch)

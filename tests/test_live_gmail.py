@@ -48,10 +48,20 @@ class FakeThreads:
     def __init__(self, api):
         self._api = api
 
-    def list(self, userId="me", q="", maxResults=50):
-        self._api.queries.append({"q": q, "maxResults": maxResults})
-        ids = list(self._api.order)[:maxResults]
-        return _Exec({"threads": [{"id": i} for i in ids]})
+    def list(self, userId="me", q="", maxResults=50, pageToken=None):
+        self._api.queries.append({"q": q, "maxResults": maxResults,
+                                  "pageToken": pageToken})
+        # Gmail caps a page well below the number of threads a query can match,
+        # so the fake pages too - list_thread_ids only reaches past the first
+        # page if nextPageToken is honoured, and a non-paging fake would let a
+        # sampler that silently truncates pass.
+        start = int(pageToken or 0)
+        window = list(self._api.order)[start:start + min(maxResults,
+                                                         self._api.page_size)]
+        out = {"threads": [{"id": i} for i in window]}
+        if start + len(window) < len(self._api.order) and window:
+            out["nextPageToken"] = str(start + len(window))
+        return _Exec(out)
 
     def get(self, userId="me", id=None, format="full"):
         self._api.gets.append(id)
@@ -129,6 +139,7 @@ class FakeGmailApi:
             {"id": "Label_1", "name": "Notes"},
             {"id": "Label_6111317184412779502", "name": "Education/AI"},
         ]
+        self.page_size = 500
         self.queries, self.gets, self.modifies = [], [], []
         self.trashed, self.drafts, self.created_labels = [], [], []
         self.label_list_calls = 0

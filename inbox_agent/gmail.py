@@ -59,7 +59,10 @@ def matches_query(thread: Thread, query: str) -> bool:
 
 class GmailClient(Protocol):
     def list_threads(self, limit: int = 50, query: str = "") -> list[Thread]: ...
+    def list_thread_ids(self, query: str = "", max_ids: int = 500) -> list[str]: ...
     def get_thread(self, thread_id: str) -> Thread: ...
+    def get_threads(self, thread_ids: list[str],
+                    *, workers: int | None = None) -> list[Thread]: ...
     def apply_label(self, thread_id: str, label: str) -> dict[str, Any]: ...
     def remove_label(self, thread_id: str, label: str) -> dict[str, Any]: ...
     def archive(self, thread_id: str) -> dict[str, Any]: ...
@@ -101,10 +104,21 @@ class SnapshotGmailClient:
                 break
         return out
 
+    def list_thread_ids(self, query: str = "", max_ids: int = 500) -> list[str]:
+        # Deliberately the same filter as list_threads. Both clients answering
+        # one query string identically is the contract matches_query exists to
+        # protect, and an ids-only path that drifted from it would be a
+        # sampler that sees different mail depending on the backend.
+        return [t.id for t in self.list_threads(limit=max_ids, query=query)]
+
     def get_thread(self, thread_id: str) -> Thread:
         if thread_id not in self._threads:
             raise KeyError(f"thread {thread_id!r} not in snapshot")
         return self._threads[thread_id]
+
+    def get_threads(self, thread_ids: list[str],
+                    *, workers: int | None = None) -> list[Thread]:
+        return [self.get_thread(i) for i in thread_ids]
 
     def _labels(self, thread_id: str) -> list[str]:
         return self.get_thread(thread_id).label_ids
@@ -662,19 +676,64 @@ class LiveGmailClient:
                 userId="me", q=query,
                 maxResults=limit).execute(http=self._http()),
             what="threads.list", reset=self._reset_http)
-        ids = [t["id"] for t in (result.get("threads") or [])]
-        if not ids:
-            return []
+        return self.get_threads([t["id"] for t in (result.get("threads") or [])])
 
+    def list_thread_ids(self, query: str = "", max_ids: int = 500) -> list[str]:
+        """Ids only, paged, with nothing hydrated.
+
+        list_threads costs one threads.get per id, so it cannot be pointed at
+        more mail than you intend to read. Sampling wants the opposite shape:
+        see thousands of ids cheaply, choose a few, hydrate only those. A page
+        of 500 ids costs 5 quota units; hydrating one thread costs 10. So the
+        whole 20 000-thread mailbox is enumerable for less than the cost of
+        reading twenty of it.
+
+        max_ids bounds a mailbox that has no natural end. It is a per-stratum
+        ceiling for the sampler, not a limit on the answer: a stratum with more
+        threads than this is sampled from its newest max_ids, which is a bias
+        worth knowing about and the reason the strata are cut by year.
+        """
+        ids: list[str] = []
+        token = None
+        while len(ids) < max_ids:
+            page = _with_backoff(
+                lambda: self._threads_resource().list(
+                    userId="me", q=query, pageToken=token,
+                    maxResults=min(500, max_ids - len(ids))).execute(
+                        http=self._http()),
+                what="threads.list", reset=self._reset_http)
+            ids.extend(t["id"] for t in (page.get("threads") or []))
+            token = page.get("nextPageToken")
+            if not token:
+                break
+        return ids[:max_ids]
+
+    def get_threads(self, thread_ids: list[str],
+                    *, workers: int | None = None) -> list[Thread]:
+        """Hydrate an explicit list of ids, `workers` at a time.
+
+        _HYDRATE_WORKERS is tuned for a triage run - twenty or so threads,
+        fetched once, where five in flight is the difference between a
+        responsive digest and a slow one. A caller pulling hundreds in one
+        burst is a different problem: five workers there re-consume Gmail's
+        per-minute quota the moment it refills, so every retry in _with_backoff
+        collides with the four siblings that were also waiting, and six
+        attempts run out while the limit is still exhausted. Seen on
+        2026-09-04 hydrating a 200-thread sample. Such a caller should pace
+        itself and say so here.
+        """
+        if not thread_ids:
+            return []
         # Built once here rather than lazily inside each worker: five threads
         # racing to build it would issue five labels.list calls.
         self._labels._ensure()
 
-        with ThreadPoolExecutor(max_workers=_HYDRATE_WORKERS) as pool:
+        with ThreadPoolExecutor(
+                max_workers=workers or _HYDRATE_WORKERS) as pool:
             # pool.map preserves input order. Gmail returns newest first and the
             # digest renders in that order, so ordering is contract rather than
             # an accident of scheduling.
-            return list(pool.map(self.get_thread, ids))
+            return list(pool.map(self.get_thread, thread_ids))
 
     def get_thread(self, thread_id: str) -> Thread:
         raw = _with_backoff(

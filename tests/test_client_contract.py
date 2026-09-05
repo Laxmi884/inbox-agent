@@ -143,3 +143,22 @@ def test_only_the_snapshot_client_marks_writes_simulated(
     one; the live client must never make that claim."""
     assert snapshot_client.archive("t0")["simulated"] is True
     assert live_client.archive("t0").get("simulated") is not True
+
+
+def test_both_clients_agree_on_ids_only_listing(snapshot_client, live_client):
+    """list_thread_ids exists so the sampler can see the mailbox without
+    hydrating it. It is only useful if it selects the same threads
+    list_threads would - an ids path that drifted from the query engine would
+    be a sampler quietly measuring different mail on each backend."""
+    query = "in:inbox is:unread -label:agent/triaged"
+    assert snapshot_client.list_thread_ids(query=query) == \
+           [t.id for t in snapshot_client.list_threads(limit=500, query=query)]
+    assert live_client.list_thread_ids(query=query) == \
+           [t.id for t in live_client.list_threads(limit=500, query=query)]
+
+
+def test_both_clients_hydrate_an_explicit_id_list_in_order(
+        snapshot_client, live_client):
+    ids = ["t4", "t0"]
+    assert [t.id for t in snapshot_client.get_threads(ids)] == ids
+    assert [t.id for t in live_client.get_threads(ids)] == ids

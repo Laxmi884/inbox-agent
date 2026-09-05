@@ -26,3 +26,36 @@ def test_banner_is_quiet_when_none_was_chosen_deliberately(monkeypatch):
 def test_banner_reports_ollama_when_it_is_available(monkeypatch):
     monkeypatch.setenv("INBOX_EMBEDDINGS", "auto")
     assert "ollama" in _embeddings_banner(load_settings(), resolved="ollama")
+
+
+# --- tracing ----------------------------------------------------------------
+
+from inbox_agent import doctor
+from inbox_agent.telegram.__main__ import _tracing_banner
+
+
+def test_banner_reports_tracing_at_all(monkeypatch):
+    """It reported twelve settings and not this one. Seventeen hours of
+    unwanted traces were invisible until someone read `ps` start times."""
+    monkeypatch.setattr(doctor, "dotenv_value", lambda key: None)
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2_x")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "inbox-agent")
+    assert _tracing_banner().startswith("tracing   : on -> inbox-agent")
+
+
+def test_banner_is_quiet_when_the_file_and_the_process_agree(monkeypatch):
+    monkeypatch.setattr(doctor, "dotenv_value", lambda key: "false")
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    assert _tracing_banner() == "tracing   : off"
+
+
+def test_banner_flags_a_process_the_file_can_no_longer_reach(monkeypatch):
+    """The exact 2026-09-04 shape: .env says stop, this process is still
+    going, and the banner is printed early enough to say so on restart."""
+    monkeypatch.setattr(doctor, "dotenv_value", lambda key: "false")
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2_x")
+    line = _tracing_banner()
+    assert line.startswith("tracing   : on")
+    assert "restart" in line

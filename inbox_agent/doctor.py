@@ -12,13 +12,14 @@ doctor that computes its own answers is checking a different program.
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from . import config as config_mod
-from .config import Settings, load_settings, mask, source_of
+from .config import (Settings, dotenv_value, load_settings, mask, source_of)
 from .google_auth import consented_at
 from .policy import load_policy
 
@@ -52,6 +53,55 @@ def _setting(key: str, value, *, level: str = "ok", note: str = "") -> Check:
             "set in the shell, not in .env - this value will NOT survive a "
             "restart, and the file says something else or nothing at all")
     return Check(name=key, value=shown, source=source, level=level, note=note)
+
+
+# LangSmith accepts several spellings for on. Anything else, including the
+# empty string and an unset variable, is off.
+_TRACING_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def _is_on(raw: Optional[str]) -> bool:
+    return (raw or "").strip().lower() in _TRACING_TRUE
+
+
+def tracing_check() -> Check:
+    """Is THIS process sending traces to LangSmith?
+
+    Read from os.environ, not from .env, and that distinction is the entire
+    reason the row exists. On 2026-09-04 a bot started at 18:12 with tracing
+    on; the file was set to false at 18:40; the bot went on tracing for
+    another seventeen hours and nothing anywhere said so. The banner reported
+    twelve settings and not this one, and doctor would have read the file and
+    confidently reported the opposite of what the bot was doing.
+
+    So the value here is the running truth, and the note is the discrepancy:
+    when the file and the process disagree, the file was edited after the
+    process started and only a restart applies it. source_of() cannot express
+    that - it distinguishes shell from file, and this third source is time.
+
+    An empty API key is its own warning. Tracing that is on and going nowhere
+    looks identical to tracing that is off, until someone needs the trace.
+    """
+    raw = os.getenv("LANGSMITH_TRACING")
+    on = _is_on(raw)
+    project = os.getenv("LANGSMITH_PROJECT") or "default"
+    source = source_of("LANGSMITH_TRACING")
+    value = f"on -> {project}" if on else "off"
+
+    on_file = dotenv_value("LANGSMITH_TRACING")
+    if on_file is not None and _is_on(on_file) != on:
+        return Check("LANGSMITH_TRACING", value, source, "warn",
+                     f".env says {on_file!r} but this process has "
+                     f"{(raw or '')!r} - the file was edited after the process "
+                     f"started, and only a restart applies it")
+    if on and not (os.getenv("LANGSMITH_API_KEY") or "").strip():
+        return Check("LANGSMITH_TRACING", value, source, "warn",
+                     "tracing is on but LANGSMITH_API_KEY is empty - the traces "
+                     "go nowhere, which looks exactly like tracing being off")
+    if on:
+        return Check("LANGSMITH_TRACING", value, source, "ok",
+                     "a running process keeps this until it restarts")
+    return Check("LANGSMITH_TRACING", value, source, "ok")
 
 
 def run_checks(settings: Optional[Settings] = None) -> list[Check]:
@@ -127,6 +177,7 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
             level="fatal" if needs_it else "ok",
             note="missing, and INBOX_GMAIL=live needs it" if needs_it else ""))
 
+    checks.append(tracing_check())
     checks.append(oauth_check(s))
 
     try:
