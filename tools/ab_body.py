@@ -389,7 +389,8 @@ def compare(results: dict[str, list[dict]]) -> None:
             print(f"  {a['subject'][:52]:<52} {a['category']} -> {b['category']}")
 
 
-def _persist(results: dict[str, list[dict]], strata: dict[str, str]) -> None:
+def _persist(results: dict[str, list[dict]], strata: dict[str, str],
+             policy_version: str | None = None) -> None:
     """Write the run to disk.
 
     With LANGSMITH_TRACING=false there is no trace to go back to, so a
@@ -400,8 +401,12 @@ def _persist(results: dict[str, list[dict]], strata: dict[str, str]) -> None:
     which arm was right.
     """
     STORE.mkdir(parents=True, exist_ok=True)
+    # A category means what the policy says it means, so a result set without
+    # the policy that produced it cannot be re-checked later - and tools.label_ab
+    # copies this onto every human label for exactly that reason.
     RESULTS.write_text(json.dumps(
         {"ran_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+         "policy_version": policy_version,
          "strata": strata, "arms": results}, indent=1), encoding="utf-8")
 
     names = list(results)
@@ -420,6 +425,21 @@ def _persist(results: dict[str, list[dict]], strata: dict[str, str]) -> None:
         lines.append("")
     DISAGREEMENTS.write_text("\n".join(lines), encoding="utf-8")
     print(f"\nwrote {RESULTS.name} and {DISAGREEMENTS.name} to {STORE}")
+
+
+def _policy_version() -> str | None:
+    """The policy the arms actually ran under, or None if it cannot be read.
+
+    Never fatal: a run that classified 180 threads must not be thrown away
+    because the version string could not be fetched at the end of it.
+    """
+    try:
+        from inbox_agent.config import load_settings
+        from inbox_agent.policy import load_policy
+        return load_policy(load_settings()).version
+    except Exception as exc:                       # noqa: BLE001 - see docstring
+        print(f"(could not read the policy version: {exc})")
+        return None
 
 
 def _budget(token: str) -> tuple[int, str]:
@@ -492,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\narm {label} (budget={budget}):")
         results[label] = run_arm(raw, budget, label)
     compare(results)
-    _persist(results, strata)
+    _persist(results, strata, _policy_version())
     return 0
 
 
