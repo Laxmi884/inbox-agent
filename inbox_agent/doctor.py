@@ -124,6 +124,11 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
         # same reason INBOX_GMAIL and INBOX_DRY_RUN do.
         _setting("INBOX_FORBIDDEN_ACTIONS", ", ".join(sorted(s.forbidden_actions))),
         _setting("INBOX_AUDIT_LOG", s.audit_log),
+        _setting("INBOX_LOG_FILE", s.log_file or "stderr (not rotated)",
+                 level="warn" if not s.log_file else "ok",
+                 note="fine interactively; under launchd nothing rotates the "
+                      "captured stderr and it grows without limit"
+                      if not s.log_file else ""),
     ]
 
     # Resolved, not configured. On a machine whose Ollama has died these differ,

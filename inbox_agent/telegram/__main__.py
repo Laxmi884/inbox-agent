@@ -68,8 +68,10 @@ def _embeddings_banner(settings, resolved: str) -> str:
 
 
 def main() -> int:
-    configure_logging()
+    # Before anything that logs, but after nothing: load_settings only reads
+    # env, so the log file can be configured from the same file it reads.
     settings = load_settings()
+    configure_logging(log_file=settings.log_file)
 
     missing = [n for n, v in (("INBOX_TG_TOKEN", settings.tg_token),
                               ("INBOX_TG_CHAT_ID", settings.tg_chat_id)) if not v]

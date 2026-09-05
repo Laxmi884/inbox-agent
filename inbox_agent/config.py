@@ -103,6 +103,9 @@ class Settings:
     # forfeits a future one. Defaulted so an existing checkout with Ollama
     # running behaves exactly as it always has.
     embeddings: str = "auto"
+    # Empty means log to stderr, which is right interactively and wrong under
+    # launchd: nothing rotates a StandardErrorPath. See logging_setup.configure.
+    log_file: str = ""
 
     @property
     def inbox_query(self) -> str:
@@ -256,6 +259,7 @@ def load_settings() -> Settings:
         context_hub_tag=os.getenv("CONTEXT_HUB_TAG", ""),
         stale_after_days=int(os.getenv("INBOX_STALE_AFTER_DAYS", "90")),
         triaged_label=_resolve_triaged_label(),
+        log_file=os.getenv("INBOX_LOG_FILE", ""),
         gmail=_resolve_gmail(),
         google_credentials=Path(
             os.getenv("INBOX_GOOGLE_CREDENTIALS", "secrets/credentials.json")),

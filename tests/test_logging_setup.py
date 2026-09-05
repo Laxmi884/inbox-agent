@@ -64,3 +64,65 @@ def test_configure_replaces_rather_than_stacks():
     logging_setup.configure()
     logging_setup.configure()
     assert len(logging.getLogger().handlers) == 1
+
+
+# --- rotation ---------------------------------------------------------------
+#
+# Nothing rotates a launchd StandardErrorPath, so an unattended bot writing
+# only to stderr grows without limit.
+
+import logging.handlers
+
+
+def test_no_log_file_means_stderr(tmp_path):
+    logging_setup.configure()
+    assert isinstance(logging.getLogger().handlers[0], logging.StreamHandler)
+
+
+def test_a_log_file_rotates(tmp_path):
+    logging_setup.configure(log_file=tmp_path / "bot.log")
+    handler = logging.getLogger().handlers[0]
+    assert isinstance(handler, logging.handlers.RotatingFileHandler)
+    assert handler.maxBytes == logging_setup.MAX_BYTES
+    assert handler.backupCount == logging_setup.BACKUPS
+
+
+def test_it_is_either_or_never_both(tmp_path):
+    """Two destinations is how an operator ends up reading the stale one - and
+    under launchd the duplicate would be the unbounded copy."""
+    logging_setup.configure(log_file=tmp_path / "bot.log")
+    assert len(logging.getLogger().handlers) == 1
+
+
+def test_the_directory_is_created(tmp_path):
+    logging_setup.configure(log_file=tmp_path / "deep" / "down" / "bot.log")
+    assert (tmp_path / "deep" / "down").is_dir()
+    logging.getLogger().handlers[0].close()
+
+
+def test_rotation_actually_caps_the_file(tmp_path, monkeypatch):
+    """The property that matters, asserted by overflowing it rather than by
+    reading maxBytes back."""
+    monkeypatch.setattr(logging_setup, "MAX_BYTES", 2000)
+    monkeypatch.setattr(logging_setup, "BACKUPS", 2)
+    target = tmp_path / "bot.log"
+    logging_setup.configure(log_file=target)
+    log = logging.getLogger("inbox_agent.rotationtest")
+    for i in range(400):
+        log.info("classify %d of 400, a line about the length of a real one", i)
+    for handler in logging.getLogger().handlers:
+        handler.close()
+
+    produced = sorted(tmp_path.glob("bot.log*"))
+    assert len(produced) == 3                      # live + 2 backups, not 400
+    assert all(p.stat().st_size < 4000 for p in produced)
+
+
+def test_the_rotated_lines_are_still_utc(tmp_path):
+    target = tmp_path / "bot.log"
+    logging_setup.configure(log_file=target)
+    logging.getLogger("inbox_agent.rotationtest").info("hello")
+    for handler in logging.getLogger().handlers:
+        handler.close()
+    assert re.search(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z ",
+                     target.read_text())

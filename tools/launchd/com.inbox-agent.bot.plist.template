@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Rendered by tools/install-launchd.sh; __PLACEHOLDERS__ are filled with this
+  checkout's real paths. Do not install this file directly.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/tools/run_bot.sh</string>
+  </array>
+
+  <!-- A launchd job inherits almost nothing: no shell, no PATH, no cwd. The
+       working directory is what lets find_dotenv() locate .env, and PATH is
+       spelled out because run_bot.sh calls python3 by name. -->
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>INBOX_PYTHON</key>
+    <string>__PYTHON__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart whatever the exit code. The alternative, SuccessfulExit=false,
+       restarts only on failure and would leave a clean shutdown down forever -
+       but this bot has no clean shutdown that means "stay down"; that is what
+       `launchctl bootout` is for.
+
+       ThrottleInterval is the safety on it. A broken config exits 78 from the
+       preflight every time, and without a throttle launchd would rerun doctor
+       - which probes Ollama and reads the policy over the network - in a tight
+       loop. 60s self-heals within a minute of the config being fixed and costs
+       one probe a minute until then. -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <!-- The banner, the preflight report and any traceback that never reached
+       logging. Small: it only grows at restarts. The operational log goes to
+       INBOX_LOG_FILE, which rotates - nothing rotates these two. -->
+  <key>StandardOutPath</key>
+  <string>__LOGDIR__/boot.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGDIR__/boot.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
