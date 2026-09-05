@@ -6,7 +6,7 @@ package, `tests/` the suite, `docs/superpowers/` the specs and plans.
 
 ## Verify
 
-    python -m pytest        # 797 tests, ~4s, no network, no credentials needed
+    python -m pytest        # 848 tests, ~5s, no network, no credentials needed
 
 That is the whole feedback loop. It is fast enough to run after every change,
 so run it — a change is not done until it is green.
@@ -71,6 +71,26 @@ job exits 126 "Operation not permitted" before any Python runs and respawns
 every 60s saying nothing. The repo was moved out of `~/Documents/Projects` on
 2026-09-05 for exactly this. `install-launchd.sh` refuses rather than let it
 happen again.
+
+**The body budget is settled: `INBOX_BODY_BUDGET=4000`.** Measured, not
+guessed. Against 13 human labels on the threads where the arms disagreed,
+snippet scored 2/13 and both 4000 and full scored 10/13 — so the body matters
+and the last 50,000 characters do not. `full` also put 4 of 60 threads over
+`SLOW_CLASSIFY_SECONDS` and overflowed the context window on a 57,900-char
+thread, losing the policy from the prompt and returning a worse answer at
+confidence 1.0. Do not re-open this without new evidence.
+
+One thing that experiment could NOT fix: `newsletter_valuable` vs
+`newsletter_noise` is not a prompt-size problem. More body made the model more
+confident and less correct there. That boundary belongs to the preference and
+rules engine.
+
+**Experiment tooling.** `tools/ab_body.py --sample N` draws a stratified corpus
+across category and year (fetching is cheap; `--arms` is hours of local GPU, so
+it is opt-in and separate). `tools/label_ab.py` records human verdicts on the
+disagreements. Everything they write lands in `inbox_agent/store/`, which is
+gitignored because it holds real email — so the labelled reference set has **no
+backup**, and re-labelling is the one cost that cannot be automated away.
 
 **Policy lives in two places on purpose.** `inbox_agent/policies/default.md` is
 the authoring surface; Context Hub is the publish target. Run
