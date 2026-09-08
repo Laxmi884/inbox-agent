@@ -338,9 +338,12 @@ The probe belongs in the `fetch` node (`graph.py:235`), not in the bot: fetch
 already holds the query and the limit, and a second Gmail call from `Bot` would
 be a second place that decides what a run's corpus is. It returns a `remaining`
 count into `TriageState`, which `_view` (`bot.py:196`) carries onto
-`DigestView` beside `total`. This adds an ids-only listing method to the Gmail
-client protocol (`gmail.py:61`), implemented by both the live and snapshot
-clients so the suite stays offline. If more threads exist than the run will take,
+`DigestView` beside `total`. No new client method is needed: `list_thread_ids`
+already exists on the protocol and on both clients (`gmail.py:62`, `:107`,
+`:681`), added for the A/B sampler and documented there as costing 5 quota units
+per page of 500 against 10 for hydrating a single thread. The snapshot client
+implements it through the same `matches_query` filter as `list_threads`, so the
+suite stays offline and both backends answer the probe identically. If more threads exist than the run will take,
 the digest header carries the remainder:
 
     Inbox · 13:00 · 50 threads · 30 more waiting
