@@ -227,3 +227,30 @@ def test_the_confirm_step_is_a_separate_kind_from_the_offer():
 
 def test_bulk_trash_codes_stay_inside_the_64_byte_callback_limit():
     assert len(encode("trash_all_go", digest_id="7f2a").encode()) <= 64
+
+
+def test_a_refused_callback_says_so_in_the_log(caplog):
+    """A tap the bot declines to parse must leave a trace.
+
+    The refusal is a toast, and on a phone a toast is a banner that vanishes -
+    so from the outside it is indistinguishable from a dead button, and from
+    the log it was indistinguishable from nothing at all. On 2026-09-08 that
+    cost an entire investigation: the only paths writing no log line were
+    "worked" and "refused", which is exactly the pair you need to tell apart.
+    """
+    import logging
+    from inbox_agent.telegram.bot import Bot
+
+    calls = []
+
+    class T:
+        def answer_callback(self, callback_id, text=""):
+            calls.append(text)
+
+    bot = Bot.__new__(Bot)
+    bot.transport = T()
+    with caplog.at_level(logging.INFO):
+        bot._ack_refusal("cb-1", "not parseable", "That button came from an "
+                                                  "older message.")
+    assert calls == ["That button came from an older message."]
+    assert "not parseable" in caplog.text

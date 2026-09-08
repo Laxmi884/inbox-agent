@@ -1056,6 +1056,20 @@ class Bot:
         except Exception as exc:
             log.info("could not acknowledge callback %s: %s", callback_id, exc)
 
+    def _ack_refusal(self, callback_id: str, why: str, text: str) -> None:
+        """Decline a tap, on the screen AND in the log.
+
+        The toast tells the owner; this tells whoever reads the log afterwards.
+        A refusal used to write nothing, which made it indistinguishable from a
+        tap that worked - both silent - and the two are precisely what an
+        investigation into "the buttons are not working" has to separate. On
+        2026-09-08 that ambiguity was the whole of the difficulty: a tap on the
+        19:00 digest left no trace of any kind, and neither did the taps on the
+        15:00 digest that were fine.
+        """
+        log.info("refused a callback: %s", why)
+        self._ack(callback_id, text)
+
     def _on_callback(self, query: dict) -> None:
         """Every path answers the callback, and says something when it refuses.
 
@@ -1072,7 +1086,8 @@ class Bot:
         intent = decode(query.get("data", ""))
         answer = query.get("id", "")
         if intent.kind == "noop":
-            self._ack(answer, "That button came from an older message.")
+            self._ack_refusal(answer, f"decode refused {query.get('data', '')!r}",
+                              "That button came from an older message.")
             return
         if not self._digest_id or intent.digest_id != self._digest_id:
             # A tap on a superseded digest. Positions have shifted since that
