@@ -26,6 +26,7 @@ from ..config import Settings
 from ..doctor import alert_text, health_alerts, oauth_check
 from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
                       Thread)
+from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
 from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
@@ -1281,24 +1282,80 @@ class HttpTransport:
         return self._post("getUpdates", offset=offset, timeout=timeout) or []
 
 
-def run_polling(bot: Bot, transport: HttpTransport, *, idle: float = 1.0) -> None:
+# How long the owner must have been quiet before an owed run may start, and how
+# long an owed run will wait for that quiet before going anyway. Module
+# constants rather than settings: neither has a second sensible value, and every
+# setting is another value resolvable from another place.
+QUIET = timedelta(minutes=5)
+MAX_DEFER = timedelta(minutes=30)
+
+
+def _run_due(bot: Bot, trigger: Optional[Trigger],
+             store: Optional[ScheduleStore]) -> None:
+    """Start the owed run, if there is one and now is a fair moment for it."""
+    if trigger is None or store is None:
+        return
+    now = datetime.now()
+    slot = trigger.owed(now, store.last)
+    if slot is None:
+        return
+    if bot.idle_for(now) < QUIET and now - slot <= MAX_DEFER:
+        return                      # mid-review, and not yet late enough to win
+    previous = store.last
+    carried = previous.count if (previous and previous.slot == slot) else 0
+    # Worked out BEFORE the run so the failure message can name the retry. Grace
+    # outranks backoff: a retry that would land outside the window is not one.
+    retry_in = (trigger.backoff
+                if carried + 1 < trigger.max_attempts
+                and (now + trigger.backoff) - slot <= trigger.grace
+                else None)
+    ok = bot.run_scheduled(slot, retry_in=retry_in)
+    # Recorded on every path. If this were reachable only after a success, a
+    # failing slot would be owed again on the next iteration - about 140 times
+    # before grace closes, each one re-running fetch and classification to reach
+    # the same exception.
+    store.record(scheduled_attempt(slot, datetime.now(), previous, failed=not ok))
+
+
+def _tick(bot: Bot, transport: HttpTransport, offset: Optional[int],
+          trigger: Optional[Trigger], store: Optional[ScheduleStore],
+          *, idle: float = 1.0) -> Optional[int]:
+    """One pass of the loop: drain the updates, then run the schedule.
+
+    Extracted from run_polling so the schedule is testable without a while True.
+    """
+    try:
+        updates = transport.get_updates(offset=offset)
+    except Exception as exc:            # network blips must not kill the bot
+        log.warning("getUpdates failed: %s", exc)
+        time.sleep(idle * 5)
+        return offset
+    for update in updates:
+        offset = update["update_id"] + 1
+        try:
+            bot.handle_update(update)
+        except Exception:
+            # One bad update must not take down a long-lived process that a
+            # parked run depends on. The checkpoint survives; log and go on.
+            log.exception("handler failed for update %s", update.get("update_id"))
+    if not updates:
+        time.sleep(idle)
+    # After the batch, never during one: this is the whole of the serialisation
+    # story. The loop is single-threaded, so a run can only begin at a point
+    # where no update is being handled.
+    _run_due(bot, trigger, store)
+    return offset
+
+
+def run_polling(bot: Bot, transport: HttpTransport, *, idle: float = 1.0,
+                trigger: Optional[Trigger] = None,
+                store: Optional[ScheduleStore] = None) -> None:
     """Long-poll forever. One update at a time, in order."""
     offset = None
     log.info("polling as chat %s in %s mode", bot.chat_id, bot.mode)
+    if store is not None:
+        # A run the owner typed marks the slot it covered, and the bot has no
+        # business holding the store to do it.
+        bot.on_run = lambda at: store.record(manual_attempt(at))
     while True:
-        try:
-            updates = transport.get_updates(offset=offset)
-        except Exception as exc:            # network blips must not kill the bot
-            log.warning("getUpdates failed: %s", exc)
-            time.sleep(idle * 5)
-            continue
-        for update in updates:
-            offset = update["update_id"] + 1
-            try:
-                bot.handle_update(update)
-            except Exception:
-                # One bad update must not take down a long-lived process that a
-                # parked run depends on. The checkpoint survives; log and go on.
-                log.exception("handler failed for update %s", update.get("update_id"))
-        if not updates:
-            time.sleep(idle)
+        offset = _tick(bot, transport, offset, trigger, store, idle=idle)

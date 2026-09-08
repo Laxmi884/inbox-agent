@@ -1745,3 +1745,99 @@ def test_a_noop_intent_only_answers_and_sends_nothing(bot):
     b.handle_update(cb("a:1234"))
     assert len(t.sent) == before
     assert t.answered[-1]["text"]
+
+
+from datetime import time as _time
+
+from inbox_agent.schedule import ScheduleStore, Trigger, manual_attempt
+from inbox_agent.telegram.bot import _tick
+
+
+class SilentTransport(FakeTransport):
+    """get_updates returns nothing, so _tick only ever runs the schedule."""
+    def get_updates(self, offset=None, timeout=50):
+        return []
+
+
+def always_due():
+    """A slot on every hour: one is always owed, without freezing the clock."""
+    return Trigger(slots=tuple(_time(h, 0) for h in range(24)))
+
+
+def test_tick_runs_an_owed_slot_when_the_owner_is_quiet(bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    _tick(b, t, None, always_due(), store, idle=0)
+    assert b._runs_started == 1
+    assert store.last is not None and store.last.slot is not None
+
+
+def test_tick_defers_while_the_owner_is_tapping(bot, tmp_path):
+    """A scheduled digest must not pull the screen out from under a thumb."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    b._last_touch = datetime.now()               # tapped a moment ago
+    store = ScheduleStore(tmp_path / "schedule.json")
+    _tick(b, t, None, always_due(), store, idle=0)
+    assert b._runs_started == 0
+    assert store.last is None
+
+
+def test_tick_runs_anyway_once_the_defer_cap_is_past(bot, tmp_path):
+    """Otherwise an owner who taps something every few minutes for an afternoon
+    starves the schedule silently."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    b._last_touch = datetime.now()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    # A slot 31 minutes old: past MAX_DEFER, still well inside grace.
+    stale = (datetime.now() - timedelta(minutes=31)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(stale,)), store, idle=0)
+    assert b._runs_started == 1
+
+
+def test_tick_does_nothing_without_a_trigger_or_a_store(bot):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    _tick(b, t, None, None, None, idle=0)
+    assert b._runs_started == 0
+
+
+def test_a_failed_scheduled_run_is_recorded_so_it_is_not_retried_at_once(
+        bot, tmp_path, monkeypatch):
+    """The whole point of recording on failure: without it the slot is owed
+    again 50 seconds later, about 140 times before grace closes."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    trigger = always_due()
+    _tick(b, t, None, trigger, store, idle=0)
+    assert store.last.failed is True and store.last.count == 1
+    _tick(b, t, None, trigger, store, idle=0)
+    assert b._runs_started == 1                  # backoff has not elapsed
+    assert store.last.count == 1
+
+
+def test_a_typed_triage_is_recorded_and_covers_the_slot(bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    b.on_run = lambda at: store.record(manual_attempt(at))   # what run_polling wires
+    b.handle_update(msg("/triage 4"))
+    assert store.last is not None and store.last.slot is None
+    _tick(b, t, None, always_due(), store, idle=0)
+    assert b._runs_started == 1                  # cooldown covered the slot
+
+
+def test_tick_still_drains_updates(bot):
+    b, _old, _ = bot
+
+    class OneUpdate(FakeTransport):
+        def get_updates(self, offset=None, timeout=50):
+            return [] if offset else [dict(update_id=7, **msg("/status"))]
+
+    t = b.transport = OneUpdate()
+    assert _tick(b, t, None, None, None, idle=0) == 8
