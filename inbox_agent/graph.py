@@ -239,14 +239,18 @@ def build_graph(
     def fetch(state: TriageState) -> dict:
         limit = state.get("limit", settings.snapshot_size)
         threads = client.list_threads(limit=limit, query=settings.inbox_query)
-        # Ids only, one page, nothing hydrated. list_thread_ids costs 5 quota
-        # units per page of 500 against 10 to hydrate a single thread, so
-        # asking whether the cap bound is far cheaper than reading what it cut.
-        # It belongs here rather than in the bot: fetch already owns the query
-        # and the limit, and a second caller deciding a run's corpus is a second
-        # place for the two to drift.
-        ids = client.list_thread_ids(query=settings.inbox_query,
-                                     max_ids=limit + 1)
+        # Ids only, one page of up to 500 (list_thread_ids' own page size),
+        # nothing hydrated. A page of 500 ids costs 5 quota units against 10
+        # to hydrate a single thread, so a real count of how much matched is
+        # cheaper than reading one email - not just cheaper than reading what
+        # the cap cut. This understates for a mailbox with more than 500
+        # untriaged threads (the probe stops at that page), but it is exact
+        # below that, which limit + 1 could never be: that only ever answers
+        # "did the cap bind" (0 or 1), not by how much. It belongs here rather
+        # than in the bot: fetch already owns the query and the limit, and a
+        # second caller deciding a run's corpus is a second place for the two
+        # to drift.
+        ids = client.list_thread_ids(query=settings.inbox_query, max_ids=500)
         return {"thread_ids": [t.id for t in threads],
                 "remaining": max(0, len(ids) - len(threads))}
 
