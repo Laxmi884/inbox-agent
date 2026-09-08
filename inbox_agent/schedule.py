@@ -140,15 +140,26 @@ class ScheduleStore:
             return None
 
     def record(self, attempt: Attempt) -> None:
+        # In-memory first, write second, and the write must not be able to
+        # undo the first line. `self._last` is what bounds the retry budget
+        # for the life of THIS process - an unwritable store_dir should cost
+        # that budget only across a restart, not turn every slot into an
+        # infinite retry because a failed disk write raised past the caller.
         self._last = attempt
         payload = {"at": attempt.at.isoformat(),
                    "slot": attempt.slot.isoformat() if attempt.slot else None,
                    "count": attempt.count,
                    "failed": attempt.failed}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Written through a temporary file and renamed: a half-written record
-        # read back as corrupt is a lost retry budget, and the process this
-        # runs in is one launchd will restart mid-write given the chance.
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(payload))
-        tmp.replace(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Written through a temporary file and renamed: a half-written
+            # record read back as corrupt is a lost retry budget, and the
+            # process this runs in is one launchd will restart mid-write
+            # given the chance.
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(self.path)
+        except Exception:
+            log.warning("could not write %s; the attempt is held in memory "
+                        "only and will be lost on restart", self.path,
+                        exc_info=True)

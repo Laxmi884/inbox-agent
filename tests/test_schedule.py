@@ -186,3 +186,27 @@ def test_last_is_updated_in_memory_without_a_reread(tmp_path):
     store = ScheduleStore(tmp_path / "schedule.json")
     store.record(manual_attempt(at(7, 8, 55)))
     assert store.last == manual_attempt(at(7, 8, 55))
+
+
+def test_record_against_an_unwritable_store_dir_does_not_raise(tmp_path, caplog):
+    """A raise out of record() would propagate past _run_due's finally straight
+    into _tick and kill run_polling's while True - the retry budget must not
+    depend on the disk being writable. `self._last` is set before the write is
+    even attempted, so an unwritable store_dir still bounds the retry for the
+    life of this process; it only loses that bound across a restart, which is
+    the honest, cheaper trade.
+
+    The parent is an existing FILE (not a permission bit, which root and CI
+    sometimes ignore) so mkdir(parents=True) fails the same way on macOS as
+    anywhere else, and nothing needs cleaning up afterwards - tmp_path is
+    thrown away by pytest either way."""
+    blocked = tmp_path / "not_a_directory"
+    blocked.write_text("i am a file, not a directory")
+    path = blocked / "schedule.json"
+    store = ScheduleStore(path)
+    attempt = manual_attempt(at(7, 8, 55))
+    with caplog.at_level("WARNING"):
+        store.record(attempt)                   # must not raise
+    assert store.last == attempt
+    assert "schedule.json" in caplog.text
+    assert not path.exists()

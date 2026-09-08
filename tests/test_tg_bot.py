@@ -1750,7 +1750,7 @@ def test_a_noop_intent_only_answers_and_sends_nothing(bot):
 from datetime import time as _time
 
 from inbox_agent.schedule import Attempt, ScheduleStore, Trigger, manual_attempt
-from inbox_agent.telegram.bot import _tick
+from inbox_agent.telegram.bot import TelegramError, _tick
 
 
 class SilentTransport(FakeTransport):
@@ -1931,3 +1931,37 @@ def test_status_says_when_there_is_no_schedule(bot):
     b.settings = replace(b.settings, schedule=())
     b.handle_update(msg("/status"))
     assert "no schedule" in t.sent[-1]["text"].lower()
+
+
+# --- a raise between running and recording must not skip the record or kill
+# the loop ---------------------------------------------------------------
+#
+# _run_triage only guards graph.invoke; the digest send that follows
+# (`self._show(edit=False)`) is outside that try/except, and HttpTransport._post
+# raises TelegramError on any connection error or HTTP >= 400. Before this fix
+# that raise propagated out of run_scheduled, out of _run_due (where
+# store.record was the NEXT statement, not a finally), and out of _tick (which
+# did not guard the _run_due call at all) - killing run_polling's while True.
+# The graph work (archives, trashes) had already happened and gone through the
+# chokepoint, but the attempt was never recorded, so the slot stayed owed with
+# count == 0 and would re-triage the live mailbox on every restart.
+
+class FailingSendTransport(SilentTransport):
+    """get_updates is silent, like SilentTransport; send_message raises, as
+    HttpTransport._post does on a connection error or HTTP >= 400 - the digest
+    send that happens right after a scheduled graph.invoke succeeds."""
+    def send_message(self, chat_id, text, keyboard=None):
+        raise TelegramError("sendMessage", 502, "Bad Gateway")
+
+
+def test_a_raise_sending_the_digest_is_still_recorded_and_does_not_kill_the_loop(
+        bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = FailingSendTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    trigger = always_due()
+    _tick(b, t, None, trigger, store, idle=0)          # must not raise
+    assert b._runs_started == 1                        # the mailbox work ran
+    assert store.last is not None and store.last.failed is True
+    # The loop must survive to poll again.
+    _tick(b, t, None, trigger, store, idle=0)

@@ -1316,12 +1316,20 @@ def _run_due(bot: Bot, trigger: Optional[Trigger],
                 if carried + 1 < trigger.max_attempts
                 and (now + trigger.backoff) - slot <= trigger.grace
                 else None)
-    ok = bot.run_scheduled(slot, retry_in=retry_in)
-    # Recorded on every path. If this were reachable only after a success, a
-    # failing slot would be owed again on the next iteration - about 140 times
-    # before grace closes, each one re-running fetch and classification to reach
-    # the same exception.
-    store.record(scheduled_attempt(slot, datetime.now(), previous, failed=not ok))
+    ok = False
+    try:
+        ok = bot.run_scheduled(slot, retry_in=retry_in)
+    finally:
+        # In finally, not just after the call: run_scheduled catches the graph
+        # failure itself, but the digest send after it (_show) is outside that
+        # guard and can raise (e.g. a Telegram HTTP error). Without finally
+        # here, that raise would skip this record entirely, leaving the slot
+        # owed with count == 0 forever - re-triaging a live mailbox on every
+        # loop iteration until grace closes, with no digest ever sent. `ok`
+        # stays False on a raise, so the attempt is recorded as failed and
+        # gets its one retry - the honest outcome.
+        store.record(scheduled_attempt(slot, datetime.now(), previous,
+                                       failed=not ok))
 
 
 def _tick(bot: Bot, transport: HttpTransport, offset: Optional[int],
@@ -1350,7 +1358,15 @@ def _tick(bot: Bot, transport: HttpTransport, offset: Optional[int],
     # After the batch, never during one: this is the whole of the serialisation
     # story. The loop is single-threaded, so a run can only begin at a point
     # where no update is being handled.
-    _run_due(bot, trigger, store)
+    try:
+        _run_due(bot, trigger, store)
+    except Exception:
+        # Before the schedule existed this loop could not raise at all - both
+        # statements above are individually guarded. A scheduled run must not
+        # be the thing that changes that: the record it makes on the way out
+        # (see _run_due) already bounds the retry, so there is nothing left
+        # for a long-lived process to do here but log and keep polling.
+        log.exception("the scheduled run failed outside the run itself")
     return offset
 
 
