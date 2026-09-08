@@ -369,3 +369,20 @@ def test_doctor_reports_a_tracing_row_at_all(monkeypatch):
     """It reported twelve settings and not this one, which is why nobody could
     see it without reading process start times off ps."""
     assert "LANGSMITH_TRACING" in _checks(monkeypatch)
+
+
+def test_doctor_reports_the_schedule(monkeypatch):
+    monkeypatch.setenv("INBOX_SCHEDULE", "09:00,18:00")
+    from inbox_agent.config import load_settings
+    from inbox_agent.doctor import run_checks
+    row = next(c for c in run_checks(load_settings()) if c.name == "INBOX_SCHEDULE")
+    assert "09:00" in row.value and "18:00" in row.value
+    assert row.source
+
+
+def test_doctor_reports_an_absent_schedule_as_off(monkeypatch):
+    monkeypatch.delenv("INBOX_SCHEDULE", raising=False)
+    from inbox_agent.config import load_settings
+    from inbox_agent.doctor import run_checks
+    row = next(c for c in run_checks(load_settings()) if c.name == "INBOX_SCHEDULE")
+    assert row.value == "off"

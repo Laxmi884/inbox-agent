@@ -810,3 +810,32 @@ def test_the_footnote_agrees_in_number_for_a_single_leftover():
     note = [l for l in text.splitlines() if "button below" in l][0]
     assert "1 more needs approving" in note, note
     assert "1 more need approving" not in note
+
+
+def test_the_header_reports_what_the_cap_left_behind():
+    """Scanning 50 of 50 and scanning the first 50 of 80 must not look the
+    same. Only one of them means the owner is caught up."""
+    view = DigestView(run_at=NOW, total=50, done_by_kind={"archive": 50},
+                      rule_decided=0, held=[], digest_id="ab12cd34",
+                      dry_run=False, run_report=True, remaining=30)
+    text, _ = digest(view)
+    assert "50 threads" in text
+    assert "30 more waiting" in text
+
+
+def test_the_header_is_silent_when_the_cap_did_not_bind():
+    """A permanently present '0 more waiting' is read for a week and then never
+    again. A line that appears only when it means something keeps its meaning."""
+    view = DigestView(run_at=NOW, total=12, done_by_kind={"archive": 12},
+                      rule_decided=0, held=[], digest_id="ab12cd34",
+                      dry_run=False, run_report=True, remaining=0)
+    text, _ = digest(view)
+    assert "more waiting" not in text
+
+
+def test_held_reports_no_remainder_because_it_ran_nothing():
+    view = DigestView(run_at=NOW, total=0, done_by_kind={}, rule_decided=0,
+                      held=[], digest_id="ab12cd34", dry_run=False,
+                      run_report=False, remaining=30)
+    text, _ = digest(view)
+    assert "more waiting" not in text

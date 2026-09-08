@@ -59,3 +59,24 @@ def test_banner_flags_a_process_the_file_can_no_longer_reach(monkeypatch):
     line = _tracing_banner()
     assert line.startswith("tracing   : on")
     assert "restart" in line
+
+
+# --- schedule -----------------------------------------------------------
+
+from datetime import datetime, time
+
+from inbox_agent.telegram.__main__ import _schedule_banner
+
+
+def test_the_banner_names_the_slots_and_the_next_one(monkeypatch):
+    """The banner is the honest source - it is printed by the process that
+    holds the config, which is why it is trusted over .env."""
+    monkeypatch.setenv("INBOX_SCHEDULE", "09:00,12:00,18:00")
+    line = _schedule_banner(load_settings(), now=datetime(2026, 9, 7, 10, 0))
+    assert "09:00" in line and "12:00" in line and "18:00" in line
+    assert "next 12:00" in line
+
+
+def test_the_banner_says_off_when_there_is_no_schedule(monkeypatch):
+    monkeypatch.delenv("INBOX_SCHEDULE", raising=False)
+    assert "off" in _schedule_banner(load_settings())

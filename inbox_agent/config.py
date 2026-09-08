@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +69,10 @@ class Settings:
     tg_token: str = ""
     tg_chat_id: str = ""
     tg_mode: str = "digest"
+    # Local wall-clock times at which the bot triages on its own. Empty means it
+    # only ever runs when the owner types /triage, which is the default: this is
+    # the one setting that makes the agent act on a real mailbox unprompted.
+    schedule: tuple[time, ...] = ()
     # Applied to every thread the agent has processed, so it leaves the fetch
     # query. Without it, threads that were labelled but left in the inbox - and
     # everything decided `none` - stay INBOX+UNREAD forever and are re-triaged,
@@ -237,6 +242,36 @@ def _resolve_body_budget() -> int:
     return value
 
 
+def _resolve_schedule() -> tuple[time, ...]:
+    """Local times of day, sorted and de-duplicated.
+
+    Raises rather than falling back, for the reason _resolve_triaged_label
+    raises: a schedule that quietly disabled itself on a typo is a proactive
+    agent that is not proactive and does not say so - and unlike a bad label,
+    nothing downstream would ever produce an error naming this setting.
+    """
+    raw = os.getenv("INBOX_SCHEDULE", "").strip()
+    if not raw:
+        return ()
+    slots: list[time] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue            # a trailing comma is a typo, not a failure
+        hh, sep, mm = part.partition(":")
+        try:
+            if not sep:
+                raise ValueError
+            slots.append(time(int(hh), int(mm)))
+        except ValueError:
+            raise ValueError(
+                f"INBOX_SCHEDULE contains {part!r}, which is not an HH:MM "
+                f"time of day. Use a comma-separated list like "
+                f"08:30,13:00,18:00, or leave it empty to run only when you "
+                f"send /triage.") from None
+    return tuple(sorted(set(slots)))
+
+
 def load_settings() -> Settings:
     raw_forbidden = os.getenv("INBOX_FORBIDDEN_ACTIONS", "")
     configured = {a.strip() for a in raw_forbidden.split(",") if a.strip()}
@@ -269,6 +304,7 @@ def load_settings() -> Settings:
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),
+        schedule=_resolve_schedule(),
     )
 
 

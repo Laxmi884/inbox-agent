@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from datetime import datetime
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -19,6 +20,7 @@ from ..logging_setup import configure as configure_logging
 from ..single_instance import AlreadyRunning, acquire
 from ..graph import build_graph
 from ..policy import load_policy
+from ..schedule import ScheduleStore, Trigger
 from ..store import HeldQueue, PreferenceStore, open_store
 from .bot import Bot, HttpTransport, run_polling
 
@@ -48,6 +50,19 @@ def _tracing_banner() -> str:
     check = tracing_check()
     return (f"tracing   : {check.value}"
             + (f"   <- {check.note}" if check.level != "ok" else ""))
+
+
+def _schedule_banner(settings, now: datetime | None = None) -> str:
+    """What the schedule is, from the process that holds it.
+
+    A .env edit does not reach a running bot - load_dotenv runs once, at import -
+    so the banner is the honest source and doctor can only report the file.
+    """
+    if not settings.schedule:
+        return "schedule  : off   <- runs only when you send /triage"
+    slots = ", ".join(t.strftime("%H:%M") for t in settings.schedule)
+    nxt = Trigger(slots=settings.schedule).next_slot(now or datetime.now())
+    return f"schedule  : {slots} local (next {nxt.strftime('%H:%M')})"
 
 
 def _embeddings_banner(settings, resolved: str) -> str:
@@ -142,6 +157,7 @@ def main() -> int:
           + ("   <- DRIFTED from the committed policies/default.md"
              if policy.drifted else ""))
     print(f"mode      : {bot.mode}")
+    print(_schedule_banner(settings))
     print(f"chat id   : {settings.tg_chat_id}  (the only authorised sender)")
     print(f"token     : {mask(settings.tg_token)}")
     print(f"categories: {categories}")
@@ -176,7 +192,9 @@ def main() -> int:
             "could not send the startup health alert")
 
     try:
-        run_polling(bot, transport)
+        trigger = Trigger(slots=settings.schedule)
+        store = ScheduleStore(settings.store_dir / "schedule.json")
+        run_polling(bot, transport, trigger=trigger, store=store)
     except KeyboardInterrupt:
         print("\nstopped. any parked run is still in the checkpoint.")
     return 0

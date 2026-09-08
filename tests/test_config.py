@@ -296,3 +296,43 @@ def test_the_error_mentions_full_as_an_option(monkeypatch):
     monkeypatch.setenv("INBOX_BODY_BUDGET", "everything")
     with _pytest.raises(ValueError, match="full"):
         _resolve_body_budget()
+
+
+# --- INBOX_SCHEDULE ----------------------------------------------------------
+
+from datetime import time as _time
+
+import pytest
+
+from inbox_agent.config import load_settings
+
+
+def test_schedule_is_empty_by_default(monkeypatch):
+    """Off unless explicitly turned on. A proactive agent nobody asked for is
+    the one change here that acts on a real mailbox unprompted."""
+    monkeypatch.delenv("INBOX_SCHEDULE", raising=False)
+    assert load_settings().schedule == ()
+
+
+def test_schedule_parses_sorts_and_deduplicates(monkeypatch):
+    monkeypatch.setenv("INBOX_SCHEDULE", "18:00, 09:00,12:00 , 09:00")
+    assert load_settings().schedule == (_time(9, 0), _time(12, 0), _time(18, 0))
+
+
+def test_a_malformed_schedule_raises_and_names_the_setting(monkeypatch):
+    """A schedule that silently disabled itself on a typo would be a proactive
+    agent that is not proactive and does not say so."""
+    monkeypatch.setenv("INBOX_SCHEDULE", "08:30,noon")
+    with pytest.raises(ValueError, match="INBOX_SCHEDULE"):
+        load_settings()
+
+
+def test_an_out_of_range_time_raises(monkeypatch):
+    monkeypatch.setenv("INBOX_SCHEDULE", "25:00")
+    with pytest.raises(ValueError, match="INBOX_SCHEDULE"):
+        load_settings()
+
+
+def test_trailing_separators_are_tolerated(monkeypatch):
+    monkeypatch.setenv("INBOX_SCHEDULE", "09:00,")
+    assert load_settings().schedule == (_time(9, 0),)

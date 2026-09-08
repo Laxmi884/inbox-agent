@@ -10,7 +10,7 @@ are covered where they now live - at the graph level in tests/test_graph.py and
 at the boundary in tests/test_tg_callbacks.py.
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -397,7 +397,7 @@ def test_a_stale_tap_says_so_instead_of_doing_nothing(bot):
     b.handle_update(msg("/triage 4"))
     b.handle_update(cb(encode("done", digest_id="dead")))
     assert t.edited == [], "a stale tap was acted on"
-    assert "/triage" in t.answered[-1]["text"]
+    assert "out of date" in t.answered[-1]["text"]
 
 
 def test_every_button_on_the_digest_now_acts(bot):
@@ -489,10 +489,25 @@ def test_a_callback_from_the_current_digest_is_honoured(bot):
 
 def test_a_callback_carrying_no_digest_id_at_all_is_ignored(bot):
     """An empty id is what decode() gives an id-less callback, and it is also
-    the bot's own starting state - so it must never be allowed to match."""
+    the bot's own starting state - so it must never be allowed to match. Like
+    any other stale tap it now re-renders the queue rather than acting.
+
+    Checking only `_panel == "digest"` plus a "waiting" line does NOT
+    discriminate here: with the held queue empty and no digest ever shown,
+    there is no item 0 to open, so `_item_screen()`'s own "list moved under
+    the callback" fallback lands on `_panel == "digest"` with a "waiting"
+    line too - even when a BROKEN guard let the id-less `open` fall through.
+    What that fallback cannot reproduce is what `_show_queue()` itself does:
+    mint a fresh, non-empty digest id and set `run_report = False`, so the
+    render carries no DONE section at all. Those are what this asserts on -
+    verified by temporarily deleting the guard's `not self._digest_id or`
+    clause and confirming this test then fails (see task-6-report.md).
+    """
     b, t, _ = bot
     b.handle_update(cb(encode("open", 0)))
-    assert t.sent == [] and t.edited == []
+    assert t.edited == []
+    assert b._digest_id != "", "a stale tap should mint a fresh digest via _show_queue"
+    assert "DONE" not in t.sent[-1]["text"], "a run report leaked in from the open-item fallback"
 
 
 def test_hostile_callback_data_is_answered_and_ignored(bot):
@@ -1596,3 +1611,360 @@ def test_a_failed_run_still_reports_the_failure_after_acknowledging(bot):
     b.handle_update(msg("/triage 4"))
     assert "Triaging" in t.sent[0]["text"]
     assert "Triage failed" in t.sent[-1]["text"]
+
+
+def boom(*a, **kw):
+    """A run that dies partway, the way an expired token makes it."""
+    raise RuntimeError("connection refused")
+
+
+SLOT = datetime(2026, 9, 7, 9, 0)
+
+
+def test_a_scheduled_run_sends_no_pre_notice(bot):
+    """The 'this takes a few minutes' line exists because the owner typed
+    something and was watching. Nobody is watching a scheduled run, and a second
+    unprompted ping per slot is noise."""
+    b, t, _ = bot
+    b.run_scheduled(SLOT)
+    assert not any("takes a few minutes" in m["text"] for m in t.sent)
+
+
+def test_a_scheduled_run_still_sends_the_digest(bot):
+    b, t, _ = bot
+    assert b.run_scheduled(SLOT) is True
+    assert any("Inbox ·" in m["text"] for m in t.sent)
+
+
+def test_a_typed_triage_still_announces_itself(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert any("takes a few minutes" in m["text"] for m in t.sent)
+
+
+def test_a_failed_scheduled_run_returns_false_and_names_the_retry(
+        bot, monkeypatch):
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    assert b.run_scheduled(SLOT, retry_in=timedelta(minutes=5)) is False
+    assert any("Retrying in 5 minutes" in m["text"] for m in t.sent)
+
+
+def test_a_failed_scheduled_run_with_no_retry_left_says_so(bot, monkeypatch):
+    """The two failure messages have to differ, or a repeat reads as a stutter
+    rather than as the slot being abandoned."""
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    assert b.run_scheduled(SLOT, retry_in=None) is False
+    text = " ".join(m["text"] for m in t.sent)
+    assert "Retrying" not in text
+    assert "next scheduled run" in text
+
+
+def test_a_typed_run_notifies_on_run_and_a_scheduled_one_does_not(bot):
+    """A typed /triage marks the slot too - it swept the same backlog. The loop
+    records scheduled runs itself, so doing it here as well would reset the
+    retry count on every attempt."""
+    b, t, _ = bot
+    marks = []
+    b.on_run = marks.append
+    b.handle_update(msg("/triage 4"))
+    assert len(marks) == 1
+    b.run_scheduled(SLOT)
+    assert len(marks) == 1
+
+
+def test_on_run_is_called_even_when_the_run_raised(bot, monkeypatch):
+    """Recording the attempt is what bounds the retry. If it only happened on
+    success, a failing slot would be owed again 50 seconds later, forever."""
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    marks = []
+    b.on_run = marks.append
+    b.handle_update(msg("/triage 4"))
+    assert len(marks) == 1
+
+
+def test_idle_for_is_unbounded_before_any_update(bot):
+    """A bot nobody has touched is not mid-review, so an owed run should not
+    wait five minutes for a conversation that never started."""
+    b, _t, _ = bot
+    assert b.idle_for(datetime(2026, 9, 7, 9, 0)) > timedelta(days=365)
+
+
+def test_handling_an_update_stamps_the_touch(bot):
+    b, _t, _ = bot
+    b.handle_update(msg("/status"))
+    assert b.idle_for(datetime.now()) < timedelta(seconds=5)
+    assert b.idle_for(datetime.now() + timedelta(minutes=5)) >= timedelta(minutes=5)
+
+
+def test_an_unauthorised_update_does_not_count_as_the_owner_reviewing(bot):
+    b, _t, _ = bot
+    b.handle_update(msg("/status", chat_id=999))
+    assert b.idle_for(datetime(2026, 9, 7, 9, 0)) > timedelta(days=365)
+
+
+def test_a_stale_tap_sends_the_current_queue_instead_of_asking_for_a_command(bot):
+    """With scheduled runs every digest but the newest is stale, so this stops
+    being an edge case and becomes how an absent owner comes back to the phone.
+    A toast is a banner that vanishes; the queue is on the screen."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    before = len(t.sent)
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert len(t.sent) > before                  # a new message, not a toast
+    assert "waiting" in t.sent[-1]["text"]
+
+
+def test_a_stale_tap_does_not_edit_the_message_it_came_from(bot):
+    """Editing would silently replace what that run reported, and the owner
+    scrolling back later would find a different run in its place."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    edits = len(t.edited)
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert len(t.edited) == edits
+
+
+def test_a_stale_tap_starts_no_run(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    runs = b._runs_started
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert b._runs_started == runs
+    assert "DONE" not in t.sent[-1]["text"]      # no run report without a run
+
+
+def test_a_noop_intent_only_answers_and_sends_nothing(bot):
+    """Data too old or malformed to decode has no digest to be stale relative
+    to, so there is nothing to re-render."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    before = len(t.sent)
+    b.handle_update(cb("a:1234"))
+    assert len(t.sent) == before
+    assert t.answered[-1]["text"]
+
+
+from datetime import time as _time
+
+from inbox_agent.schedule import Attempt, ScheduleStore, Trigger, manual_attempt
+from inbox_agent.telegram.bot import TelegramError, _tick
+
+
+class SilentTransport(FakeTransport):
+    """get_updates returns nothing, so _tick only ever runs the schedule."""
+    def get_updates(self, offset=None, timeout=50):
+        return []
+
+
+def always_due():
+    """A slot on every hour: one is always owed, without freezing the clock."""
+    return Trigger(slots=tuple(_time(h, 0) for h in range(24)))
+
+
+def test_tick_runs_an_owed_slot_when_the_owner_is_quiet(bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    _tick(b, t, None, always_due(), store, idle=0)
+    assert b._runs_started == 1
+    assert store.last is not None and store.last.slot is not None
+
+
+def test_tick_defers_while_the_owner_is_tapping(bot, tmp_path):
+    """A scheduled digest must not pull the screen out from under a thumb."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    b._last_touch = datetime.now()               # tapped a moment ago
+    store = ScheduleStore(tmp_path / "schedule.json")
+    # Built relative to now, not always_due(): an hourly slot's age equals the
+    # current wall-clock minute, so past :30 past the hour it is already older
+    # than MAX_DEFER and the loop would correctly run it anyway - making the
+    # assertion below wall-clock flaky. A slot ~1-2 minutes old is always well
+    # inside MAX_DEFER, so the defer happens on any clock.
+    recent = (datetime.now() - timedelta(minutes=1)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(recent,)), store, idle=0)
+    assert b._runs_started == 0
+    assert store.last is None
+
+
+def test_tick_runs_anyway_once_the_defer_cap_is_past(bot, tmp_path):
+    """Otherwise an owner who taps something every few minutes for an afternoon
+    starves the schedule silently."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    b._last_touch = datetime.now()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    # A slot 31 minutes old: past MAX_DEFER, still well inside grace.
+    stale = (datetime.now() - timedelta(minutes=31)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(stale,)), store, idle=0)
+    assert b._runs_started == 1
+
+
+def test_tick_does_nothing_without_a_trigger_or_a_store(bot):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    _tick(b, t, None, None, None, idle=0)
+    assert b._runs_started == 0
+
+
+def test_a_failed_scheduled_run_is_recorded_so_it_is_not_retried_at_once(
+        bot, tmp_path, monkeypatch):
+    """The whole point of recording on failure: without it the slot is owed
+    again 50 seconds later, about 140 times before grace closes."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    trigger = always_due()
+    _tick(b, t, None, trigger, store, idle=0)
+    assert store.last.failed is True and store.last.count == 1
+    _tick(b, t, None, trigger, store, idle=0)
+    assert b._runs_started == 1                  # backoff has not elapsed
+    assert store.last.count == 1
+
+
+def test_a_typed_triage_is_recorded_and_covers_the_slot(bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    b.on_run = lambda at: store.record(manual_attempt(at))   # what run_polling wires
+    b.handle_update(msg("/triage 4"))
+    assert store.last is not None and store.last.slot is None
+    _tick(b, t, None, always_due(), store, idle=0)
+    assert b._runs_started == 1                  # cooldown covered the slot
+
+
+def test_tick_still_drains_updates(bot):
+    b, _old, _ = bot
+
+    class OneUpdate(FakeTransport):
+        def get_updates(self, offset=None, timeout=50):
+            return [] if offset else [dict(update_id=7, **msg("/status"))]
+
+    t = b.transport = OneUpdate()
+    assert _tick(b, t, None, None, None, idle=0) == 8
+
+
+# --- pinning the retry_in arithmetic in _run_due ----------------------------
+#
+# None of the tests above observe retry_in or the failure message it drives -
+# they only check b._runs_started and store.last.count/failed. That leaves the
+# grace-vs-backoff expression unpinned: a regression to it can invert the
+# comparison and every existing test still passes. These three watch the
+# message run_scheduled sends, which is where retry_in becomes visible.
+
+def test_a_scheduled_failure_names_the_retry(bot, tmp_path, monkeypatch):
+    """A fresh failure, with budget and grace both to spare, must retry."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    # Built relative to now, not always_due(): see the comment on
+    # test_tick_defers_while_the_owner_is_tapping for why.
+    recent = (datetime.now() - timedelta(minutes=1)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(recent,)), store, idle=0)
+    assert any("Retrying in 5 minutes" in m["text"] for m in t.sent)
+
+
+def test_a_second_failed_attempt_runs_but_does_not_retry(bot, tmp_path,
+                                                          monkeypatch):
+    """Attempt 2 of max_attempts=2 has no budget left for a further retry, but
+    the attempt itself must still run - the retry budget bounds retries, not
+    the run count - and the store must show it as attempt 2."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    slot_time = (datetime.now() - timedelta(minutes=10)).time().replace(
+        second=0, microsecond=0)
+    # The seeded slot must be the SAME instant owed() will compute, and that
+    # is Trigger.latest_slot's job, not datetime.combine(today, slot_time):
+    # combining with today's date is wrong when `now - 10min` has crossed
+    # midnight backwards - slot_time is then a time yesterday, latest_slot
+    # correctly wraps to yesterday's date, and a hand-combined "today" instant
+    # would silently stop matching it.
+    slot = Trigger(slots=(slot_time,)).latest_slot(datetime.now())
+    store.record(Attempt(at=datetime.now() - timedelta(minutes=6),  # backoff
+                         slot=slot, count=1, failed=True))          # elapsed
+    _tick(b, t, None, Trigger(slots=(slot_time,)), store, idle=0)
+    text = " ".join(m["text"] for m in t.sent)
+    assert "next scheduled run" in text
+    assert "Retrying" not in text
+    assert store.last.count == 2
+
+
+def test_grace_outranks_backoff_in_the_retry_decision(bot, tmp_path,
+                                                       monkeypatch):
+    """The test that catches an inverted grace-vs-backoff comparison. A slot
+    117 minutes old is still owed (grace is 120 minutes), but a retry 5
+    minutes from now would land at 122 minutes - past grace - so retry_in
+    must be None even though this is only attempt 1. Flip `<=` to `>=` (or
+    otherwise invert the comparison) in the retry_in expression and this is
+    the test that fails."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    old = (datetime.now() - timedelta(minutes=117)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(old,)), store, idle=0)
+    text = " ".join(m["text"] for m in t.sent)
+    assert "Not retrying" in text
+    assert "Retrying in" not in text
+
+
+from dataclasses import replace
+
+
+def test_status_names_the_next_scheduled_run(bot):
+    b, t, _ = bot
+    b.settings = replace(b.settings, schedule=(_time(9, 0), _time(18, 0)))
+    b.handle_update(msg("/status"))
+    assert "scheduled" in t.sent[-1]["text"].lower()
+
+
+def test_status_says_when_there_is_no_schedule(bot):
+    b, t, _ = bot
+    b.settings = replace(b.settings, schedule=())
+    b.handle_update(msg("/status"))
+    assert "no schedule" in t.sent[-1]["text"].lower()
+
+
+# --- a raise between running and recording must not skip the record or kill
+# the loop ---------------------------------------------------------------
+#
+# _run_triage only guards graph.invoke; the digest send that follows
+# (`self._show(edit=False)`) is outside that try/except, and HttpTransport._post
+# raises TelegramError on any connection error or HTTP >= 400. Before this fix
+# that raise propagated out of run_scheduled, out of _run_due (where
+# store.record was the NEXT statement, not a finally), and out of _tick (which
+# did not guard the _run_due call at all) - killing run_polling's while True.
+# The graph work (archives, trashes) had already happened and gone through the
+# chokepoint, but the attempt was never recorded, so the slot stayed owed with
+# count == 0 and would re-triage the live mailbox on every restart.
+
+class FailingSendTransport(SilentTransport):
+    """get_updates is silent, like SilentTransport; send_message raises, as
+    HttpTransport._post does on a connection error or HTTP >= 400 - the digest
+    send that happens right after a scheduled graph.invoke succeeds."""
+    def send_message(self, chat_id, text, keyboard=None):
+        raise TelegramError("sendMessage", 502, "Bad Gateway")
+
+
+def test_a_raise_sending_the_digest_is_still_recorded_and_does_not_kill_the_loop(
+        bot, tmp_path):
+    b, _old, _ = bot
+    t = b.transport = FailingSendTransport()
+    store = ScheduleStore(tmp_path / "schedule.json")
+    trigger = always_due()
+    _tick(b, t, None, trigger, store, idle=0)          # must not raise
+    assert b._runs_started == 1                        # the mailbox work ran
+    assert store.last is not None and store.last.failed is True
+    # The loop must survive to poll again.
+    _tick(b, t, None, trigger, store, idle=0)

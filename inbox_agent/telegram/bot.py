@@ -16,8 +16,8 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional, Sequence
 
 from langgraph.types import Command
 
@@ -26,6 +26,7 @@ from ..config import Settings
 from ..doctor import alert_text, health_alerts, oauth_check
 from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
                       Thread)
+from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
 from ..store import HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
 from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
@@ -51,7 +52,8 @@ class Bot:
                  held: HeldQueue, prefs: PreferenceStore, client=None,
                  log: Optional[AuditLog] = None,
                  categories: Sequence[str] = (), mode: Optional[str] = None,
-                 policy_version: Optional[str] = None):
+                 policy_version: Optional[str] = None,
+                 on_run: Optional[Callable[[datetime], None]] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
@@ -74,6 +76,10 @@ class Bot:
         # bot only reports which one is in play. Optional because a caller that
         # does not care about traces should not be forced to thread it through.
         self.policy_version = policy_version
+        # Called after a run the owner TYPED, so the schedule can mark the slot
+        # it covered. Scheduled runs are recorded by the loop that started them;
+        # firing this for those too would reset the retry count every attempt.
+        self.on_run = on_run
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
 
@@ -109,6 +115,11 @@ class Bot:
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
+        # When the owner last touched the bot. The scheduler's quiet gate reads
+        # it: taps are the only honest signal of "mid-review" there is, because
+        # nothing emits a done-reviewing event and a queue the owner is
+        # deliberately ignoring would read as a review that never ends.
+        self._last_touch: Optional[datetime] = None
 
     # --- identity -----------------------------------------------------------
 
@@ -233,6 +244,7 @@ class Bot:
             # that says so is on the terminal; the digest is on the phone.
             dry_run=bool(self.settings.dry_run),
             run_report=run_report,
+            remaining=int((result or {}).get("remaining", 0)),
         )
 
     def _done_items(self) -> list[DoneItem]:
@@ -284,6 +296,19 @@ class Bot:
                 item.rule_note = (f"{rule.scope} {rule.pattern} → {rule.summary}"
                                   if rule else "")
         return list(rows.values())
+
+    def _show_queue(self) -> None:
+        """The current queue, as a new message, running nothing.
+
+        The queue outlives runs, so looking at it must not require producing
+        more work - and with no run, no run report (see _view's run_report).
+        """
+        self._page = 0
+        self._message_id = None
+        self._digest_id = self._new_digest_id()
+        self._run_report = False
+        self._panel = "digest"
+        self._show(edit=False)
 
     def _show(self, *, edit: bool) -> None:
         view = self._view(run_report=self._run_report)
@@ -833,10 +858,19 @@ class Bot:
     def handle_update(self, update: dict) -> None:
         if not self._authorised(update):
             return
+        # Only authorised updates count: a rejected update is not the owner
+        # reviewing anything.
+        self._last_touch = datetime.now()
         if "callback_query" in update:
             self._on_callback(update["callback_query"])
         elif "message" in update:
             self._on_message(update["message"])
+
+    def idle_for(self, now: datetime) -> timedelta:
+        """How long since the owner last touched the bot."""
+        if self._last_touch is None:
+            return timedelta.max
+        return now - self._last_touch
 
     def _on_message(self, message: dict) -> None:
         text = (message.get("text") or "").strip()
@@ -849,15 +883,7 @@ class Bot:
             limit = int(arg) if arg.strip().isdigit() else self.settings.snapshot_size
             self._start(limit)
         elif command == "/held":
-            # Shows the queue without running anything: the queue outlives runs,
-            # so looking at it must not require producing more work. And with no
-            # run, no run report - see _view's run_report.
-            self._page = 0
-            self._message_id = None
-            self._digest_id = self._new_digest_id()
-            self._run_report = False
-            self._panel = "digest"
-            self._show(edit=False)
+            self._show_queue()
         elif command == "/status":
             self._status()
         elif command == "/cancel":
@@ -868,6 +894,42 @@ class Bot:
                 "Commands: /triage [n] · /held · /status · /cancel")
 
     def _start(self, limit: int) -> None:
+        # Say something before the four minutes of silence, not after. A run is
+        # one blocking graph.invoke: classify is seconds per thread and the two
+        # Gmail phases are seconds per action, so a twenty-thread run is minutes
+        # long and, until this line, sent nothing at all until the digest. The
+        # owner cannot tell that from a bot that has died, and asked.
+        self.transport.send_message(
+            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
+                          f"minutes; the digest arrives when it is done.")
+        self._run_triage(limit)
+        # A typed run swept the same untriaged backlog a slot would have, so it
+        # covers one. Marked even when the run raised: recording the attempt is
+        # what bounds the retry.
+        if self.on_run is not None:
+            try:
+                self.on_run(datetime.now())
+            except Exception:
+                log.exception("could not record the run against the schedule")
+
+    def run_scheduled(self, slot: datetime, *,
+                      retry_in: Optional[timedelta] = None) -> bool:
+        """A run nobody typed. Returns whether it finished.
+
+        No pre-notice: that line is owed to someone watching a wait they asked
+        for. The caller records the attempt - it holds the retry budget.
+        """
+        if retry_in is not None:
+            suffix = (f" Retrying in {int(retry_in.total_seconds() // 60)} "
+                      f"minutes.")
+        else:
+            suffix = " Not retrying; the next scheduled run is the next attempt."
+        log.info("scheduled triage for slot %s", slot.isoformat())
+        return self._run_triage(self.settings.snapshot_size,
+                                failure_suffix=suffix)
+
+    def _run_triage(self, limit: int, *, failure_suffix: str = "") -> bool:
+        """The run itself, with no announcement and no schedule bookkeeping."""
         self._run += 1
         self._runs_started += 1
         self._page = 0
@@ -879,20 +941,9 @@ class Bot:
         self._done_page = 0
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
-        # Say something before the four minutes of silence, not after. A run is
-        # one blocking graph.invoke: classify is seconds per thread and the two
-        # Gmail phases are seconds per action, so a twenty-thread run is minutes
-        # long and, until this line, sent nothing at all until the digest. The
-        # owner cannot tell that from a bot that has died, and asked.
-        self.transport.send_message(
-            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
-                          f"minutes; the digest arrives when it is done.")
         started = time.monotonic()
-        # mode="incremental": /triage ACTS. The confident, reversible majority
-        # is executed and only what genuinely needs the owner goes to the queue,
-        # which is what this whole design is for. It ran in backlog mode while
-        # the bot rendered from a parked checkpoint - that transitional hack is
-        # what the queue and the digest replace.
+        # mode="incremental": a run ACTS. The confident, reversible majority is
+        # executed and only what genuinely needs the owner goes to the queue.
         try:
             self._last_run = self.graph.invoke(
                 {"limit": limit, "mode": "incremental"},
@@ -901,20 +952,21 @@ class Bot:
             # Silence is indistinguishable from an empty inbox, which is a
             # failure the owner would trust for days without noticing. Say so.
             log.exception("triage failed")
-            # NOT "nothing was executed" - the same falsehood /cancel used to
-            # tell. The run can raise anywhere, including after auto_execute
-            # has already pushed actions through the chokepoint, so the honest
-            # claim is that it did not finish. /held shows what survived.
+            # NOT "nothing was executed" - the run can raise anywhere, including
+            # after auto_execute has already pushed actions through the
+            # chokepoint, so the honest claim is that it did not finish.
             self.transport.send_message(
                 self.chat_id, f"Triage failed: {type(exc).__name__}. "
                               f"The run did not finish; some actions may already "
-                              f"have run. /held to see the queue, /triage to retry.")
-            return
+                              f"have run. /held to see the queue, /triage to "
+                              f"retry." + failure_suffix)
+            return False
         elapsed = time.monotonic() - started
         log.info("triage done in %.1fs: %s executed, %s held", elapsed,
                  len(self._last_run.get("executed", [])), len(self.held.all()))
         self._show(edit=False)
         self._send_health_alerts()
+        return True
 
     def _send_health_alerts(self) -> None:
         """Put anything at warn or fatal in front of the owner, on the phone.
@@ -952,6 +1004,13 @@ class Bot:
             body += f"\n\noauth: {check.note or check.value}"
         except Exception:
             log.exception("could not read the oauth countdown for /status")
+        # Read off Settings rather than a Trigger the bot holds: the loop owns
+        # the scheduling decision, and this only reports it.
+        if self.settings.schedule:
+            nxt = Trigger(slots=self.settings.schedule).next_slot(datetime.now())
+            body += f"\n\nNext scheduled run: {nxt.strftime('%H:%M')}"
+        else:
+            body += "\n\nNo schedule configured; runs happen when you send /triage."
         self.transport.send_message(self.chat_id, body)
 
     def _cancel(self) -> None:
@@ -1017,17 +1076,23 @@ class Bot:
             return
         if not self._digest_id or intent.digest_id != self._digest_id:
             # A tap on a superseded digest. Positions have shifted since that
-            # message was drawn, so acting on it would act on the wrong thread.
+            # message was drawn, so acting on it would act on the wrong thread -
+            # this check stays exactly as strict as it was.
             #
-            # The empty-id check is not redundant: decode() reports an id-less
-            # callback as digest_id="", which is also this object's state before
-            # the first digest and after /cancel. Comparing alone would let ""
-            # match "" and make an id-less callback valid in exactly the two
-            # moments when no digest exists.
-            log.info("ignored a callback from digest %r (current %r)",
-                     intent.digest_id, self._digest_id)
-            self._ack(answer, "That digest is out of date - send /triage or "
-                             "/held for a current one.")
+            # What changed is the refusal. Telling the owner to send /held was
+            # tuned for a rare event; with scheduled runs every digest but the
+            # newest is stale, so this is simply how an absent owner comes back
+            # to their phone. A toast is a banner that vanishes, so send the
+            # queue instead of asking for a command.
+            #
+            # A NEW message, never an edit: editing would silently replace what
+            # that run reported, and the owner scrolling back later would find a
+            # different run in its place.
+            log.info("re-rendered the queue for a callback from digest %r "
+                     "(current %r)", intent.digest_id, self._digest_id)
+            self._ack(answer, "That digest is out of date - here is the "
+                              "current queue.")
+            self._show_queue()
             return
 
         self._ack(answer)
@@ -1224,24 +1289,96 @@ class HttpTransport:
         return self._post("getUpdates", offset=offset, timeout=timeout) or []
 
 
-def run_polling(bot: Bot, transport: HttpTransport, *, idle: float = 1.0) -> None:
+# How long the owner must have been quiet before an owed run may start, and how
+# long an owed run will wait for that quiet before going anyway. Module
+# constants rather than settings: neither has a second sensible value, and every
+# setting is another value resolvable from another place.
+QUIET = timedelta(minutes=5)
+MAX_DEFER = timedelta(minutes=30)
+
+
+def _run_due(bot: Bot, trigger: Optional[Trigger],
+             store: Optional[ScheduleStore]) -> None:
+    """Start the owed run, if there is one and now is a fair moment for it."""
+    if trigger is None or store is None:
+        return
+    now = datetime.now()
+    slot = trigger.owed(now, store.last)
+    if slot is None:
+        return
+    if bot.idle_for(now) < QUIET and now - slot <= MAX_DEFER:
+        return                      # mid-review, and not yet late enough to win
+    previous = store.last
+    carried = previous.count if (previous and previous.slot == slot) else 0
+    # Worked out BEFORE the run so the failure message can name the retry. Grace
+    # outranks backoff: a retry that would land outside the window is not one.
+    retry_in = (trigger.backoff
+                if carried + 1 < trigger.max_attempts
+                and (now + trigger.backoff) - slot <= trigger.grace
+                else None)
+    ok = False
+    try:
+        ok = bot.run_scheduled(slot, retry_in=retry_in)
+    finally:
+        # In finally, not just after the call: run_scheduled catches the graph
+        # failure itself, but the digest send after it (_show) is outside that
+        # guard and can raise (e.g. a Telegram HTTP error). Without finally
+        # here, that raise would skip this record entirely, leaving the slot
+        # owed with count == 0 forever - re-triaging a live mailbox on every
+        # loop iteration until grace closes, with no digest ever sent. `ok`
+        # stays False on a raise, so the attempt is recorded as failed and
+        # gets its one retry - the honest outcome.
+        store.record(scheduled_attempt(slot, datetime.now(), previous,
+                                       failed=not ok))
+
+
+def _tick(bot: Bot, transport: HttpTransport, offset: Optional[int],
+          trigger: Optional[Trigger], store: Optional[ScheduleStore],
+          *, idle: float = 1.0) -> Optional[int]:
+    """One pass of the loop: drain the updates, then run the schedule.
+
+    Extracted from run_polling so the schedule is testable without a while True.
+    """
+    try:
+        updates = transport.get_updates(offset=offset)
+    except Exception as exc:            # network blips must not kill the bot
+        log.warning("getUpdates failed: %s", exc)
+        time.sleep(idle * 5)
+        return offset
+    for update in updates:
+        offset = update["update_id"] + 1
+        try:
+            bot.handle_update(update)
+        except Exception:
+            # One bad update must not take down a long-lived process that a
+            # parked run depends on. The checkpoint survives; log and go on.
+            log.exception("handler failed for update %s", update.get("update_id"))
+    if not updates:
+        time.sleep(idle)
+    # After the batch, never during one: this is the whole of the serialisation
+    # story. The loop is single-threaded, so a run can only begin at a point
+    # where no update is being handled.
+    try:
+        _run_due(bot, trigger, store)
+    except Exception:
+        # Before the schedule existed this loop could not raise at all - both
+        # statements above are individually guarded. A scheduled run must not
+        # be the thing that changes that: the record it makes on the way out
+        # (see _run_due) already bounds the retry, so there is nothing left
+        # for a long-lived process to do here but log and keep polling.
+        log.exception("the scheduled run failed outside the run itself")
+    return offset
+
+
+def run_polling(bot: Bot, transport: HttpTransport, *, idle: float = 1.0,
+                trigger: Optional[Trigger] = None,
+                store: Optional[ScheduleStore] = None) -> None:
     """Long-poll forever. One update at a time, in order."""
     offset = None
     log.info("polling as chat %s in %s mode", bot.chat_id, bot.mode)
+    if store is not None:
+        # A run the owner typed marks the slot it covered, and the bot has no
+        # business holding the store to do it.
+        bot.on_run = lambda at: store.record(manual_attempt(at))
     while True:
-        try:
-            updates = transport.get_updates(offset=offset)
-        except Exception as exc:            # network blips must not kill the bot
-            log.warning("getUpdates failed: %s", exc)
-            time.sleep(idle * 5)
-            continue
-        for update in updates:
-            offset = update["update_id"] + 1
-            try:
-                bot.handle_update(update)
-            except Exception:
-                # One bad update must not take down a long-lived process that a
-                # parked run depends on. The checkpoint survives; log and go on.
-                log.exception("handler failed for update %s", update.get("update_id"))
-        if not updates:
-            time.sleep(idle)
+        offset = _tick(bot, transport, offset, trigger, store, idle=idle)

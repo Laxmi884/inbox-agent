@@ -38,6 +38,7 @@ The whole of spec section 3, as pure functions. Nothing else in this plan can be
   - `Attempt(at: datetime, slot: datetime | None = None, count: int = 0, failed: bool = False)` — frozen dataclass.
   - `Trigger(slots: tuple[time, ...] = (), grace: timedelta = 2h, cooldown: timedelta = 15m, backoff: timedelta = 5m, max_attempts: int = 2)` — frozen dataclass.
   - `Trigger.owed(now: datetime, last: Attempt | None) -> datetime | None`
+  - `Trigger.latest_slot(now: datetime) -> datetime | None`
   - `Trigger.next_slot(now: datetime) -> datetime | None`
   - `scheduled_attempt(slot: datetime, now: datetime, previous: Attempt | None, *, failed: bool) -> Attempt`
   - `manual_attempt(now: datetime) -> Attempt`
@@ -82,7 +83,16 @@ def test_the_most_recent_slot_wins_so_three_missed_ones_collapse_to_one():
 
 
 def test_before_the_first_slot_of_the_day_yesterdays_last_is_the_candidate():
-    assert TRIGGER.owed(at(7, 0, 30), None) == at(6, 18, 0)
+    """The candidate wraps to yesterday - but at 00:30 that slot is 6.5 hours
+    old, so grace then rejects it. Both halves are asserted: picking the
+    candidate and refusing to act on it are different steps."""
+    assert TRIGGER.latest_slot(at(7, 0, 30)) == at(6, 18, 0)
+    assert TRIGGER.owed(at(7, 0, 30), None) is None
+
+
+def test_yesterdays_last_slot_is_owed_when_it_is_still_inside_grace():
+    """Just after midnight is too late; 19:00 the evening before is not."""
+    assert TRIGGER.owed(at(7, 19, 30), None) == at(7, 18, 0)
 
 
 def test_a_slot_older_than_grace_is_not_owed():
@@ -300,7 +310,7 @@ def manual_attempt(now: datetime) -> Attempt:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_schedule.py -q`
-Expected: 19 passed
+Expected: 20 passed
 
 - [ ] **Step 5: Commit**
 
@@ -439,7 +449,7 @@ class ScheduleStore:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_schedule.py -q`
-Expected: 25 passed
+Expected: 26 passed
 
 - [ ] **Step 5: Commit**
 
