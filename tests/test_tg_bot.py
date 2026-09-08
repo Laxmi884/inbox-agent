@@ -490,11 +490,24 @@ def test_a_callback_from_the_current_digest_is_honoured(bot):
 def test_a_callback_carrying_no_digest_id_at_all_is_ignored(bot):
     """An empty id is what decode() gives an id-less callback, and it is also
     the bot's own starting state - so it must never be allowed to match. Like
-    any other stale tap it now re-renders the queue rather than acting."""
+    any other stale tap it now re-renders the queue rather than acting.
+
+    Checking only `_panel == "digest"` plus a "waiting" line does NOT
+    discriminate here: with the held queue empty and no digest ever shown,
+    there is no item 0 to open, so `_item_screen()`'s own "list moved under
+    the callback" fallback lands on `_panel == "digest"` with a "waiting"
+    line too - even when a BROKEN guard let the id-less `open` fall through.
+    What that fallback cannot reproduce is what `_show_queue()` itself does:
+    mint a fresh, non-empty digest id and set `run_report = False`, so the
+    render carries no DONE section at all. Those are what this asserts on -
+    verified by temporarily deleting the guard's `not self._digest_id or`
+    clause and confirming this test then fails (see task-6-report.md).
+    """
     b, t, _ = bot
     b.handle_update(cb(encode("open", 0)))
     assert t.edited == []
-    assert t.sent, "a stale tap should still show the current queue"
+    assert b._digest_id != "", "a stale tap should mint a fresh digest via _show_queue"
+    assert "DONE" not in t.sent[-1]["text"], "a run report leaked in from the open-item fallback"
 
 
 def test_hostile_callback_data_is_answered_and_ignored(bot):
