@@ -1749,7 +1749,7 @@ def test_a_noop_intent_only_answers_and_sends_nothing(bot):
 
 from datetime import time as _time
 
-from inbox_agent.schedule import ScheduleStore, Trigger, manual_attempt
+from inbox_agent.schedule import Attempt, ScheduleStore, Trigger, manual_attempt
 from inbox_agent.telegram.bot import _tick
 
 
@@ -1779,7 +1779,14 @@ def test_tick_defers_while_the_owner_is_tapping(bot, tmp_path):
     t = b.transport = SilentTransport()
     b._last_touch = datetime.now()               # tapped a moment ago
     store = ScheduleStore(tmp_path / "schedule.json")
-    _tick(b, t, None, always_due(), store, idle=0)
+    # Built relative to now, not always_due(): an hourly slot's age equals the
+    # current wall-clock minute, so past :30 past the hour it is already older
+    # than MAX_DEFER and the loop would correctly run it anyway - making the
+    # assertion below wall-clock flaky. A slot ~1-2 minutes old is always well
+    # inside MAX_DEFER, so the defer happens on any clock.
+    recent = (datetime.now() - timedelta(minutes=1)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(recent,)), store, idle=0)
     assert b._runs_started == 0
     assert store.last is None
 
@@ -1841,3 +1848,69 @@ def test_tick_still_drains_updates(bot):
 
     t = b.transport = OneUpdate()
     assert _tick(b, t, None, None, None, idle=0) == 8
+
+
+# --- pinning the retry_in arithmetic in _run_due ----------------------------
+#
+# None of the tests above observe retry_in or the failure message it drives -
+# they only check b._runs_started and store.last.count/failed. That leaves the
+# grace-vs-backoff expression unpinned: a regression to it can invert the
+# comparison and every existing test still passes. These three watch the
+# message run_scheduled sends, which is where retry_in becomes visible.
+
+def test_a_scheduled_failure_names_the_retry(bot, tmp_path, monkeypatch):
+    """A fresh failure, with budget and grace both to spare, must retry."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    # Built relative to now, not always_due(): see the comment on
+    # test_tick_defers_while_the_owner_is_tapping for why.
+    recent = (datetime.now() - timedelta(minutes=1)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(recent,)), store, idle=0)
+    assert any("Retrying in 5 minutes" in m["text"] for m in t.sent)
+
+
+def test_a_second_failed_attempt_runs_but_does_not_retry(bot, tmp_path,
+                                                          monkeypatch):
+    """Attempt 2 of max_attempts=2 has no budget left for a further retry, but
+    the attempt itself must still run - the retry budget bounds retries, not
+    the run count - and the store must show it as attempt 2."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    slot_time = (datetime.now() - timedelta(minutes=10)).time().replace(
+        second=0, microsecond=0)
+    # The instant Trigger.latest_slot will compute for slot_time today - the
+    # store records a slot as a datetime instant, not a time of day, and the
+    # two must match or owed() will not see this as a retry of the same slot.
+    slot = datetime.combine(datetime.now().date(), slot_time)
+    store.record(Attempt(at=datetime.now() - timedelta(minutes=6),  # backoff
+                         slot=slot, count=1, failed=True))          # elapsed
+    _tick(b, t, None, Trigger(slots=(slot_time,)), store, idle=0)
+    text = " ".join(m["text"] for m in t.sent)
+    assert "next scheduled run" in text
+    assert "Retrying" not in text
+    assert store.last.count == 2
+
+
+def test_grace_outranks_backoff_in_the_retry_decision(bot, tmp_path,
+                                                       monkeypatch):
+    """The test that catches an inverted grace-vs-backoff comparison. A slot
+    117 minutes old is still owed (grace is 120 minutes), but a retry 5
+    minutes from now would land at 122 minutes - past grace - so retry_in
+    must be None even though this is only attempt 1. Flip `<=` to `>=` (or
+    otherwise invert the comparison) in the retry_in expression and this is
+    the test that fails."""
+    b, _old, _ = bot
+    t = b.transport = SilentTransport()
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    store = ScheduleStore(tmp_path / "schedule.json")
+    old = (datetime.now() - timedelta(minutes=117)).time().replace(
+        second=0, microsecond=0)
+    _tick(b, t, None, Trigger(slots=(old,)), store, idle=0)
+    text = " ".join(m["text"] for m in t.sent)
+    assert "Not retrying" in text
+    assert "Retrying in" not in text
