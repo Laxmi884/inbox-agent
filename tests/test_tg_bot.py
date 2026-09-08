@@ -1883,10 +1883,13 @@ def test_a_second_failed_attempt_runs_but_does_not_retry(bot, tmp_path,
     store = ScheduleStore(tmp_path / "schedule.json")
     slot_time = (datetime.now() - timedelta(minutes=10)).time().replace(
         second=0, microsecond=0)
-    # The instant Trigger.latest_slot will compute for slot_time today - the
-    # store records a slot as a datetime instant, not a time of day, and the
-    # two must match or owed() will not see this as a retry of the same slot.
-    slot = datetime.combine(datetime.now().date(), slot_time)
+    # The seeded slot must be the SAME instant owed() will compute, and that
+    # is Trigger.latest_slot's job, not datetime.combine(today, slot_time):
+    # combining with today's date is wrong when `now - 10min` has crossed
+    # midnight backwards - slot_time is then a time yesterday, latest_slot
+    # correctly wraps to yesterday's date, and a hand-combined "today" instant
+    # would silently stop matching it.
+    slot = Trigger(slots=(slot_time,)).latest_slot(datetime.now())
     store.record(Attempt(at=datetime.now() - timedelta(minutes=6),  # backoff
                          slot=slot, count=1, failed=True))          # elapsed
     _tick(b, t, None, Trigger(slots=(slot_time,)), store, idle=0)
