@@ -16,8 +16,8 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional, Sequence
 
 from langgraph.types import Command
 
@@ -51,7 +51,8 @@ class Bot:
                  held: HeldQueue, prefs: PreferenceStore, client=None,
                  log: Optional[AuditLog] = None,
                  categories: Sequence[str] = (), mode: Optional[str] = None,
-                 policy_version: Optional[str] = None):
+                 policy_version: Optional[str] = None,
+                 on_run: Optional[Callable[[datetime], None]] = None):
         self.transport = transport
         self.graph = graph
         self.settings = settings
@@ -74,6 +75,10 @@ class Bot:
         # bot only reports which one is in play. Optional because a caller that
         # does not care about traces should not be forced to thread it through.
         self.policy_version = policy_version
+        # Called after a run the owner TYPED, so the schedule can mark the slot
+        # it covered. Scheduled runs are recorded by the loop that started them;
+        # firing this for those too would reset the retry count every attempt.
+        self.on_run = on_run
         self.mode = (mode or settings.tg_mode or "digest").lower()
         self.chat_id = str(settings.tg_chat_id)
 
@@ -869,6 +874,42 @@ class Bot:
                 "Commands: /triage [n] · /held · /status · /cancel")
 
     def _start(self, limit: int) -> None:
+        # Say something before the four minutes of silence, not after. A run is
+        # one blocking graph.invoke: classify is seconds per thread and the two
+        # Gmail phases are seconds per action, so a twenty-thread run is minutes
+        # long and, until this line, sent nothing at all until the digest. The
+        # owner cannot tell that from a bot that has died, and asked.
+        self.transport.send_message(
+            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
+                          f"minutes; the digest arrives when it is done.")
+        self._run_triage(limit)
+        # A typed run swept the same untriaged backlog a slot would have, so it
+        # covers one. Marked even when the run raised: recording the attempt is
+        # what bounds the retry.
+        if self.on_run is not None:
+            try:
+                self.on_run(datetime.now())
+            except Exception:
+                log.exception("could not record the run against the schedule")
+
+    def run_scheduled(self, slot: datetime, *,
+                      retry_in: Optional[timedelta] = None) -> bool:
+        """A run nobody typed. Returns whether it finished.
+
+        No pre-notice: that line is owed to someone watching a wait they asked
+        for. The caller records the attempt - it holds the retry budget.
+        """
+        if retry_in is not None:
+            suffix = (f" Retrying in {int(retry_in.total_seconds() // 60)} "
+                      f"minutes.")
+        else:
+            suffix = " Not retrying; the next scheduled run is the next attempt."
+        log.info("scheduled triage for slot %s", slot.isoformat())
+        return self._run_triage(self.settings.snapshot_size,
+                                failure_suffix=suffix)
+
+    def _run_triage(self, limit: int, *, failure_suffix: str = "") -> bool:
+        """The run itself, with no announcement and no schedule bookkeeping."""
         self._run += 1
         self._runs_started += 1
         self._page = 0
@@ -880,20 +921,9 @@ class Bot:
         self._done_page = 0
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
-        # Say something before the four minutes of silence, not after. A run is
-        # one blocking graph.invoke: classify is seconds per thread and the two
-        # Gmail phases are seconds per action, so a twenty-thread run is minutes
-        # long and, until this line, sent nothing at all until the digest. The
-        # owner cannot tell that from a bot that has died, and asked.
-        self.transport.send_message(
-            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
-                          f"minutes; the digest arrives when it is done.")
         started = time.monotonic()
-        # mode="incremental": /triage ACTS. The confident, reversible majority
-        # is executed and only what genuinely needs the owner goes to the queue,
-        # which is what this whole design is for. It ran in backlog mode while
-        # the bot rendered from a parked checkpoint - that transitional hack is
-        # what the queue and the digest replace.
+        # mode="incremental": a run ACTS. The confident, reversible majority is
+        # executed and only what genuinely needs the owner goes to the queue.
         try:
             self._last_run = self.graph.invoke(
                 {"limit": limit, "mode": "incremental"},
@@ -902,20 +932,21 @@ class Bot:
             # Silence is indistinguishable from an empty inbox, which is a
             # failure the owner would trust for days without noticing. Say so.
             log.exception("triage failed")
-            # NOT "nothing was executed" - the same falsehood /cancel used to
-            # tell. The run can raise anywhere, including after auto_execute
-            # has already pushed actions through the chokepoint, so the honest
-            # claim is that it did not finish. /held shows what survived.
+            # NOT "nothing was executed" - the run can raise anywhere, including
+            # after auto_execute has already pushed actions through the
+            # chokepoint, so the honest claim is that it did not finish.
             self.transport.send_message(
                 self.chat_id, f"Triage failed: {type(exc).__name__}. "
                               f"The run did not finish; some actions may already "
-                              f"have run. /held to see the queue, /triage to retry.")
-            return
+                              f"have run. /held to see the queue, /triage to "
+                              f"retry." + failure_suffix)
+            return False
         elapsed = time.monotonic() - started
         log.info("triage done in %.1fs: %s executed, %s held", elapsed,
                  len(self._last_run.get("executed", [])), len(self.held.all()))
         self._show(edit=False)
         self._send_health_alerts()
+        return True
 
     def _send_health_alerts(self) -> None:
         """Put anything at warn or fatal in front of the owner, on the phone.

@@ -10,7 +10,7 @@ are covered where they now live - at the graph level in tests/test_graph.py and
 at the boundary in tests/test_tg_callbacks.py.
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -1596,3 +1596,75 @@ def test_a_failed_run_still_reports_the_failure_after_acknowledging(bot):
     b.handle_update(msg("/triage 4"))
     assert "Triaging" in t.sent[0]["text"]
     assert "Triage failed" in t.sent[-1]["text"]
+
+
+def boom(*a, **kw):
+    """A run that dies partway, the way an expired token makes it."""
+    raise RuntimeError("connection refused")
+
+
+SLOT = datetime(2026, 9, 7, 9, 0)
+
+
+def test_a_scheduled_run_sends_no_pre_notice(bot):
+    """The 'this takes a few minutes' line exists because the owner typed
+    something and was watching. Nobody is watching a scheduled run, and a second
+    unprompted ping per slot is noise."""
+    b, t, _ = bot
+    b.run_scheduled(SLOT)
+    assert not any("takes a few minutes" in m["text"] for m in t.sent)
+
+
+def test_a_scheduled_run_still_sends_the_digest(bot):
+    b, t, _ = bot
+    assert b.run_scheduled(SLOT) is True
+    assert any("Inbox ·" in m["text"] for m in t.sent)
+
+
+def test_a_typed_triage_still_announces_itself(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    assert any("takes a few minutes" in m["text"] for m in t.sent)
+
+
+def test_a_failed_scheduled_run_returns_false_and_names_the_retry(
+        bot, monkeypatch):
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    assert b.run_scheduled(SLOT, retry_in=timedelta(minutes=5)) is False
+    assert any("Retrying in 5 minutes" in m["text"] for m in t.sent)
+
+
+def test_a_failed_scheduled_run_with_no_retry_left_says_so(bot, monkeypatch):
+    """The two failure messages have to differ, or a repeat reads as a stutter
+    rather than as the slot being abandoned."""
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    assert b.run_scheduled(SLOT, retry_in=None) is False
+    text = " ".join(m["text"] for m in t.sent)
+    assert "Retrying" not in text
+    assert "next scheduled run" in text
+
+
+def test_a_typed_run_notifies_on_run_and_a_scheduled_one_does_not(bot):
+    """A typed /triage marks the slot too - it swept the same backlog. The loop
+    records scheduled runs itself, so doing it here as well would reset the
+    retry count on every attempt."""
+    b, t, _ = bot
+    marks = []
+    b.on_run = marks.append
+    b.handle_update(msg("/triage 4"))
+    assert len(marks) == 1
+    b.run_scheduled(SLOT)
+    assert len(marks) == 1
+
+
+def test_on_run_is_called_even_when_the_run_raised(bot, monkeypatch):
+    """Recording the attempt is what bounds the retry. If it only happened on
+    success, a failing slot would be owed again 50 seconds later, forever."""
+    b, t, _ = bot
+    monkeypatch.setattr(b.graph, "invoke", boom)
+    marks = []
+    b.on_run = marks.append
+    b.handle_update(msg("/triage 4"))
+    assert len(marks) == 1
