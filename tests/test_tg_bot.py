@@ -397,7 +397,7 @@ def test_a_stale_tap_says_so_instead_of_doing_nothing(bot):
     b.handle_update(msg("/triage 4"))
     b.handle_update(cb(encode("done", digest_id="dead")))
     assert t.edited == [], "a stale tap was acted on"
-    assert "/triage" in t.answered[-1]["text"]
+    assert "out of date" in t.answered[-1]["text"]
 
 
 def test_every_button_on_the_digest_now_acts(bot):
@@ -489,10 +489,12 @@ def test_a_callback_from_the_current_digest_is_honoured(bot):
 
 def test_a_callback_carrying_no_digest_id_at_all_is_ignored(bot):
     """An empty id is what decode() gives an id-less callback, and it is also
-    the bot's own starting state - so it must never be allowed to match."""
+    the bot's own starting state - so it must never be allowed to match. Like
+    any other stale tap it now re-renders the queue rather than acting."""
     b, t, _ = bot
     b.handle_update(cb(encode("open", 0)))
-    assert t.sent == [] and t.edited == []
+    assert t.edited == []
+    assert t.sent, "a stale tap should still show the current queue"
 
 
 def test_hostile_callback_data_is_answered_and_ignored(bot):
@@ -1668,3 +1670,65 @@ def test_on_run_is_called_even_when_the_run_raised(bot, monkeypatch):
     b.on_run = marks.append
     b.handle_update(msg("/triage 4"))
     assert len(marks) == 1
+
+
+def test_idle_for_is_unbounded_before_any_update(bot):
+    """A bot nobody has touched is not mid-review, so an owed run should not
+    wait five minutes for a conversation that never started."""
+    b, _t, _ = bot
+    assert b.idle_for(datetime(2026, 9, 7, 9, 0)) > timedelta(days=365)
+
+
+def test_handling_an_update_stamps_the_touch(bot):
+    b, _t, _ = bot
+    b.handle_update(msg("/status"))
+    assert b.idle_for(datetime.now()) < timedelta(seconds=5)
+    assert b.idle_for(datetime.now() + timedelta(minutes=5)) >= timedelta(minutes=5)
+
+
+def test_an_unauthorised_update_does_not_count_as_the_owner_reviewing(bot):
+    b, _t, _ = bot
+    b.handle_update(msg("/status", chat_id=999))
+    assert b.idle_for(datetime(2026, 9, 7, 9, 0)) > timedelta(days=365)
+
+
+def test_a_stale_tap_sends_the_current_queue_instead_of_asking_for_a_command(bot):
+    """With scheduled runs every digest but the newest is stale, so this stops
+    being an edge case and becomes how an absent owner comes back to the phone.
+    A toast is a banner that vanishes; the queue is on the screen."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    before = len(t.sent)
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert len(t.sent) > before                  # a new message, not a toast
+    assert "waiting" in t.sent[-1]["text"]
+
+
+def test_a_stale_tap_does_not_edit_the_message_it_came_from(bot):
+    """Editing would silently replace what that run reported, and the owner
+    scrolling back later would find a different run in its place."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    edits = len(t.edited)
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert len(t.edited) == edits
+
+
+def test_a_stale_tap_starts_no_run(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    runs = b._runs_started
+    b.handle_update(cb(encode("open", 1, digest_id="dead")))
+    assert b._runs_started == runs
+    assert "DONE" not in t.sent[-1]["text"]      # no run report without a run
+
+
+def test_a_noop_intent_only_answers_and_sends_nothing(bot):
+    """Data too old or malformed to decode has no digest to be stale relative
+    to, so there is nothing to re-render."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    before = len(t.sent)
+    b.handle_update(cb("a:1234"))
+    assert len(t.sent) == before
+    assert t.answered[-1]["text"]

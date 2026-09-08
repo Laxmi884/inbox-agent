@@ -114,6 +114,11 @@ class Bot:
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
+        # When the owner last touched the bot. The scheduler's quiet gate reads
+        # it: taps are the only honest signal of "mid-review" there is, because
+        # nothing emits a done-reviewing event and a queue the owner is
+        # deliberately ignoring would read as a review that never ends.
+        self._last_touch: Optional[datetime] = None
 
     # --- identity -----------------------------------------------------------
 
@@ -290,6 +295,19 @@ class Bot:
                 item.rule_note = (f"{rule.scope} {rule.pattern} → {rule.summary}"
                                   if rule else "")
         return list(rows.values())
+
+    def _show_queue(self) -> None:
+        """The current queue, as a new message, running nothing.
+
+        The queue outlives runs, so looking at it must not require producing
+        more work - and with no run, no run report (see _view's run_report).
+        """
+        self._page = 0
+        self._message_id = None
+        self._digest_id = self._new_digest_id()
+        self._run_report = False
+        self._panel = "digest"
+        self._show(edit=False)
 
     def _show(self, *, edit: bool) -> None:
         view = self._view(run_report=self._run_report)
@@ -839,10 +857,19 @@ class Bot:
     def handle_update(self, update: dict) -> None:
         if not self._authorised(update):
             return
+        # Only authorised updates count: a rejected update is not the owner
+        # reviewing anything.
+        self._last_touch = datetime.now()
         if "callback_query" in update:
             self._on_callback(update["callback_query"])
         elif "message" in update:
             self._on_message(update["message"])
+
+    def idle_for(self, now: datetime) -> timedelta:
+        """How long since the owner last touched the bot."""
+        if self._last_touch is None:
+            return timedelta.max
+        return now - self._last_touch
 
     def _on_message(self, message: dict) -> None:
         text = (message.get("text") or "").strip()
@@ -855,15 +882,7 @@ class Bot:
             limit = int(arg) if arg.strip().isdigit() else self.settings.snapshot_size
             self._start(limit)
         elif command == "/held":
-            # Shows the queue without running anything: the queue outlives runs,
-            # so looking at it must not require producing more work. And with no
-            # run, no run report - see _view's run_report.
-            self._page = 0
-            self._message_id = None
-            self._digest_id = self._new_digest_id()
-            self._run_report = False
-            self._panel = "digest"
-            self._show(edit=False)
+            self._show_queue()
         elif command == "/status":
             self._status()
         elif command == "/cancel":
@@ -1049,17 +1068,23 @@ class Bot:
             return
         if not self._digest_id or intent.digest_id != self._digest_id:
             # A tap on a superseded digest. Positions have shifted since that
-            # message was drawn, so acting on it would act on the wrong thread.
+            # message was drawn, so acting on it would act on the wrong thread -
+            # this check stays exactly as strict as it was.
             #
-            # The empty-id check is not redundant: decode() reports an id-less
-            # callback as digest_id="", which is also this object's state before
-            # the first digest and after /cancel. Comparing alone would let ""
-            # match "" and make an id-less callback valid in exactly the two
-            # moments when no digest exists.
-            log.info("ignored a callback from digest %r (current %r)",
-                     intent.digest_id, self._digest_id)
-            self._ack(answer, "That digest is out of date - send /triage or "
-                             "/held for a current one.")
+            # What changed is the refusal. Telling the owner to send /held was
+            # tuned for a rare event; with scheduled runs every digest but the
+            # newest is stale, so this is simply how an absent owner comes back
+            # to their phone. A toast is a banner that vanishes, so send the
+            # queue instead of asking for a command.
+            #
+            # A NEW message, never an edit: editing would silently replace what
+            # that run reported, and the owner scrolling back later would find a
+            # different run in its place.
+            log.info("re-rendered the queue for a callback from digest %r "
+                     "(current %r)", intent.digest_id, self._digest_id)
+            self._ack(answer, "That digest is out of date - here is the "
+                              "current queue.")
+            self._show_queue()
             return
 
         self._ack(answer)
