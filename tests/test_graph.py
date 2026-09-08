@@ -911,3 +911,37 @@ def test_mark_triaged_reports_each_thread(wiring, caplog):
         _run_incremental(wiring)
     assert any(m.startswith("mark_triaged ") and "/" in m
                for m in _messages(caplog))
+
+
+def test_learning_uses_the_sender_history_the_run_recorded():
+    """The teach path reads the history, so a bulk address widens to itself.
+
+    End-to-end over the wiring rather than over choose_scope: the sighting that
+    makes a display name look like payload is recorded by the triage node, and
+    the rule is written by learn_from_response, and before this the two were
+    not connected at all - every rule the owner taught carried the full From
+    header and could never fire twice.
+    """
+    prefs = PreferenceStore(build_store())
+    for name in ("Charmain Guia", "Daphna Cibulski-Cohen"):
+        prefs.note_sender(f"{name} <invitations@linkedin.com>")
+
+    threads = [Thread(id="t1", subject="I want to connect",
+                      sender="Daphna Cibulski-Cohen <invitations@linkedin.com>",
+                      to=[], date="2026-09-08T10:00:00Z", snippet="s", body="b",
+                      label_ids=["INBOX"])]
+    learn_from_response(
+        ReviewResponse(decisions={"t1": "edit"},
+                       edits={"t1": [Action(kind="trash", thread_id="t1")]},
+                       instructions=[]),
+        threads, prefs)
+
+    rule = prefs.rules()[0]
+    assert rule.pattern == "invitations@linkedin.com"
+
+    # The next invitation is a different human at the same address.
+    later = Thread(id="t2", subject="I want to connect",
+                   sender="Rajesh Kumar <invitations@linkedin.com>", to=[],
+                   date="2026-09-08T19:00:00Z", snippet="s", body="b",
+                   label_ids=["INBOX"])
+    assert [r.id for r in prefs.matching(later)] == [rule.id]

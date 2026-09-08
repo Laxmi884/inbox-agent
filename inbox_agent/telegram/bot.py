@@ -479,7 +479,7 @@ class Bot:
                                           sender=item.item.sender)),
                 [ActionTemplate(kind="none")],
                 f"owner refused {proposed} on {item.item.subject[:50]!r}",
-                rejected=proposed, supersedes=item.item.rule_id)
+                rejected=proposed, supersedes=item.item.rule_id, seen=self.prefs)
             self.prefs.add_rule(rule)
             summary = (f"Left alone. Learned: {rule.scope} {rule.pattern} "
                        f"→ {rule.summary}.")
@@ -808,7 +808,7 @@ class Bot:
             thread = self._thread_for(item)
             rule = rule_from_correction(
                 thread, actions, f"owner corrected {item.subject[:60]!r}",
-                supersedes=superseded)
+                supersedes=superseded, seen=self.prefs)
             self.prefs.add_rule(rule)
             reach = f"{rule.scope} {rule.pattern}"
 
@@ -1215,6 +1215,11 @@ class TelegramError(RuntimeError):
         super().__init__(f"{method} failed [{status}]: {description}")
 
 
+# The Bot API's phrasing for an edit that would change nothing. Matched on the
+# stable head of the description; the sentence goes on to recite the content.
+_NOT_MODIFIED = "message is not modified"
+
+
 class HttpTransport:
     """Raw Bot API over httpx. No telegram library.
 
@@ -1279,8 +1284,20 @@ class HttpTransport:
                           reply_markup=self._markup(keyboard))
 
     def edit_message(self, chat_id, message_id, text, keyboard=None) -> dict:
-        return self._post("editMessageText", chat_id=chat_id, message_id=message_id,
-                          text=text, reply_markup=self._markup(keyboard))
+        try:
+            return self._post("editMessageText", chat_id=chat_id, message_id=message_id,
+                              text=text, reply_markup=self._markup(keyboard))
+        except TelegramError as exc:
+            # Telegram reports "nothing changed" as a 400, but the edit did
+            # what it was asked to: the screen already shows this exact text
+            # and keyboard. Every callback ends in _show(edit=True), so a tap
+            # that lands back where it started - "back to the digest" from the
+            # digest, "show the done" from the done panel - re-renders
+            # identically. Letting the 400 out took the whole callback down in
+            # _tick, and the owner saw a button that did nothing at all.
+            if exc.status == 400 and _NOT_MODIFIED in exc.description:
+                return {}
+            raise
 
     def answer_callback(self, callback_id, text="") -> dict:
         return self._post("answerCallbackQuery", callback_query_id=callback_id, text=text)

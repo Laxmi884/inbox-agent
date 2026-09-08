@@ -144,7 +144,7 @@ def learn_from_response(
         rule = rule_from_correction(by_id[thread_id],
                                     [ActionTemplate(kind=kind, params=params)], note,
                                     rejected=rejected, corpus=threads,
-                                    supersedes=by_rule.get(thread_id))
+                                    supersedes=by_rule.get(thread_id), seen=prefs)
         prefs.add_rule(rule)
         learned.append(rule.id)
 
@@ -257,6 +257,13 @@ def build_graph(
     def triage(state: TriageState) -> dict:
         """Prefilter first, model only on what is left."""
         threads = _threads(state)
+        # Every thread the run looks at, before anything is decided about it.
+        # This is the sender history choose_scope reads at teach time, and the
+        # teaching usually happens in a later run than the sighting that makes
+        # the display name look like payload - so it has to be durable, and it
+        # has to be written for mail the owner never corrects.
+        for seen_thread in threads:
+            prefs.note_sender(seen_thread.sender)
         decided, undecided = prefilter(threads, prefs)
         decided += classify_batch(undecided, llm, policy, prefs.instructions(),
                                   body_budget=settings.body_budget)

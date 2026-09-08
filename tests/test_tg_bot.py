@@ -1968,3 +1968,45 @@ def test_a_raise_sending_the_digest_is_still_recorded_and_does_not_kill_the_loop
     assert store.last is not None and store.last.failed is True
     # The loop must survive to poll again.
     _tick(b, t, None, trigger, store, idle=0)
+
+
+# --- a tap that changes nothing is not a failure -----------------------------
+
+def test_edit_message_treats_not_modified_as_success():
+    """Telegram reports "nothing changed" as a 400, and it is not an error.
+
+    Re-tapping the panel you are already on - "back to the digest" from the
+    digest, "show the done" from the done panel - renders exactly what is
+    already on screen. Letting that 400 out of the transport killed the whole
+    callback in _tick, so the tap looked like a dead button. Observed live on
+    2026-09-08 at 15:25 EDT against update 823541640.
+    """
+    from inbox_agent.telegram.bot import HttpTransport, TelegramError
+
+    transport = HttpTransport.__new__(HttpTransport)   # no socket, no token
+    calls = []
+
+    def fake_post(method, **payload):
+        calls.append(method)
+        raise TelegramError(method, 400, "Bad Request: message is not modified: "
+                                         "specified new message content and reply "
+                                         "markup are exactly the same as a current "
+                                         "content and reply markup of the message")
+
+    transport._post = fake_post
+    assert transport.edit_message(1, 2, "same text", None) == {}
+    assert calls == ["editMessageText"]
+
+
+def test_edit_message_still_raises_every_other_400():
+    """Only the no-op is swallowed. A real failure must still be loud."""
+    from inbox_agent.telegram.bot import HttpTransport, TelegramError
+
+    transport = HttpTransport.__new__(HttpTransport)
+
+    def fake_post(method, **payload):
+        raise TelegramError(method, 400, "Bad Request: message to edit not found")
+
+    transport._post = fake_post
+    with pytest.raises(TelegramError):
+        transport.edit_message(1, 2, "text", None)

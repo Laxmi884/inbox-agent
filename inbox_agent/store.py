@@ -23,6 +23,7 @@ from .models import ActionKind, ActionTemplate, HeldItem, ReviewItem, Rule, Thre
 
 RULES_NS = ("prefs", "rules")
 INSTRUCTIONS_NS = ("prefs", "instructions")
+SENDERS_NS = ("prefs", "senders")
 HELD_NS = ("held", "items")
 
 # BaseStore.search() defaults to limit=10. rules() pages through with an
@@ -117,15 +118,26 @@ def open_store(path: Path | str, embeddings=None, dims: int = 768) -> SqliteStor
 MIN_PRECISION = 0.5
 MIN_HITS_BEFORE_DEMOTION = 4
 
-# Addresses that are structurally incapable of holding a conversation. Mail from
-# these is bulk by construction, so a sender-scoped rule is safe: there is no
-# "but sometimes this person writes to me personally" case to worry about.
-_NOREPLY_MARKERS = ("noreply", "no-reply", "no_reply", "donotreply",
-                    "do-not-reply", "notifications", "mailer-daemon")
+# When a display name stops being an identity and becomes payload.
+#
+# This replaces a list of no-reply markers that was written to answer the same
+# question and never referenced by anything. A marker list cannot answer it:
+# invitations@linkedin.com carries none of those words and is pure bulk, while
+# newsletters-noreply@linkedin.com carries two of them and is Forbes AND S&P
+# Global AND a real person - the exact case _sender_matches exists to protect.
+#
+# What separates them is not the address, it is whether the NAME RECURS. A
+# publisher writes again under the same name; a stranger inviting you on
+# LinkedIn never does. So an address whose names almost never repeat is an
+# address where the name is a per-message payload, and the rule belongs to the
+# address. Below the floor there is no evidence either way and nothing widens.
+_NAME_SIGHTINGS_FLOOR = 2
+_NAME_CHURN_FOR_PAYLOAD = 0.75
+_NAME_TALLY_CAP = 50
 
 
-def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None
-                 ) -> tuple[str, str]:
+def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None,
+                 *, seen: Optional["PreferenceStore"] = None) -> tuple[str, str]:
     """Pick the narrowest scope that still generalises past this one message.
 
     Everything used to be sender-scoped, which meant correcting one job alert
@@ -157,21 +169,43 @@ def choose_scope(thread: Thread, corpus: Optional[list[Thread]] = None
             # distinguishing feature, so scope to it rather than to the person.
             return "subject", subject[:60].lower()
 
-    # No corpus evidence. A no-reply address cannot hold a conversation, so
-    # everything it sends is bulk and the sender is a safe unit; a human address
-    # gets the same treatment only because one correction is not enough to infer
-    # anything narrower.
+    # No corpus evidence for a narrower scope. The remaining question is not
+    # how narrow to go but how WIDE the sender unit itself is: the whole From
+    # header, or the address under it. `seen` is the sender history that
+    # answers it - see _sender_unit.
     if sender:
-        return "sender", sender
+        return "sender", _sender_unit(sender, seen)
     if subject:
         return "subject", subject[:60].lower()
     return "sender", "unknown"
 
 
+def _sender_unit(sender: str, seen: Optional["PreferenceStore"]) -> str:
+    """The whole From header, or just the address when the name is payload.
+
+    A rule taught on "Daphna Cibulski-Cohen <invitations@linkedin.com>" is a
+    rule about a stranger who will never write again, and _sender_matches
+    matches a pattern carrying a display name whole - so it could never fire a
+    second time. Every LinkedIn invitation is a different human at the same
+    address, which is precisely what makes the name payload rather than
+    identity.
+
+    Decided from history, never from the shape of the address: see the comment
+    on _NAME_CHURN_FOR_PAYLOAD for why a marker list cannot tell these apart.
+    With no history the full header stands, which is the behaviour every rule
+    taught before this existed already had.
+    """
+    if seen is None or "<" not in sender:
+        return sender
+    address = _sender_address(sender)
+    return address if seen.name_is_payload(address) else sender
+
+
 def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: str,
                          *, rejected: Optional[ActionKind] = None,
                          corpus: Optional[list[Thread]] = None,
-                         supersedes: Optional[str] = None) -> Rule:
+                         supersedes: Optional[str] = None,
+                         seen: Optional["PreferenceStore"] = None) -> Rule:
     """Turn one human correction into a durable, attributable rule.
 
     `actions` is the sequence to take next time, not a single kind: the
@@ -187,7 +221,7 @@ def rule_from_correction(thread: Thread, actions: list[ActionTemplate], note: st
     and defaulted: a correction of the model's own judgement overrides no rule,
     and every existing caller passes three positional arguments.
     """
-    scope, pattern = choose_scope(thread, corpus)
+    scope, pattern = choose_scope(thread, corpus, seen=seen)
     return Rule(
         id=f"r-{uuid.uuid4().hex[:8]}",
         scope=scope,
@@ -278,6 +312,53 @@ class PreferenceStore:
                 update={"supersedes": max(replaced, key=lambda r: r.created_at).id})
         self._put(rule)
         return rule
+
+    # --- sender history ------------------------------------------------------
+
+    def note_sender(self, raw_sender: str) -> None:
+        """Record that this address was seen under this display name.
+
+        One row per address holding a name -> count tally, written for every
+        thread a run looks at. That is the only durable record of whether a
+        name recurs, and _sender_unit needs it at teach time - which is
+        typically a different run from the one that saw the earlier mail.
+
+        Names are capped: an address whose names never repeat is exactly the
+        case this exists to detect, so the tally must not grow without bound.
+        The cap is well past the floor a decision needs, and the ratio it
+        preserves is the whole of the signal.
+        """
+        raw_sender = (raw_sender or "").strip().lower()
+        if not raw_sender or "<" not in raw_sender:
+            return
+        address = _sender_address(raw_sender)
+        name = raw_sender.split("<", 1)[0].strip().strip('"').strip()
+        if not address or not name:
+            return
+        item = self._store.get(SENDERS_NS, address)
+        names = dict((item.value.get("names") or {})) if item else {}
+        total = int(item.value.get("total", 0)) if item else 0
+        if name in names or len(names) < _NAME_TALLY_CAP:
+            names[name] = names.get(name, 0) + 1
+            total += 1
+            self._store.put(SENDERS_NS, address, {"names": names, "total": total})
+
+    def name_is_payload(self, address: str) -> bool:
+        """Does this address put a new name on nearly every message?
+
+        The ratio, not the count: newsletters-noreply@linkedin.com sends under
+        several names too, but each recurs, so each identifies a publisher
+        worth scoping a rule to. invitations@linkedin.com sends under a new
+        name every time, so the name identifies nothing that will write again.
+        """
+        item = self._store.get(SENDERS_NS, (address or "").strip().lower())
+        if not item:
+            return False
+        names = item.value.get("names") or {}
+        total = int(item.value.get("total", 0))
+        if len(names) < _NAME_SIGHTINGS_FLOOR or total < _NAME_SIGHTINGS_FLOOR:
+            return False
+        return len(names) / total >= _NAME_CHURN_FOR_PAYLOAD
 
     def rules(self) -> list[Rule]:
         """All stored rules, regardless of how many there are."""

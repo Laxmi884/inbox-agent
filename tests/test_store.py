@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from inbox_agent.models import ActionTemplate, Rule, Thread
 from inbox_agent.store import (MIN_HITS_BEFORE_DEMOTION, PreferenceStore,
+                               choose_scope,
                                build_store, rule_from_correction)
 
 
@@ -364,3 +365,71 @@ def test_rules_written_with_an_index_read_back_without_one(tmp_path):
     plain = PreferenceStore(open_store(path))          # embeddings=None
     ids = [r.id for r in plain.rules()]
     assert ids == ["r-keepme"], f"rule lost when the index went away: {ids}"
+
+
+# --- when a display name is payload rather than an identity -------------------
+
+def _seen(pairs):
+    """A sender history: (address, display name) as the agent saw them."""
+    s = store()
+    for address, name in pairs:
+        s.note_sender(f"{name} <{address}>")
+    return s
+
+
+def test_rule_scopes_to_the_address_when_every_mail_brings_a_new_name():
+    """invitations@linkedin.com is a different human every single time.
+
+    Taught on one invitation, a rule carrying the inviter's display name can
+    never match a second one - it is scoped to a person who will not write
+    again. Observed live: r-d33ffdc7, taught 2026-09-08 15:22 EDT, hit_count 0
+    while the 19:00 run trashed nothing.
+    """
+    s = _seen([("invitations@linkedin.com", "charmain guia"),
+               ("invitations@linkedin.com", "daphna cibulski-cohen")])
+    scope, pattern = choose_scope(
+        thread(sender="Daphna Cibulski-Cohen <invitations@linkedin.com>",
+               subject="I want to connect"),
+        seen=s)
+    assert (scope, pattern) == ("sender", "invitations@linkedin.com")
+
+
+def test_a_rule_scoped_to_the_address_covers_the_next_stranger():
+    s = _seen([("invitations@linkedin.com", "charmain guia"),
+               ("invitations@linkedin.com", "daphna cibulski-cohen")])
+    rule = rule_from_correction(
+        thread(sender="Daphna Cibulski-Cohen <invitations@linkedin.com>",
+               subject="I want to connect"),
+        [ActionTemplate(kind="trash")], "owner corrected", seen=s)
+    s.add_rule(rule)
+    later = thread(id="t2", sender="Rajesh Kumar <invitations@linkedin.com>",
+                   subject="I want to connect")
+    assert [r.id for r in s.matching(later)] == [rule.id]
+
+
+def test_a_recurring_display_name_is_still_an_identity():
+    """newsletters-noreply@linkedin.com is Forbes AND S&P Global AND a person.
+
+    Several names, but each one recurs - so the name identifies a publisher and
+    scoping to the bare address would let a rule taught on a newsletter decide
+    a person's mail. This is the case _sender_matches was built to protect.
+    """
+    s = _seen([("newsletters-noreply@linkedin.com", "s&p global via linkedin"),
+               ("newsletters-noreply@linkedin.com", "s&p global via linkedin"),
+               ("newsletters-noreply@linkedin.com", "s&p global via linkedin"),
+               ("newsletters-noreply@linkedin.com", "forbes via linkedin"),
+               ("newsletters-noreply@linkedin.com", "forbes via linkedin"),
+               ("newsletters-noreply@linkedin.com", "forbes via linkedin")])
+    scope, pattern = choose_scope(
+        thread(sender="S&P Global via LinkedIn <newsletters-noreply@linkedin.com>",
+               subject="Daily Update"),
+        seen=s)
+    assert pattern == "s&p global via linkedin <newsletters-noreply@linkedin.com>"
+
+
+def test_one_sighting_teaches_nothing_about_the_name():
+    """A single mail cannot say whether the name recurs, so nothing widens."""
+    s = _seen([("someone@example.com", "a person")])
+    scope, pattern = choose_scope(
+        thread(sender="A Person <someone@example.com>", subject="hello"), seen=s)
+    assert pattern == "a person <someone@example.com>"
