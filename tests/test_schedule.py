@@ -137,3 +137,52 @@ def test_next_slot_is_today_when_one_remains_and_tomorrow_otherwise():
     assert TRIGGER.next_slot(at(7, 10, 0)) == at(7, 12, 0)
     assert TRIGGER.next_slot(at(7, 19, 0)) == at(8, 9, 0)
     assert Trigger(slots=()).next_slot(at(7, 10, 0)) is None
+
+
+from inbox_agent.schedule import ScheduleStore
+
+
+def test_an_attempt_survives_a_restart_with_its_count(tmp_path):
+    """A restart must not hand a failing slot a fresh retry budget - that is the
+    retry storm again, one restart at a time."""
+    path = tmp_path / "schedule.json"
+    first = scheduled_attempt(at(7, 9, 0), at(7, 9, 1), None, failed=True)
+    second = scheduled_attempt(at(7, 9, 0), at(7, 9, 7), first, failed=True)
+    ScheduleStore(path).record(second)
+
+    reopened = ScheduleStore(path)          # a new process
+    assert reopened.last == second
+    assert reopened.last.count == 2
+    assert TRIGGER.owed(at(7, 9, 20), reopened.last) is None
+
+
+def test_a_manual_attempt_round_trips_with_no_slot(tmp_path):
+    path = tmp_path / "schedule.json"
+    ScheduleStore(path).record(manual_attempt(at(7, 8, 55)))
+    assert ScheduleStore(path).last == manual_attempt(at(7, 8, 55))
+
+
+def test_a_missing_file_is_no_previous_attempt(tmp_path):
+    assert ScheduleStore(tmp_path / "nothing.json").last is None
+
+
+def test_a_corrupt_file_is_no_previous_attempt_and_is_logged(tmp_path, caplog):
+    """At worst one extra run. Refusing to start over an unreadable scheduling
+    hint would be a far worse trade."""
+    path = tmp_path / "schedule.json"
+    path.write_text("{ this is not json")
+    with caplog.at_level("WARNING"):
+        assert ScheduleStore(path).last is None
+    assert "schedule.json" in caplog.text
+
+
+def test_recording_creates_the_directory(tmp_path):
+    path = tmp_path / "store" / "schedule.json"
+    ScheduleStore(path).record(manual_attempt(at(7, 8, 55)))
+    assert path.exists()
+
+
+def test_last_is_updated_in_memory_without_a_reread(tmp_path):
+    store = ScheduleStore(tmp_path / "schedule.json")
+    store.record(manual_attempt(at(7, 8, 55)))
+    assert store.last == manual_attempt(at(7, 8, 55))

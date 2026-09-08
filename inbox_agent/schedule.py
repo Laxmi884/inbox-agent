@@ -104,3 +104,51 @@ def manual_attempt(now: datetime) -> Attempt:
     """Record of a run the owner typed. It belongs to no slot, but it still
     covers one within `cooldown` - it swept the same untriaged backlog."""
     return Attempt(at=now)
+
+
+class ScheduleStore:
+    """The last attempt, across restarts.
+
+    Separate from Trigger on purpose: Trigger stays pure, and this is the only
+    thing here that touches a disk.
+    """
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self._last = self._read()
+
+    @property
+    def last(self) -> Optional[Attempt]:
+        return self._last
+
+    def _read(self) -> Optional[Attempt]:
+        if not self.path.exists():
+            return None
+        try:
+            raw = json.loads(self.path.read_text())
+            return Attempt(
+                at=datetime.fromisoformat(raw["at"]),
+                slot=(datetime.fromisoformat(raw["slot"])
+                      if raw.get("slot") else None),
+                count=int(raw.get("count", 0)),
+                failed=bool(raw.get("failed", False)))
+        except Exception:
+            # One extra run is the cost of not understanding this file. Refusing
+            # to start would be the expensive failure.
+            log.warning("could not read %s; treating it as no previous attempt",
+                        self.path, exc_info=True)
+            return None
+
+    def record(self, attempt: Attempt) -> None:
+        self._last = attempt
+        payload = {"at": attempt.at.isoformat(),
+                   "slot": attempt.slot.isoformat() if attempt.slot else None,
+                   "count": attempt.count,
+                   "failed": attempt.failed}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Written through a temporary file and renamed: a half-written record
+        # read back as corrupt is a lost retry budget, and the process this
+        # runs in is one launchd will restart mid-write given the chance.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(self.path)
