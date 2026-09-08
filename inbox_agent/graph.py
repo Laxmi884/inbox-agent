@@ -72,6 +72,10 @@ class TriageState(TypedDict, total=False):
     mode: str
     auto: list[dict]
     held: list[dict]
+    # How many more threads matched the query than this run took. Not a count
+    # of the mailbox: the probe asks for limit + 1 ids and stops, so this says
+    # "the cap bound, and by at least this much".
+    remaining: int
 
 
 def learn_from_response(
@@ -233,10 +237,18 @@ def build_graph(
         return [client.get_thread(i) for i in state["thread_ids"]]
 
     def fetch(state: TriageState) -> dict:
-        threads = client.list_threads(
-            limit=state.get("limit", settings.snapshot_size),
-            query=settings.inbox_query)
-        return {"thread_ids": [t.id for t in threads]}
+        limit = state.get("limit", settings.snapshot_size)
+        threads = client.list_threads(limit=limit, query=settings.inbox_query)
+        # Ids only, one page, nothing hydrated. list_thread_ids costs 5 quota
+        # units per page of 500 against 10 to hydrate a single thread, so
+        # asking whether the cap bound is far cheaper than reading what it cut.
+        # It belongs here rather than in the bot: fetch already owns the query
+        # and the limit, and a second caller deciding a run's corpus is a second
+        # place for the two to drift.
+        ids = client.list_thread_ids(query=settings.inbox_query,
+                                     max_ids=limit + 1)
+        return {"thread_ids": [t.id for t in threads],
+                "remaining": max(0, len(ids) - len(threads))}
 
     def triage(state: TriageState) -> dict:
         """Prefilter first, model only on what is left."""

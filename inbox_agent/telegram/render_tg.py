@@ -157,6 +157,7 @@ class DigestView:
     # the list behind the "Show the N done" button, which said a label happened
     # and could not say which one.
     done: list[DoneItem] = field(default_factory=list)
+    remaining: int = 0
 
 
 def rule_decided_count(request: ReviewRequest) -> int:
@@ -267,7 +268,10 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
         stat = " · ".join(f"{count} {kind}"
                           for kind, count in sorted(view.done_by_kind.items())
                           if count)
-        head = [f"Inbox · {clock} · {view.total} threads",
+        # The remainder only when the cap actually bound. A permanent
+        # "0 more waiting" is read for a week and then never again.
+        head = [f"Inbox · {clock} · {view.total} threads"
+                + (f" · {view.remaining} more waiting" if view.remaining else ""),
                 f"{stat} · {len(ordered)} waiting" if stat
                 else f"{len(ordered)} waiting"]
     else:

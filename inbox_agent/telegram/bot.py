@@ -233,6 +233,7 @@ class Bot:
             # that says so is on the terminal; the digest is on the phone.
             dry_run=bool(self.settings.dry_run),
             run_report=run_report,
+            remaining=int((result or {}).get("remaining", 0)),
         )
 
     def _done_items(self) -> list[DoneItem]:

@@ -58,6 +58,41 @@ def test_graph_suspends_at_the_review_interrupt(wiring):
     assert "__interrupt__" in result
 
 
+@pytest.fixture
+def three_threads(tmp_path):
+    data = [{"id": f"r{i}", "subject": f"Sale {i}", "sender": "deals@shop.com",
+             "to": [], "date": "2026-08-26T10:00:00Z", "snippet": "s",
+             "body": "b", "label_ids": ["INBOX", "UNREAD"]} for i in range(3)]
+    p = tmp_path / "three.json"
+    p.write_text(json.dumps(data))
+    return p
+
+
+@pytest.fixture
+def wiring_of_three(wiring, three_threads):
+    return {**wiring, "client": SnapshotGmailClient(three_threads)}
+
+
+def test_fetch_reports_how_many_the_limit_left_behind(wiring_of_three):
+    """The probe is ids-only: it answers 'was the cap the reason this run
+    stopped?' without paying to read the answer."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring_of_three, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 2, "mode": "incremental"},
+                          {"configurable": {"thread_id": "run-remaining"}})
+    assert len(result["thread_ids"]) == 2
+    assert result["remaining"] == 1
+
+
+def test_fetch_reports_no_remainder_when_the_limit_was_not_reached(
+        wiring_of_three):
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = build_graph(**wiring_of_three, checkpointer=InMemorySaver())
+    result = graph.invoke({"limit": 50, "mode": "incremental"},
+                          {"configurable": {"thread_id": "run-no-remaining"}})
+    assert result["remaining"] == 0
+
+
 def test_interrupt_payload_is_json_serialisable(wiring):
     """It must survive the trip to a Telegram renderer unchanged."""
     from langgraph.checkpoint.memory import InMemorySaver
