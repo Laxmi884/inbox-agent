@@ -1914,3 +1914,20 @@ def test_grace_outranks_backoff_in_the_retry_decision(bot, tmp_path,
     text = " ".join(m["text"] for m in t.sent)
     assert "Not retrying" in text
     assert "Retrying in" not in text
+
+
+from dataclasses import replace
+
+
+def test_status_names_the_next_scheduled_run(bot):
+    b, t, _ = bot
+    b.settings = replace(b.settings, schedule=(_time(9, 0), _time(18, 0)))
+    b.handle_update(msg("/status"))
+    assert "scheduled" in t.sent[-1]["text"].lower()
+
+
+def test_status_says_when_there_is_no_schedule(bot):
+    b, t, _ = bot
+    b.settings = replace(b.settings, schedule=())
+    b.handle_update(msg("/status"))
+    assert "no schedule" in t.sent[-1]["text"].lower()

@@ -117,6 +117,8 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
         _setting("INBOX_BODY_BUDGET", s.body_budget),
         _setting("INBOX_TRIAGED_LABEL", s.triaged_label),
         _setting("INBOX_STORE_DIR", s.store_dir),
+        _setting("INBOX_SCHEDULE",
+                 ", ".join(t.strftime("%H:%M") for t in s.schedule) or "off"),
         # Mailbox-affecting safety settings: additive to the deny-list, and
         # the sink an operator checks when they think nothing happened. Both
         # are spec 1.4's failure applied to a different variable - a value

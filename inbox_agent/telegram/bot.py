@@ -1004,6 +1004,13 @@ class Bot:
             body += f"\n\noauth: {check.note or check.value}"
         except Exception:
             log.exception("could not read the oauth countdown for /status")
+        # Read off Settings rather than a Trigger the bot holds: the loop owns
+        # the scheduling decision, and this only reports it.
+        if self.settings.schedule:
+            nxt = Trigger(slots=self.settings.schedule).next_slot(datetime.now())
+            body += f"\n\nNext scheduled run: {nxt.strftime('%H:%M')}"
+        else:
+            body += "\n\nNo schedule configured; runs happen when you send /triage."
         self.transport.send_message(self.chat_id, body)
 
     def _cancel(self) -> None:
