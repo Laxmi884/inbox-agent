@@ -1265,7 +1265,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from inbox_agent.audit import AuditLog
 from inbox_agent.graph import build_graph
 from inbox_agent.config import get_llm
-from inbox_agent.store import HeldQueue
+from inbox_agent.store import DoneStore, HeldQueue
 
 log = AuditLog(settings.audit_log)
 teach_prefs = PreferenceStore(build_store())     # fresh, so §9 is reproducible
@@ -1273,13 +1273,16 @@ teach_prefs = PreferenceStore(build_store())     # fresh, so §9 is reproducible
 # item is work in flight, not durable preference knowledge, and build_graph
 # now requires the queue explicitly (task 4) rather than building one itself.
 teach_held = HeldQueue(build_store())
+# Own namespace in the same store: the run report that makes /done survive a
+# restart (see DoneStore in store.py).
+teach_done = DoneStore(build_store())
 
 cm = SqliteSaver.from_conn_string("inbox_agent/checkpoints.sqlite")
 checkpointer = cm.__enter__()    # kept open across cells; closes with the kernel
 
 llm = get_llm() if settings.backend != "offline" else None
 g = build_graph(client=client, prefs=teach_prefs, policy=pol, llm=llm,
-                settings=settings, log=log, held=teach_held,
+                settings=settings, log=log, held=teach_held, done=teach_done,
                 checkpointer=checkpointer)
 
 gg = g.get_graph()
@@ -1564,39 +1567,58 @@ if not teach_prefs.as_table():
 """)
 
 md(r"""
-## §9.7 · What this means when you go to production
+## §9.7 · What this meant when it went to production
 
-Everything in §9 was built against a frozen snapshot and a notebook. Here is how
-each piece earns its keep when it becomes a real system — which is this project's
-next milestone.
+Everything in §9 was built against a frozen snapshot and a notebook. This
+section used to predict what would happen when it became a real system. It has
+since become one, so the predictions are now checkable — and scoring them is
+more useful than quietly rewriting them.
 
-**The interrupt payload becomes a Telegram message.** Nothing in the graph
-changes. `render.py` (§10) is replaced by a Telegram renderer, and the bot calls
-`Command(resume=...)` with the same JSON. The design note in `models.py` — *"the
-notebook renders it today, a Telegram bot renders it tomorrow"* — was written for
-exactly this moment.
+**The full story is `inbox_agent_stage_b_explained.ipynb`.** This is the
+scorecard.
 
-**The checkpointer becomes the reason it works at all.** A human answering from
-their phone hours later is precisely the case a script cannot handle and
-`SqliteSaver` handles for free. In production you would move to Postgres and key
-`thread_id` per review session.
+**✅ The interrupt payload becomes a Telegram message.** Half right, and the
+interesting half is the part that changed. `render.py` (§10) *was* replaced by a
+Telegram renderer, and the graph *was* untouched — the claim in `models.py`,
+*"the notebook renders it today, a Telegram bot renders it tomorrow"*, held
+exactly. But the bot does **not** call `Command(resume=...)` for `/triage`. The
+partition ladder of §12 meant most threads never needed an answer at all, so
+`/triage` runs `mode="incremental"`, acts, and reports. The interrupt path
+survives intact for the historical sweep and nothing drives it yet — Stage B
+§21 explains why wiring it up today would be the most destructive single edit
+available in the codebase.
 
-**The trust boundary stops being theoretical.** A Telegram webhook is a public
-endpoint. §9.5's guard is the thing standing between a replayed callback and an
-action on an email nobody approved.
+**✅ The checkpointer becomes the reason it works at all.** True for the
+interrupt path. But held items outgrew it: work waiting on a person is now its
+own durable queue rather than a suspended graph execution, because coupling
+"what is waiting for you" to "a parked checkpoint" made restarts and concurrent
+runs hard to reason about. Stage B §17.
 
-**The client swap is one argument.** `LiveGmailClient` implementing §3's seven
-methods, passed to `build_graph(client=...)`. And `INBOX_DRY_RUN=false` becomes a
-decision with consequences instead of a config value.
+**❌ The trust boundary stops being theoretical. *A Telegram webhook is a public
+endpoint.*** The boundary is real; the webhook never happened. The project chose
+**long polling** — the bot dials out, there is no inbound port — and it chose it
+*for the reason this very section raises*. Read `inbox_agent/telegram/bot.py`'s
+opening docstring: shrinking the trust boundary is stated as the better reason,
+ahead of convenience.
 
-**LangSmith turns runs into datasets.** Tracing is on throughout; every audit
-record carries `langsmith_run_id`. Once the agent runs on real mail for a few
-days, those traces become the evaluation set — real threads, real proposals, and
-the human's actual verdict as the label. That dataset is what makes Stage B
-measurable rather than merely different: same input, same store, diffed on
-identical ground.
+That is the most useful wrong prediction in this notebook. §9.5's guard was
+built anyway, and so were the chat-id allow-list and the digest-staleness
+check, on top of a transport that had already removed the attack they were
+written for. Defence in depth is not a slogan here — it is why three
+independent guards exist when none of them is load-bearing against an endpoint
+nobody exposed.
 
-Which is the real argument for reading Stage A this closely. Not because a
+**✅ The client swap is one argument.** `LiveGmailClient` implementing §3's
+seven methods, passed to `build_graph(client=...)`. Exactly that, and
+`INBOX_DRY_RUN=false` did become a decision with consequences. What the snapshot
+was hiding filled a section of its own: consent that expires without warning,
+and a 403 that means two opposite things. Stage B §19.
+
+**⏳ LangSmith turns runs into datasets.** Still true, still not built. Tracing
+is on and every audit record carries `langsmith_run_id`; nothing yet turns
+corrections into an evaluation set.
+
+Which remains the real argument for reading Stage A this closely. Not because a
 deterministic pipeline is the final architecture — but because it is the
 **baseline that makes everything after it measurable.**
 """)
@@ -1944,9 +1966,8 @@ nb = {
     "nbformat_minor": 5,
 }
 
-out = Path("/path/to/Agents_For_IT_POC/"
-           "inbox_agent_stage_a_explained.ipynb")
-out.write_text(json.dumps(nb, indent=1))
+out = Path(__file__).parent / "inbox_agent_stage_a_explained.ipynb"
+out.write_text(json.dumps(nb, indent=1) + "\n")
 print(f"wrote {out} — {len(cells)} cells "
       f"({sum(1 for c in cells if c['cell_type']=='markdown')} md, "
       f"{sum(1 for c in cells if c['cell_type']=='code')} code)")

@@ -80,7 +80,13 @@ def bot(tmp_path, snapshot_file):
     # One queue, shared by the graph that fills it and the bot that renders it.
     # Two instances over two stores would let the bot show an empty queue while
     # the graph quietly filled another one.
-    held = HeldQueue(build_store())
+    from inbox_agent.store import DoneStore
+    work = build_store()
+    held = HeldQueue(work)
+    # The report store the graph writes and the bot reads. One instance, like
+    # the queue: two would let the bot show an empty /done while the graph
+    # filled another.
+    done = DoneStore(work)
     # One store, shared by the graph that reads rules and the bot that writes
     # them - two instances would let a correction land where nothing reads it.
     prefs = PreferenceStore(build_store())
@@ -89,7 +95,7 @@ def bot(tmp_path, snapshot_file):
                         prefs=prefs,
                         policy=Policy(text="P", version="local:t", source="local"),
                         llm=FakeLLM(), settings=settings, log=log, held=held,
-                        checkpointer=InMemorySaver())
+                        done=done, checkpointer=InMemorySaver())
     t = FakeTransport()
     return Bot(transport=t, graph=graph, settings=settings, held=held,
                prefs=prefs, client=client, log=log,

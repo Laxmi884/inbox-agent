@@ -21,7 +21,7 @@ from ..single_instance import AlreadyRunning, acquire
 from ..graph import build_graph
 from ..policy import load_policy
 from ..schedule import ScheduleStore, Trigger
-from ..store import HeldQueue, PreferenceStore, open_store
+from ..store import DoneStore, HeldQueue, PreferenceStore, open_store
 from .bot import Bot, HttpTransport, run_polling
 
 
@@ -122,7 +122,12 @@ def main() -> int:
     # one, because only the rules want the embedding index - pointing it at a
     # held payload with no `text` field would cost embedding calls to index
     # nothing.
-    held = HeldQueue(open_store(settings.store_dir / "held.sqlite"))
+    work_store = open_store(settings.store_dir / "held.sqlite")
+    held = HeldQueue(work_store)
+    # Same store, own namespace (spec 2.1): a run report wants an embedding
+    # index no more than a held item does, and a third sqlite file would be a
+    # third object threaded through build_graph and Bot for no gain.
+    done = DoneStore(work_store)
     llm = use_model("gemma") if settings.backend == "ollama" else None
     if llm is None:
         from ..config import get_llm
@@ -132,7 +137,7 @@ def main() -> int:
     checkpointer = cm.__enter__()
 
     graph = build_graph(client=client, prefs=prefs, policy=policy, llm=llm,
-                        settings=settings, log=log, held=held,
+                        settings=settings, log=log, held=held, done=done,
                         checkpointer=checkpointer)
 
     categories = policy_categories(policy)

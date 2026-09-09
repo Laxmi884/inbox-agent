@@ -14,7 +14,7 @@ from inbox_agent.models import (
     Action, ActionTemplate, Decision, ReviewResponse, Rule, Thread,
 )
 from inbox_agent.policy import Policy
-from inbox_agent.store import HeldQueue, PreferenceStore, build_store
+from inbox_agent.store import DoneStore, HeldQueue, PreferenceStore, build_store
 
 
 class FakeLLM:
@@ -46,7 +46,7 @@ def wiring(tmp_path, snapshot_file):
         prefs=PreferenceStore(build_store()),
         policy=Policy(text="TEST", version="local:test", source="local"),
         llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
-        held=HeldQueue(build_store()),
+        held=HeldQueue(build_store()), done=DoneStore(build_store()),
     )
 
 
@@ -422,6 +422,7 @@ def test_stale_threads_are_demoted_inside_the_pipeline(tmp_path):
                         llm=NeedsReply(), settings=settings,
                         log=AuditLog(settings.audit_log),
                         held=HeldQueue(build_store()),
+                        done=DoneStore(build_store()),
                         checkpointer=InMemorySaver())
     result = graph.invoke({"limit": 5, "mode": "backlog"},
                           {"configurable": {"thread_id": "stale-1"}})
@@ -466,6 +467,7 @@ def test_a_recent_needs_reply_still_stays_in_the_inbox(tmp_path):
                         llm=NeedsReply(), settings=settings,
                         log=AuditLog(settings.audit_log),
                         held=HeldQueue(build_store()),
+                        done=DoneStore(build_store()),
                         checkpointer=InMemorySaver())
     result = graph.invoke({"limit": 5, "mode": "backlog"},
                           {"configurable": {"thread_id": "fresh-1"}})
@@ -567,7 +569,7 @@ def test_two_runs_accumulate_held_items_rather_than_replacing_them(tmp_path):
         llm=FakeLLM(ThreadJudgment(category="other", action="archive", label=None,
                                    reason="unsure", confidence=0.2)),
         settings=settings, log=AuditLog(settings.audit_log), held=held,
-        checkpointer=InMemorySaver())
+        done=DoneStore(build_store()), checkpointer=InMemorySaver())
 
     graph.invoke({"limit": 1}, {"configurable": {"thread_id": "run-1"}})
     assert len(held.all()) == 1
@@ -641,7 +643,8 @@ def test_fetch_only_picks_unread_untriaged_inbox_mail(tmp_path):
         client=SnapshotGmailClient(snap), prefs=PreferenceStore(build_store()),
         policy=Policy(text="T", version="local:test", source="local"),
         llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
-        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+        held=HeldQueue(build_store()), done=DoneStore(build_store()),
+        checkpointer=InMemorySaver())
     result = graph.invoke({"limit": 10}, {"configurable": {"thread_id": "run-q"}})
     assert result["thread_ids"] == ["unread"]
 
@@ -669,7 +672,8 @@ def test_every_processed_thread_gets_the_triaged_label(tmp_path):
         llm=FakeLLM(ThreadJudgment(category="other", action="archive", label=None,
                                    reason="unsure", confidence=0.2)),
         settings=settings, log=log,
-        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+        held=HeldQueue(build_store()), done=DoneStore(build_store()),
+        checkpointer=InMemorySaver())
     graph.invoke({"limit": 2}, {"configurable": {"thread_id": "run-m"}})
     for tid in ("t1", "t2"):
         assert settings.triaged_label in client.get_thread(tid).label_ids
@@ -701,7 +705,8 @@ def test_auto_executed_thread_gets_both_the_action_and_the_triaged_label(tmp_pat
         client=client, prefs=PreferenceStore(build_store()),
         policy=Policy(text="T", version="local:test", source="local"),
         llm=FakeLLM(), settings=settings, log=AuditLog(settings.audit_log),
-        held=HeldQueue(build_store()), checkpointer=InMemorySaver())
+        held=HeldQueue(build_store()), done=DoneStore(build_store()),
+        checkpointer=InMemorySaver())
     graph.invoke({"limit": 1}, {"configurable": {"thread_id": "run-auto"}})
     labels = client.get_thread("t1").label_ids
     assert "INBOX" not in labels, "the auto-executed archive did not reach the client"

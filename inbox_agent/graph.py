@@ -15,6 +15,7 @@ import logging as log_module
 import operator
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated, Optional, TypedDict, get_args
 
 from langchain_core.runnables import RunnableConfig
@@ -26,14 +27,14 @@ from .audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_act
 from .classify import classify_batch
 from .config import Settings
 from .models import (
-    Action, ActionKind, ActionTemplate, Decision, ReviewItem, ReviewRequest,
-    ReviewResponse, Thread,
+    Action, ActionKind, ActionTemplate, Decision, DoneRecord, ReviewItem,
+    ReviewRequest, ReviewResponse, RunReport, Thread,
 )
 from .partition import partition
 from .policy import Policy
 from .prefilter import prefilter
 from .recency import demote_stale
-from .store import HeldQueue, PreferenceStore, rule_from_correction
+from .store import DoneStore, HeldQueue, PreferenceStore, rule_from_correction
 
 # Derived from the Literal itself, not a hand-copied list, so this can't
 # silently drift from ActionKind if it's ever extended.
@@ -187,6 +188,60 @@ def _run_actions(actions, *, decision, verdict, client, settings, log, context):
     return executed, refused
 
 
+def run_report_from_state(state: TriageState, *, triaged_label: str,
+                          now: Optional[datetime] = None) -> RunReport:
+    """What this run did, joined into one durable record.
+
+    Two sources, the same two the digest panel has always used. The audit
+    records say what actually went through the chokepoint - the only honest
+    answer to "what did you do" - but they know a thread by id, which is not
+    something the owner can read. The proposals carry the subject, the sender,
+    the category and the model's reason. A record whose thread is missing from
+    the proposals still gets a row, named by its id: an action with no visible
+    subject is strange, and hiding it would be worse.
+
+    Read off `review.items` rather than `auto`: in an incremental run the
+    executed set is a subset of `auto` and the two agree, and taking the whole
+    proposal list means a record can never lose its subject to a partition
+    detail.
+
+    .get() throughout, and never raising: this runs after the actions have
+    reached Gmail, so an exception here would cost the owner the report for
+    work that already happened.
+    """
+    request = ReviewRequest.model_validate(state["review"])
+    proposals = {i.thread_id: i for i in request.items}
+
+    rows: dict[str, DoneRecord] = {}
+    for record in state.get("executed", []):
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("action")
+        thread_id = record.get("thread_id")
+        if not kind or not thread_id:
+            continue
+        label = (record.get("params") or {}).get("label")
+        if kind == "label" and label == triaged_label:
+            continue    # bookkeeping on every thread, not work to report
+        row = rows.get(thread_id)
+        if row is None:
+            item = proposals.get(thread_id) or ReviewItem(
+                thread_id=thread_id, subject=thread_id, sender="", snippet="",
+                proposed=[], reason="", confidence=0.0, source="model")
+            row = DoneRecord(thread_id=thread_id, item=item)
+            rows[thread_id] = row
+        row.actions.append((kind, label))
+        actor = str(record.get("actor", ""))
+        if actor.startswith("rule:"):
+            row.rule_id = actor.split(":", 1)[1]
+
+    return RunReport(run_id=request.run_id,
+                     ran_at=now or datetime.now(timezone.utc),
+                     total=len(state.get("thread_ids", [])),
+                     remaining=int(state.get("remaining", 0) or 0),
+                     done=list(rows.values()))
+
+
 def build_graph(
     *,
     client,
@@ -196,6 +251,7 @@ def build_graph(
     settings: Settings,
     log: AuditLog,
     held: HeldQueue,
+    done: DoneStore,
     checkpointer=None,
 ):
     def _context(config: Optional[RunnableConfig]) -> ExecutionContext:
@@ -400,6 +456,9 @@ def build_graph(
         Scoped to `auto`, never to the whole queue. A /triage of 10 must not
         empty a queue holding 40 - threads this run never fetched are exactly
         the carry-over the queue exists for.
+
+        Also writes this run's RunReport: same node, same join, and the
+        record outlives the run.
         """
         run_id = ReviewRequest.model_validate(state["review"]).run_id
         for raw in state.get("auto", []):
@@ -410,6 +469,11 @@ def build_graph(
         for raw in state.get("held", []):
             held.add(ReviewItem.model_validate(raw["item"]),
                      run_id=run_id, reason=raw["reason"])
+        # The report goes here rather than in the bot because this node already
+        # holds `executed`, the proposals and the run id together - and a run
+        # gets its record whether or not Telegram drove it.
+        done.record(run_report_from_state(
+            state, triaged_label=settings.triaged_label))
         return {}
 
     def mark_triaged(state: TriageState, config: RunnableConfig) -> dict:
