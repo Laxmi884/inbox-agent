@@ -30,7 +30,8 @@ from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
 from ..store import DoneStore, HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
 from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
-                        confirm_trash_all, digest, done_panel, item_view)
+                        confirm_trash_all, digest, done_panel, item_view,
+                        runs_panel)
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -308,13 +309,33 @@ class Bot:
         self._panel = "digest"
         self._show(edit=False)
 
+    def _show_runs(self) -> None:
+        """The last runs, as a new message, running nothing.
+
+        A new message rather than an edit for the reason /held is one: editing
+        would replace what an earlier run reported, and the owner scrolling back
+        would find a different run in its place.
+        """
+        self._page = 0
+        self._message_id = None
+        self._digest_id = self._new_digest_id()
+        self._run_report = False
+        self._done_run = None
+        self._panel = "runs"
+        self._show(edit=False)
+
     def _show(self, *, edit: bool) -> None:
         view = self._view(run_report=self._run_report)
         if self._panel == "item":
             text, keyboard = self._item_screen()
+        elif self._panel == "runs":
+            text, keyboard = runs_panel(self.done.recent(),
+                                        digest_id=self._digest_id,
+                                        now=datetime.now(timezone.utc))
         elif self._panel == "done":
             view.done = self._done_items()
-            text, keyboard = done_panel(view, self._done_page)
+            text, keyboard = done_panel(view, self._done_page,
+                                        back_to_runs=self._done_run is not None)
         else:
             text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
@@ -884,6 +905,8 @@ class Bot:
             self._start(limit)
         elif command == "/held":
             self._show_queue()
+        elif command == "/done":
+            self._show_runs()
         elif command == "/status":
             self._status()
         elif command == "/cancel":
@@ -891,7 +914,7 @@ class Bot:
         else:
             self.transport.send_message(
                 self.chat_id,
-                "Commands: /triage [n] · /held · /status · /cancel")
+                "Commands: /triage [n] · /held · /done · /status · /cancel")
 
     def _start(self, limit: int) -> None:
         # Say something before the four minutes of silence, not after. A run is
@@ -1135,6 +1158,22 @@ class Bot:
             return
         if intent.kind == "list":
             self._panel = "digest"
+            # Back to the digest is back to now: leaving a past run selected
+            # would stamp the live screen with an old run's counts.
+            self._done_run = None
+            self._show(edit=True)
+            return
+        if intent.kind == "runs":
+            self._panel = "runs"
+            self._done_run = None
+            self._show(edit=True)
+            return
+        if intent.kind == "run":
+            # A position in the list that was drawn, never a run id: the same
+            # index -> identity boundary every other button here respects.
+            self._done_run = intent.index or 0
+            self._done_page = 0
+            self._panel = "done"
             self._show(edit=True)
             return
         if intent.kind == "open":

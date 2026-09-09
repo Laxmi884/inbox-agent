@@ -229,6 +229,27 @@ def test_bulk_trash_codes_stay_inside_the_64_byte_callback_limit():
     assert len(encode("trash_all_go", digest_id="7f2a").encode()) <= 64
 
 
+# --- the run list -------------------------------------------------------
+# Index-based like every other position here: an 8-character run_id plus a
+# digest id plus a kind does not reliably fit in 64 bytes.
+
+def test_runs_and_run_round_trip():
+    from inbox_agent.telegram.callbacks import decode, encode
+    assert decode(encode("runs", digest_id="ab12")).kind == "runs"
+    intent = decode(encode("run", 2, digest_id="ab12"))
+    assert (intent.kind, intent.index, intent.digest_id) == ("run", 2, "ab12")
+
+
+def test_a_run_callback_without_an_index_is_a_noop():
+    from inbox_agent.telegram.callbacks import decode
+    assert decode("U:ab12").kind == "noop"
+
+
+def test_a_runs_callback_carrying_an_index_is_a_noop():
+    from inbox_agent.telegram.callbacks import decode
+    assert decode("u:1:ab12").kind == "noop"
+
+
 def test_a_refused_callback_says_so_in_the_log(caplog):
     """A tap the bot declines to parse must leave a trace.
 

@@ -2036,3 +2036,102 @@ def test_edit_message_still_raises_every_other_400():
     transport._post = fake_post
     with pytest.raises(TelegramError):
         transport.edit_message(1, 2, "text", None)
+
+
+# --- /done: the run list, and corrections on a past run ---------------------
+# The condition the schedule going live was waiting on: the runs the owner was
+# not watching stay correctable, not just the last one this process happened
+# to do.
+
+def test_done_with_no_runs_says_so(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/done"))
+    assert "No runs" in t.sent[-1]["text"]
+
+
+def test_done_lists_the_run_that_just_happened(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    t.sent.clear()
+    b.handle_update(msg("/done"))
+    text = t.sent[-1]["text"]
+    assert text.startswith("Done · last 1 run")
+    assert "4 threads" in text
+
+
+def test_opening_a_past_run_shows_what_it_did(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    panel = t.edited[-1]["text"]
+    assert "Sale 0" in panel and "archive" in panel
+
+
+def test_back_from_a_past_run_returns_to_the_run_list(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    assert any("Back to the runs" in label
+               for row in t.edited[-1]["keyboard"] for label, _ in row)
+    b.handle_update(cb(encode("runs", digest_id=b._digest_id)))
+    assert t.edited[-1]["text"].startswith("Done · last")
+
+
+def test_a_correction_on_a_past_run_teaches_the_same_rule(bot):
+    """The whole point: a run three slots ago is still correctable."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    # A second run, so the first is no longer the live one.
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    runs = b.done.recent()
+    assert len(runs) == 2
+    oldest = len(runs) - 1
+    b.handle_update(cb(encode("run", oldest, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rules = b.prefs.rules()
+    assert rules, "correcting a past run taught nothing"
+    assert "Learned" in t.edited[-1]["text"]
+
+
+def test_a_past_runs_item_screen_shows_the_model_reason(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    assert "a sale" in t.edited[-1]["text"]
+
+
+def test_a_tap_from_a_superseded_run_list_is_refused(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    stale = b._digest_id
+    b.handle_update(msg("/done"))            # a new list, new digest id
+    t.sent.clear()
+    b.handle_update(cb(encode("run", 0, digest_id=stale)))
+    assert t.answered[-1]["text"].startswith("That digest is out of date")
+
+
+def test_corrections_from_a_past_run_never_touch_gmail(bot):
+    """A purged thread must report plainly, not raise. Nothing here re-fetches:
+    _thread_for builds the Thread from what is on screen."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+
+    class Exploding:
+        def get_thread(self, *a, **k): raise AssertionError("re-fetched Gmail")
+        def __getattr__(self, name): raise AssertionError("touched Gmail")
+
+    b.client = Exploding()
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    assert b.prefs.rules()
