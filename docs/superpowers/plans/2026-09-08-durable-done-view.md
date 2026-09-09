@@ -292,7 +292,7 @@ class DoneStore:
 - [ ] **Step 5: Run the new tests, then the suite**
 
 Run: `python -m pytest tests/test_done_store.py -q`
-Expected: PASS (8 tests).
+Expected: PASS (7 tests).
 Run: `python -m pytest -q`
 Expected: PASS, no regressions.
 

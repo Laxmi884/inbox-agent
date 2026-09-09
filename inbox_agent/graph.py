@@ -471,7 +471,9 @@ def build_graph(
                      run_id=run_id, reason=raw["reason"])
         # The report goes here rather than in the bot because this node already
         # holds `executed`, the proposals and the run id together - and a run
-        # gets its record whether or not Telegram drove it.
+        # gets its record whether or not Telegram drove it. Backlog runs
+        # (review → execute → mark_triaged) skip this node and write no report,
+        # which is intentional since /backlog is unwired.
         done.record(run_report_from_state(
             state, triaged_label=settings.triaged_label))
         return {}
