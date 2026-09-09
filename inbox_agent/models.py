@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 ActionKind = Literal["label", "unlabel", "archive", "trash", "draft", "none"]
 Verdict = Literal["approve", "reject", "edit"]
@@ -190,6 +190,48 @@ class HeldItem(BaseModel):
     first_held_at: datetime
     hold_reason: str
     item: ReviewItem
+
+
+class DoneRecord(BaseModel):
+    """One thread a run acted on, and what it did to it.
+
+    Embeds the whole ReviewItem for the reason HeldItem does: ReviewItem is
+    already the renderer's contract, and re-declaring subject and sender here
+    would give the report two shapes to render instead of one. It also happens
+    to carry every field the correction path reads - `category` and `reason`
+    come free with it, and `rule_id` says which rule to demote when the owner
+    overrules it.
+
+    `actions` is (kind, label) pairs, the shape DoneItem already renders and
+    counts, so the panel does not parse a string it just formatted.
+    """
+    thread_id: str
+    item: ReviewItem
+    actions: list[tuple[str, Optional[str]]] = Field(default_factory=list)
+    rule_id: Optional[str] = None
+
+
+class RunReport(BaseModel):
+    """What one run did, addressed by the run's own id.
+
+    `total` and `remaining` live here rather than being left in graph state so
+    a past run's digest header renders identically to a live one, with no
+    special case for "this run is not the current one".
+    """
+    run_id: str
+    ran_at: datetime
+    total: int = 0
+    remaining: int = 0
+    done: list[DoneRecord] = Field(default_factory=list)
+
+    @field_validator("ran_at")
+    @classmethod
+    def _aware(cls, value: datetime) -> datetime:
+        """Naive in, UTC out. Reports are sorted against each other by this
+        field, and comparing a naive datetime to an aware one raises - a crash
+        in the one place whose whole job is to still be there after a restart.
+        """
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 class ReviewResponse(BaseModel):
