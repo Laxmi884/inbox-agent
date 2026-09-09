@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from ..models import HeldItem, ReviewRequest
+from ..models import HeldItem, ReviewRequest, RunReport
 from ..render import LOW_CONFIDENCE, NO_REASON
 from .callbacks import encode
 
@@ -432,7 +432,67 @@ def _done_actions(item: DoneItem) -> str:
     return _oneline(rendered, _ACTION_CAP)
 
 
-def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
+# One tap reaches ten runs; more rows than that is a wall of numbers on a phone.
+RUNS_PAGE_SIZE = 10
+
+
+def _run_when(ran_at: datetime, now: datetime) -> str:
+    """"today 15:00", or "6 Sep 15:00" once it is not today any more."""
+    local = ran_at.astimezone()
+    if local.date() == now.astimezone().date():
+        return f"today {local.strftime('%H:%M')}"
+    return local.strftime("%-d %b %H:%M")
+
+
+def _run_summary(report: RunReport) -> str:
+    """"22 threads · 18 archive · 2 label" - the digest header, one line long."""
+    by_kind: dict[str, int] = {}
+    for record in report.done:
+        for kind, _label in record.actions:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+    counts = " · ".join(f"{count} {kind}"
+                        for kind, count in sorted(by_kind.items(),
+                                                  key=lambda kv: -kv[1]))
+    threads = f"{report.total} thread" + ("" if report.total == 1 else "s")
+    # Never an empty tail: a run that did nothing must not read as a run whose
+    # report went missing.
+    return f"{threads} · {counts}" if counts else f"{threads} · did nothing"
+
+
+def runs_panel(reports: Sequence[RunReport], *, digest_id: str,
+               now: datetime) -> tuple[str, list]:
+    """The last runs, newest first, one tap from what each of them did.
+
+    The only new screen in this feature: everything below it is the done panel
+    and the item screen that already existed, pointed at a stored run instead of
+    at the last one this process happened to do.
+    """
+    window = list(reports)[:RUNS_PAGE_SIZE]
+    if not window:
+        return ("No runs recorded yet.\n\n"
+                "The next scheduled run will leave one here.",
+                [[("↩ Back to the digest", encode("list", digest_id=digest_id))]])
+
+    lines = [f"Done · last {len(window)} run" + ("" if len(window) == 1 else "s")]
+    for number, report in enumerate(window, start=1):
+        lines.append(f"{number}. {_run_when(report.ran_at, now)} · "
+                     f"{_run_summary(report)}")
+
+    keyboard: list[list[tuple[str, str]]] = []
+    row: list[tuple[str, str]] = []
+    for offset in range(len(window)):
+        row.append((str(offset + 1), encode("run", offset, digest_id=digest_id)))
+        if len(row) == 5:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([("↩ Back to the digest", encode("list", digest_id=digest_id))])
+    return "\n".join(lines)[:TG_MAX_TEXT], keyboard
+
+
+def done_panel(view: DigestView, page: int = 0, *,
+              back_to_runs: bool = False) -> tuple[str, list]:
     """The list behind the digest's "Show the N done" button.
 
     The digest says "33 archive · 17 label". That tells the owner a label
@@ -544,9 +604,14 @@ def done_panel(view: DigestView, page: int = 0) -> tuple[str, list]:
     if nav:
         keyboard.append(nav)
     # Always last, always present: a screen with no way out is a trap on a
-    # phone, where there is no Escape key.
-    keyboard.append([("↩ Back to the digest",
-                      encode("list", digest_id=view.digest_id))])
+    # phone, where there is no Escape key. It returns where the owner came
+    # from - the run list for a past run, the digest for the live one.
+    if back_to_runs:
+        keyboard.append([("↩ Back to the runs",
+                          encode("runs", digest_id=view.digest_id))])
+    else:
+        keyboard.append([("↩ Back to the digest",
+                          encode("list", digest_id=view.digest_id))])
     return text, keyboard
 
 

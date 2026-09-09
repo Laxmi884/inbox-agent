@@ -463,6 +463,79 @@ def test_an_empty_run_says_so_rather_than_rendering_an_empty_screen():
     assert "list" in kinds
 
 
+# --- the run list -------------------------------------------------------
+# The last ten runs, newest first, one tap from what each of them did. The
+# only new screen this feature adds: everything past it is the done panel
+# and the item screen, pointed at a stored run instead of the last one this
+# process happened to do.
+
+def test_runs_panel_lists_runs_newest_first_with_their_counts():
+    from datetime import datetime, timezone
+    from inbox_agent.models import DoneRecord, ReviewItem, RunReport
+    from inbox_agent.telegram.render_tg import runs_panel
+
+    now = datetime(2026, 9, 8, 16, 0, tzinfo=timezone.utc)
+
+    def row(tid, kinds):
+        return DoneRecord(
+            thread_id=tid,
+            item=ReviewItem(thread_id=tid, subject="s", sender="a@b.com",
+                            snippet="", proposed=[], reason="r",
+                            confidence=0.9, source="model"),
+            actions=[(k, None) for k in kinds])
+
+    reports = [
+        RunReport(run_id="aaa", ran_at=now.replace(hour=15), total=22,
+                  done=[row("t1", ["archive"]), row("t2", ["archive", "label"])]),
+        RunReport(run_id="bbb", ran_at=now.replace(hour=12), total=9, done=[]),
+    ]
+    text, keyboard = runs_panel(reports, digest_id="ab12", now=now)
+    lines = text.splitlines()
+    assert lines[0].startswith("Done · last")
+    assert "22 threads" in lines[1] and "2 archive" in lines[1]
+    assert "1 label" in lines[1]
+    assert "9 threads" in lines[2] and "nothing" in lines[2]
+    # One numbered button per run, plus a way out.
+    flat = [b for row_ in keyboard for b in row_]
+    assert ("1", "U:0:ab12") in flat
+    assert ("2", "U:1:ab12") in flat
+    assert any("Back" in label for label, _ in flat)
+
+
+def test_runs_panel_says_so_when_there_are_no_runs():
+    from datetime import datetime, timezone
+    from inbox_agent.telegram.render_tg import runs_panel
+    text, keyboard = runs_panel([], digest_id="ab12",
+                                now=datetime(2026, 9, 8, tzinfo=timezone.utc))
+    assert "No runs" in text
+    assert keyboard, "a screen with no way out is a trap on a phone"
+
+
+def test_runs_panel_shows_at_most_ten_runs():
+    from datetime import datetime, timedelta, timezone
+    from inbox_agent.models import RunReport
+    from inbox_agent.telegram.render_tg import RUNS_PAGE_SIZE, runs_panel
+    now = datetime(2026, 9, 8, 16, 0, tzinfo=timezone.utc)
+    reports = [RunReport(run_id=f"r{i}", ran_at=now - timedelta(hours=i), total=i)
+               for i in range(RUNS_PAGE_SIZE + 2)]
+    text, keyboard = runs_panel(reports, digest_id="ab12", now=now)
+    numbered = [line for line in text.splitlines() if line[:1].isdigit()]
+    assert len(numbered) == RUNS_PAGE_SIZE
+    assert numbered[0].startswith("1. ")
+
+
+def test_done_panel_can_go_back_to_the_run_list():
+    # done_view() and done() are this file's existing helpers, above.
+    _text, keyboard = done_panel(done_view([done("t1")]), 0, back_to_runs=True)
+    assert keyboard[-1][0][1].startswith("u:"), "Back did not return to the runs"
+    assert "runs" in keyboard[-1][0][0]
+
+
+def test_done_panel_still_goes_back_to_the_digest_by_default():
+    _text, keyboard = done_panel(done_view([done("t1")]))
+    assert keyboard[-1][0][1].startswith("L:"), "the live panel lost its way back"
+
+
 # --- paged ------------------------------------------------------------------
 
 def test_paged_shows_one_item_with_position():

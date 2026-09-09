@@ -19,12 +19,19 @@ from typing import Optional
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.sqlite import SqliteStore
 
-from .models import ActionKind, ActionTemplate, HeldItem, ReviewItem, Rule, Thread
+from .models import (ActionKind, ActionTemplate, HeldItem, ReviewItem, RunReport,
+                     Rule, Thread)
 
 RULES_NS = ("prefs", "rules")
 INSTRUCTIONS_NS = ("prefs", "instructions")
 SENDERS_NS = ("prefs", "senders")
 HELD_NS = ("held", "items")
+DONE_NS = ("done", "reports")
+
+# Ten runs, not a time window: at five slots a day that is two days, and a count
+# is robust to the bot being off in a way a window is not - after a quiet
+# weekend ten runs are still ten runs where "the last 48 hours" is empty.
+MAX_REPORTS = 10
 
 # BaseStore.search() defaults to limit=10. rules() pages through with an
 # explicit limit and offset until a page comes back short, so the rule set is
@@ -542,3 +549,42 @@ class HeldQueue:
         page = _search_all(self._store, HELD_NS)
         items = [HeldItem.model_validate(entry.value["held"]) for entry in page]
         return sorted(items, key=lambda h: h.first_held_at)
+
+
+class DoneStore:
+    """What each run did, kept past the run after it.
+
+    Same bargain as HeldQueue, and it shares HeldQueue's store: store-agnostic,
+    its own namespace, no embedding index. A run report has no `text` field for
+    a semantic index to key off, so it belongs beside the held items rather than
+    beside the rules - and a third sqlite file would be a third object threaded
+    through build_graph and Bot for no gain.
+
+    Retention is MAX_REPORTS deep, pruned oldest-first on WRITE. Never on read:
+    the write already touches the store, and a read that mutates would make
+    /done surprising to reason about.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def record(self, report: RunReport) -> RunReport:
+        self._store.put(DONE_NS, report.run_id,
+                        {"report": report.model_dump(mode="json")})
+        for stale in self._all()[MAX_REPORTS:]:
+            self._store.delete(DONE_NS, stale.run_id)
+        return report
+
+    def get(self, run_id: str) -> Optional[RunReport]:
+        entry = self._store.get(DONE_NS, run_id)
+        return RunReport.model_validate(entry.value["report"]) if entry else None
+
+    def recent(self, limit: int = MAX_REPORTS) -> list[RunReport]:
+        """The last runs, newest first - the order /done lists them in."""
+        return self._all()[:limit]
+
+    def _all(self) -> list[RunReport]:
+        page = _search_all(self._store, DONE_NS)
+        reports = [RunReport.model_validate(entry.value["report"])
+                   for entry in page]
+        return sorted(reports, key=lambda r: r.ran_at, reverse=True)

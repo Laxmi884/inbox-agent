@@ -10,6 +10,7 @@ are covered where they now live - at the graph level in tests/test_graph.py and
 at the boundary in tests/test_tg_callbacks.py.
 """
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,9 +21,10 @@ from inbox_agent.classify import ThreadJudgment
 from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph
-from inbox_agent.models import ActionTemplate, Action, ReviewItem, Rule
+from inbox_agent.models import (ActionTemplate, Action, DoneRecord, ReviewItem,
+                                RunReport, Rule)
 from inbox_agent.policy import Policy
-from inbox_agent.store import HeldQueue, PreferenceStore, build_store
+from inbox_agent.store import DoneStore, HeldQueue, PreferenceStore, build_store
 from inbox_agent.telegram.bot import Bot
 from inbox_agent.telegram.callbacks import decode, encode
 
@@ -80,7 +82,13 @@ def bot(tmp_path, snapshot_file):
     # One queue, shared by the graph that fills it and the bot that renders it.
     # Two instances over two stores would let the bot show an empty queue while
     # the graph quietly filled another one.
-    held = HeldQueue(build_store())
+    from inbox_agent.store import DoneStore
+    work = build_store()
+    held = HeldQueue(work)
+    # The report store the graph writes and the bot reads. One instance, like
+    # the queue: two would let the bot show an empty /done while the graph
+    # filled another.
+    done = DoneStore(work)
     # One store, shared by the graph that reads rules and the bot that writes
     # them - two instances would let a correction land where nothing reads it.
     prefs = PreferenceStore(build_store())
@@ -89,10 +97,10 @@ def bot(tmp_path, snapshot_file):
                         prefs=prefs,
                         policy=Policy(text="P", version="local:t", source="local"),
                         llm=FakeLLM(), settings=settings, log=log, held=held,
-                        checkpointer=InMemorySaver())
+                        done=done, checkpointer=InMemorySaver())
     t = FakeTransport()
     return Bot(transport=t, graph=graph, settings=settings, held=held,
-               prefs=prefs, client=client, log=log,
+               done=done, prefs=prefs, client=client, log=log,
                categories=["recruiter", "promotion"]), t, log
 
 
@@ -113,6 +121,68 @@ def review_item(tid="held-1", category="promotion", action="trash"):
                       snippet="s",
                       proposed=[Action(kind=action, thread_id=tid)],
                       reason="looks like junk", confidence=0.9, source="model")
+
+
+# --- the report survives a restart, /done does not -------------------------
+# _last_run was one in-memory attribute holding the last graph result: a later
+# run overwrote it and a restart emptied it, so with several scheduled runs a
+# day, most of them became uncorrectable. The report now lives in DoneStore,
+# addressed by run id, and these tests are the ones that would have caught it.
+
+def test_the_done_panel_does_not_read_the_graph_result(bot):
+    """_last_run is not what the report is built from any more."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = None                      # the restart, simulated in place
+    t.edited.clear()
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    panel = t.edited[-1]["text"]
+    assert "Sale 0" in panel, "the done panel came back empty without _last_run"
+
+
+def test_the_digest_header_counts_come_from_the_report(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = None
+    t.sent.clear()
+    b._show(edit=False)
+    digest_text = t.sent[-1]["text"]
+    # "Inbox · 15:00 · 4 threads" - the header the report now supplies.
+    assert "4 threads" in digest_text, "the run's thread count did not survive"
+
+
+def test_a_fresh_bot_over_the_same_store_still_reports_the_run(bot):
+    """The test that would have caught the original defect.
+
+    A restart empties _last_run. Under the old code the panel is empty and the
+    correction below is impossible.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    run_id = b._report_run_id
+    assert run_id and b.done.get(run_id) is not None
+
+    reborn = Bot(transport=FakeTransport(), graph=b.graph, settings=b.settings,
+                 held=b.held, prefs=b.prefs, done=b.done, client=b.client,
+                 log=b.log, categories=b.categories)
+    report = reborn.done.get(run_id)
+    assert report is not None
+    assert {r.thread_id for r in report.done} == {"t0", "t1", "t2", "t3"}
+    # And the fields a correction needs are all on it.
+    row = report.done[0]
+    assert row.item.category == "promotion"
+    assert row.item.reason
+
+
+def test_a_correction_still_works_when_last_run_is_gone(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b._last_run = None
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    assert b.prefs.rules(), "the correction taught nothing"
 
 
 # --- authorisation ----------------------------------------------------------
@@ -178,51 +248,31 @@ def test_the_digest_shows_what_the_run_held(bot):
     assert "Subject held-1" in t.sent[-1]["text"]
 
 
-def test_the_done_counts_leave_out_the_triaged_label(bot):
-    """The triaged label is bookkeeping, not work the owner cares about.
+def test_a_rule_decided_action_is_counted_as_learning(bot):
+    """Counted per action, not per thread: a thread a rule both labelled and
+    archived is two pieces of work the rule did, exactly as the audit records
+    were counted before the report moved into the store.
 
-    Driven against _view() directly rather than through a run. mark_triaged
-    currently writes its records to the audit log without surfacing them into
-    state's `executed`, so an end-to-end version of this test passes just as
-    happily with the filter deleted - it pins nothing. A real label the owner
-    asked for is in here too, so the filter cannot be "drop all labels".
+    The bookkeeping-label filter and malformed-record resilience this test
+    used to also cover moved with the join itself, into
+    graph.run_report_from_state - see test_run_report.py. What is left for
+    _view() to get right is the arithmetic over an already-clean report.
     """
     b, t, _ = bot
-    b._last_run = {
-        "thread_ids": ["t0", "t1", "t2"],
-        "executed": [
-            {"action": "archive", "params": {}, "actor": "agent"},
-            {"action": "label", "params": {"label": "work"}, "actor": "agent"},
-            {"action": "label", "params": {"label": b.settings.triaged_label},
-             "actor": "agent"},
-            {"action": "label", "params": {"label": b.settings.triaged_label},
-             "actor": "rule:r-1"},
-        ],
-    }
+    report = RunReport(run_id="r-count", ran_at=datetime.now(timezone.utc), total=2,
+                       done=[
+                           DoneRecord(thread_id="t0", item=review_item("t0"),
+                                      actions=[("archive", None)]),
+                           DoneRecord(thread_id="t1", item=review_item("t1"),
+                                      actions=[("label", "promotion"),
+                                              ("archive", None)],
+                                      rule_id="r-1"),
+                       ])
+    b.done.record(report)
+    b._report_run_id = "r-count"
     view = b._view()
-    assert view.done_by_kind == {"archive": 1, "label": 1}, view.done_by_kind
-    assert view.total == 3
-    # The rule-decided count must not credit the bookkeeping record either.
-    assert view.rule_decided == 0
-
-
-def test_a_rule_decided_action_is_counted_as_learning(bot):
-    b, t, _ = bot
-    b._last_run = {"thread_ids": ["t0"], "executed": [
-        {"action": "archive", "params": {}, "actor": "rule:r-1"},
-        {"action": "archive", "params": {}, "actor": "agent"}]}
-    assert b._view().rule_decided == 1
-
-
-def test_a_malformed_audit_record_does_not_take_the_digest_down(bot):
-    """This runs AFTER the graph executed. A crash here costs the owner the
-    report for work that already reached Gmail."""
-    b, t, _ = bot
-    b._last_run = {"thread_ids": ["t0"], "executed": [
-        {"actor": "agent"},                        # no action
-        {"action": "label", "params": None, "actor": "agent"},   # null params
-        {"action": "archive"}]}                    # no params, no actor
-    assert b._view().done_by_kind == {"label": 1, "archive": 1}
+    assert view.done_by_kind == {"label": 1, "archive": 2}
+    assert view.rule_decided == 2, "a rule's two actions on t1 are two, not one"
 
 
 def test_a_dry_run_digest_does_not_claim_the_work_was_done(bot):
@@ -266,8 +316,9 @@ def test_held_command_shows_the_queue_without_running_a_triage(bot):
 
 
 def test_held_does_not_re_report_the_previous_runs_work(bot):
-    """_last_run survives, so a naive /held stamps 08:00's counts with the
-    current clock - and does it again on every later /held."""
+    """_report_run_id survives a plain /held (it is only cleared by the next
+    /triage), so a naive /held would stamp 08:00's report with the current
+    clock - and do it again on every later /held."""
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
     assert "DONE" in t.sent[-1]["text"], "the run digest should report the run"
@@ -311,16 +362,7 @@ def test_the_panel_names_the_label_a_thread_was_given(bot):
     audit record knows the thread by id, and the owner does not."""
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    b._last_run = {
-        "thread_ids": ["t0"],
-        "auto": [review_item("t0", action="archive").model_dump(mode="json")],
-        "executed": [
-            {"thread_id": "t0", "action": "label",
-             "params": {"label": "recruiter"}, "actor": "agent"},
-            {"thread_id": "t0", "action": "archive", "params": {},
-             "actor": "agent"},
-        ],
-    }
+    _done_run(b, actions=(("label", "recruiter"), ("archive", None)))
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     text = t.edited[-1]["text"]
     assert "label(recruiter)" in text
@@ -330,31 +372,9 @@ def test_the_panel_names_the_label_a_thread_was_given(bot):
 def test_the_panel_credits_a_rule_that_decided_a_thread(bot):
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    b._last_run = {
-        "thread_ids": ["t0"],
-        "auto": [review_item("t0").model_dump(mode="json")],
-        "executed": [{"thread_id": "t0", "action": "archive", "params": {},
-                      "actor": "rule:r-123"}],
-    }
+    _done_run(b, actor="rule:r-123")
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
     assert "rule" in t.edited[-1]["text"].lower()
-
-
-def test_the_triaged_label_is_bookkeeping_and_stays_out_of_the_panel(bot):
-    """Same exclusion the counts already make. Every thread gets this label;
-    listing it would bury the work the owner actually cares about."""
-    b, t, _ = bot
-    b.handle_update(msg("/triage 4"))
-    b._last_run = {
-        "thread_ids": ["t0"],
-        "auto": [review_item("t0").model_dump(mode="json")],
-        "executed": [{"thread_id": "t0", "action": "label",
-                      "params": {"label": "agent/triaged"}, "actor": "agent"},
-                     {"thread_id": "t0", "action": "archive", "params": {},
-                      "actor": "agent"}],
-    }
-    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
-    assert "agent/triaged" not in t.edited[-1]["text"]
 
 
 def test_back_from_the_panel_returns_to_the_digest(bot):
@@ -563,15 +583,21 @@ def test_paging_the_digest_edits_one_message_instead_of_sending_many(bot):
 
 def _done_run(b, thread_id="t0", category="promotion", actions=(("archive", None),),
               actor="agent"):
-    """Put one known done item in front of the bot, so a verdict has something
-    to correct that the test controls."""
-    b._last_run = {
-        "thread_ids": [thread_id],
-        "auto": [review_item(thread_id, category=category).model_dump(mode="json")],
-        "executed": [{"thread_id": thread_id, "action": kind,
-                      "params": {"label": label} if label else {}, "actor": actor}
-                     for kind, label in actions],
-    }
+    """Put one known done record in the store and point the bot at it, so a
+    verdict has something to correct that the test controls.
+
+    Writes to b.done rather than b._last_run: that attribute is not what the
+    report is built from any more, and a test that still poked it would pass
+    against the very bug this file exists to catch.
+    """
+    rule_id = actor.split(":", 1)[1] if actor.startswith("rule:") else None
+    run_id = uuid.uuid4().hex
+    report = RunReport(run_id=run_id, ran_at=datetime.now(timezone.utc), total=1,
+                       done=[DoneRecord(thread_id=thread_id,
+                                        item=review_item(thread_id, category=category),
+                                        actions=list(actions), rule_id=rule_id)])
+    b.done.record(report)
+    b._report_run_id = run_id
 
 
 def test_tapping_a_number_opens_the_item(bot):
@@ -2010,3 +2036,102 @@ def test_edit_message_still_raises_every_other_400():
     transport._post = fake_post
     with pytest.raises(TelegramError):
         transport.edit_message(1, 2, "text", None)
+
+
+# --- /done: the run list, and corrections on a past run ---------------------
+# The condition the schedule going live was waiting on: the runs the owner was
+# not watching stay correctable, not just the last one this process happened
+# to do.
+
+def test_done_with_no_runs_says_so(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/done"))
+    assert "No runs" in t.sent[-1]["text"]
+
+
+def test_done_lists_the_run_that_just_happened(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    t.sent.clear()
+    b.handle_update(msg("/done"))
+    text = t.sent[-1]["text"]
+    assert text.startswith("Done · last 1 run")
+    assert "4 threads" in text
+
+
+def test_opening_a_past_run_shows_what_it_did(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    panel = t.edited[-1]["text"]
+    assert "Sale 0" in panel and "archive" in panel
+
+
+def test_back_from_a_past_run_returns_to_the_run_list(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    assert any("Back to the runs" in label
+               for row in t.edited[-1]["keyboard"] for label, _ in row)
+    b.handle_update(cb(encode("runs", digest_id=b._digest_id)))
+    assert t.edited[-1]["text"].startswith("Done · last")
+
+
+def test_a_correction_on_a_past_run_teaches_the_same_rule(bot):
+    """The whole point: a run three slots ago is still correctable."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    # A second run, so the first is no longer the live one.
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    runs = b.done.recent()
+    assert len(runs) == 2
+    oldest = len(runs) - 1
+    b.handle_update(cb(encode("run", oldest, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    rules = b.prefs.rules()
+    assert rules, "correcting a past run taught nothing"
+    assert "Learned" in t.edited[-1]["text"]
+
+
+def test_a_past_runs_item_screen_shows_the_model_reason(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    assert "a sale" in t.edited[-1]["text"]
+
+
+def test_a_tap_from_a_superseded_run_list_is_refused(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    b.handle_update(msg("/done"))
+    stale = b._digest_id
+    b.handle_update(msg("/done"))            # a new list, new digest id
+    t.sent.clear()
+    b.handle_update(cb(encode("run", 0, digest_id=stale)))
+    assert t.answered[-1]["text"].startswith("That digest is out of date")
+
+
+def test_corrections_from_a_past_run_never_touch_gmail(bot):
+    """A purged thread must report plainly, not raise. Nothing here re-fetches:
+    _thread_for builds the Thread from what is on screen."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+
+    class Exploding:
+        def get_thread(self, *a, **k): raise AssertionError("re-fetched Gmail")
+        def __getattr__(self, name): raise AssertionError("touched Gmail")
+
+    b.client = Exploding()
+    b.handle_update(msg("/done"))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
+    assert b.prefs.rules()

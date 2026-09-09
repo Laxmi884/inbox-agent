@@ -44,6 +44,12 @@ Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all",
                # Corrections on work already done. Each maps to exactly one
                # action sequence, so what gets taught is what the button said.
                "keep", "relabel", "teach_trash",
+               # The run list, and opening one run in it. Index-based like every
+               # other position here: an 8-character run_id plus a digest id
+               # plus a kind does not reliably fit in 64 bytes, and the
+               # digest_id guard already refuses a tap from a superseded list -
+               # which is exactly what a shifted run list is.
+               "runs", "run",
                # Filing, asked only after relabel chooses its new category:
                # the archive/keep decision the run made may have been a
                # consequence of the wrong category, so it gets asked again
@@ -74,6 +80,8 @@ _CODE_TO_KIND: dict[str, Kind] = {
     # Verdicts and their blast radius. Single characters because callback_data
     # is capped at 64 bytes and an index can reach three digits on a backlog.
     "k": "keep", "R": "relabel", "X": "teach_trash",
+    # The run list, and opening one run in it.
+    "u": "runs", "U": "run",
     # Filing question between choosing the category and choosing scope.
     "i": "keep_inbox", "F": "file_away",
     "s": "scope_narrow", "S": "scope_wide",
@@ -148,11 +156,11 @@ def decode(data: str) -> Intent:
         rest = rest[:-1]
 
     if kind in ("prev", "next", "approve_all", "list", "done",
-                "approve_attention", "trash_all", "trash_all_go"):
+                "approve_attention", "trash_all", "trash_all_go", "runs"):
         return Intent(kind, digest_id=digest_id) if not rest else Intent("noop")
 
     if kind in ("approve", "reject", "open", "keep", "teach_trash",
-                "keep_inbox", "file_away", "scope_narrow", "scope_wide"):
+                "keep_inbox", "file_away", "scope_narrow", "scope_wide", "run"):
         if len(rest) != 1:
             return Intent("noop")
         index = _parse(rest[0])
