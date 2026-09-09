@@ -25,9 +25,9 @@ from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_ac
 from ..config import Settings
 from ..doctor import alert_text, health_alerts, oauth_check
 from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
-                      Thread)
+                      RunReport, Thread)
 from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
-from ..store import HeldQueue, PreferenceStore, rule_from_correction
+from ..store import DoneStore, HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
 from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
                         confirm_trash_all, digest, done_panel, item_view)
@@ -49,8 +49,8 @@ class Bot:
     """Owns the graph, the checkpointer and the conversation with one human."""
 
     def __init__(self, *, transport, graph, settings: Settings,
-                 held: HeldQueue, prefs: PreferenceStore, client=None,
-                 log: Optional[AuditLog] = None,
+                 held: HeldQueue, done: DoneStore, prefs: PreferenceStore,
+                 client=None, log: Optional[AuditLog] = None,
                  categories: Sequence[str] = (), mode: Optional[str] = None,
                  policy_version: Optional[str] = None,
                  on_run: Optional[Callable[[datetime], None]] = None):
@@ -61,6 +61,11 @@ class Bot:
         # sides are looking at the same one - two instances over two stores
         # would let the bot show an empty queue while the graph filled another.
         self.held = held
+        # What each run did, outliving the run after it. Injected for the same
+        # reason the queue is: the graph writes it and the bot reads it, and two
+        # instances would let /done be permanently empty while runs filled
+        # another store.
+        self.done = done
         # The same store the graph reads rules from. A correction is a store
         # write, not a message through graph state, which is what makes the
         # learning loop independent of whether any run is parked.
@@ -111,7 +116,14 @@ class Bot:
         self._panel_before_item = "digest"
         # Counts runs actually started, so a test can assert that /held ran none.
         self._runs_started = 0
-        self._last_run: Optional[dict] = None   # the graph result for the digest
+        self._last_run: Optional[dict] = None   # the graph result, for the run flow
+        # Which run the screen is reporting. The report itself lives in the
+        # store, so this is an id and not a payload - that is what makes the
+        # DONE panel survive a later run and a restart.
+        self._report_run_id: Optional[str] = None
+        # Which past run is open, as a position in DoneStore.recent(). None
+        # means the screen is about the run this process just did.
+        self._done_run: Optional[int] = None
         self._intents: dict[int, Intent] = {}
         self._run = 0
         self.rejected_updates = 0
@@ -204,38 +216,49 @@ class Bot:
     def _new_digest_id(self) -> str:
         return uuid.uuid4().hex[:DIGEST_ID_LEN]
 
+    def _report(self) -> Optional[RunReport]:
+        """The run the screen is currently about.
+
+        Resolved on every read rather than cached: the store is the source of
+        truth, and a report held in an attribute is exactly the failure this
+        change exists to remove.
+        """
+        if self._done_run is not None:
+            runs = self.done.recent()
+            if 0 <= self._done_run < len(runs):
+                return runs[self._done_run]
+            return None
+        if not self._report_run_id:
+            return None
+        return self.done.get(self._report_run_id)
+
     def _view(self, *, run_report: bool = True) -> DigestView:
         """Assemble what the digest renders: this run's work plus the queue.
 
-        The done counts come from the audit records the run wrote, not from
-        graph state: the audit log is the durable record of what actually
-        reached Gmail, and it is the same source the undo path will read.
+        The done counts come from the run's persisted report, which is itself
+        built from the audit records the run wrote (graph.run_report_from_state)
+        - the audit log is the durable record of what actually reached Gmail,
+        and it is the same source the undo path will read.
 
-        `run_report=False` is /held, which ran nothing. `_last_run` still holds
-        the LAST run's result, and reporting it would stamp 08:00's counts with
-        the current clock - and again on every later /held. So /held reports no
-        run at all rather than someone else's.
+        `run_report=False` is /held, which ran nothing. Reporting the last run's
+        report would stamp 08:00's counts with the current clock - and again on
+        every later /held. So /held reports no run at all rather than someone
+        else's.
         """
-        result = self._last_run if run_report else None
+        report = self._report() if run_report else None
         done_by_kind: dict[str, int] = {}
         rule_decided = 0
-        for record in (result or {}).get("executed", []):
-            # .get() throughout: a malformed record must not raise here. This
-            # runs AFTER the graph executed, so an exception costs the owner the
-            # digest for work that already reached Gmail - the one moment a
-            # crash is most expensive and least recoverable.
-            kind = record.get("action")
-            if not kind:
-                continue
-            if kind == "label" and (record.get("params") or {}).get(
-                    "label") == self.settings.triaged_label:
-                continue  # bookkeeping, not work the owner cares about
-            done_by_kind[kind] = done_by_kind.get(kind, 0) + 1
-            if str(record.get("actor", "")).startswith("rule:"):
-                rule_decided += 1
+        for record in (report.done if report else []):
+            for kind, _label in record.actions:
+                done_by_kind[kind] = done_by_kind.get(kind, 0) + 1
+            if record.rule_id:
+                # Counted per action, exactly as the audit records were: a
+                # thread a rule both labelled and archived is two pieces of work
+                # the rule did, and the header has always said so.
+                rule_decided += len(record.actions)
         return DigestView(
-            run_at=datetime.now(timezone.utc),
-            total=len((result or {}).get("thread_ids", [])),
+            run_at=report.ran_at if report else datetime.now(timezone.utc),
+            total=report.total if report else 0,
             done_by_kind=done_by_kind,
             rule_decided=rule_decided,
             held=self.held.all(),
@@ -244,58 +267,33 @@ class Bot:
             # that says so is on the terminal; the digest is on the phone.
             dry_run=bool(self.settings.dry_run),
             run_report=run_report,
-            remaining=int((result or {}).get("remaining", 0)),
+            remaining=report.remaining if report else 0,
         )
 
     def _done_items(self) -> list[DoneItem]:
         """What the run did, per thread, for the panel behind the button.
 
-        Two sources, deliberately. The audit records say what actually went
-        through the chokepoint - the only honest answer to "what did you do" -
-        but they know a thread by id, which is not something the owner can read.
-        The proposals in `auto` carry the subject and the sender. A record whose
-        thread is missing from `auto` still gets a row, named by its id: an
-        action with no visible subject is strange, and hiding it would be worse.
-
-        .get() throughout, like _view, and for the same reason: this runs after
-        the graph executed, so an exception here costs the owner the report for
-        work that already happened.
+        The join happened when the report was written (graph.run_report_from_state);
+        this is the screen's shape of it. The rule note is resolved here rather
+        than stored, because a rule can be corrected after the run and what the
+        owner needs to judge is what it says NOW.
         """
-        result = self._last_run or {}
-        known: dict[str, dict] = {}
-        for raw in result.get("auto", []):
-            if isinstance(raw, dict) and raw.get("thread_id"):
-                known[raw["thread_id"]] = raw
-
-        rows: dict[str, DoneItem] = {}
-        for record in result.get("executed", []):
-            kind = record.get("action")
-            thread_id = record.get("thread_id")
-            if not kind or not thread_id:
-                continue
-            label = (record.get("params") or {}).get("label")
-            if kind == "label" and label == self.settings.triaged_label:
-                continue    # bookkeeping on every thread, not work to report
-            item = rows.get(thread_id)
-            if item is None:
-                proposal = known.get(thread_id, {})
-                item = DoneItem(thread_id=thread_id,
-                                subject=proposal.get("subject") or thread_id,
-                                sender=proposal.get("sender") or "",
-                                snippet=proposal.get("snippet") or "")
-                rows[thread_id] = item
-            item.actions.append((kind, label))
-            actor = str(record.get("actor", ""))
-            if actor.startswith("rule:"):
+        report = self._report()
+        items: list[DoneItem] = []
+        for record in (report.done if report else []):
+            item = DoneItem(thread_id=record.thread_id,
+                            subject=record.item.subject or record.thread_id,
+                            sender=record.item.sender,
+                            snippet=record.item.snippet,
+                            actions=[tuple(a) for a in record.actions])
+            if record.rule_id:
                 item.from_rule = True
-                item.rule_id = actor.split(":", 1)[1]
-                # In the rule's own terms rather than the audit sentence: the
-                # rule may have been corrected since, and what the owner needs
-                # to judge is what it says NOW.
-                rule = self._rule(item.rule_id)
+                item.rule_id = record.rule_id
+                rule = self._rule(record.rule_id)
                 item.rule_note = (f"{rule.scope} {rule.pattern} → {rule.summary}"
                                   if rule else "")
-        return list(rows.values())
+            items.append(item)
+        return items
 
     def _show_queue(self) -> None:
         """The current queue, as a new message, running nothing.
@@ -365,10 +363,11 @@ class Bot:
             self._panel = self._panel_before_item
             return digest(self._view(run_report=self._run_report), self._page)
         kind, item = opened
+        report = self._report()
         why = ""
-        for raw in (self._last_run or {}).get("auto", []):
-            if isinstance(raw, dict) and raw.get("thread_id") == item.thread_id:
-                why = raw.get("reason") or ""
+        for record in (report.done if report else []):
+            if record.thread_id == item.thread_id:
+                why = record.item.reason or ""
         actions_text = ", ".join(f"{k}({v})" if v else k for k, v in item.actions)
         return item_view(item.subject, item.sender, actions_text, why,
                          digest_id=self._digest_id, index=self._open_index,
@@ -721,9 +720,11 @@ class Bot:
         self._ask_scope(intent.kind, item, category)
 
     def _category_of(self, thread_id: str) -> str:
-        for raw in (self._last_run or {}).get("auto", []):
-            if isinstance(raw, dict) and raw.get("thread_id") == thread_id:
-                return raw.get("category") or "other"
+        report = self._report()
+        for record in (report.done if report else []):
+            if record.thread_id == thread_id:
+                return record.item.category or "other"
+        # Still the queue's job when the thread was held rather than done.
         held = self.held.get(thread_id)
         return (held.item.category if held else "other") or "other"
 
@@ -751,11 +752,10 @@ class Bot:
                 f"Taught {taught} · {hits}, {overs}")
 
     def _rule_id_of(self, item: DoneItem) -> Optional[str]:
-        for record in (self._last_run or {}).get("executed", []):
-            if record.get("thread_id") == item.thread_id:
-                actor = str(record.get("actor", ""))
-                if actor.startswith("rule:"):
-                    return actor.split(":", 1)[1]
+        report = self._report()
+        for record in (report.done if report else []):
+            if record.thread_id == item.thread_id and record.rule_id:
+                return record.rule_id
         # A held item has no executed record to read an actor out of - being
         # held is precisely what stopped it executing - so it carries the rule
         # id on the item instead. _open_item puts it there.
@@ -939,6 +939,8 @@ class Bot:
         self._run_report = True
         self._panel = "digest"
         self._done_page = 0
+        self._done_run = None
+        self._report_run_id = None
 
         log.info("triage start: limit=%s run=%s", limit, self._run)
         started = time.monotonic()
@@ -961,6 +963,9 @@ class Bot:
                               f"have run. /held to see the queue, /triage to "
                               f"retry." + failure_suffix)
             return False
+        # The run's own id, not the graph result: the report is in the store and
+        # this is how the screen addresses it.
+        self._report_run_id = ((self._last_run or {}).get("review") or {}).get("run_id")
         elapsed = time.monotonic() - started
         log.info("triage done in %.1fs: %s executed, %s held", elapsed,
                  len(self._last_run.get("executed", [])), len(self.held.all()))
