@@ -492,7 +492,7 @@ def runs_panel(reports: Sequence[RunReport], *, digest_id: str,
 
 
 def done_panel(view: DigestView, page: int = 0, *,
-              back_to_runs: bool = False) -> tuple[str, list]:
+              back_to_runs: bool = False, missing: bool = False) -> tuple[str, list]:
     """The list behind the digest's "Show the N done" button.
 
     The digest says "33 archive · 17 label". That tells the owner a label
@@ -542,7 +542,13 @@ def done_panel(view: DigestView, page: int = 0, *,
 
     if not items:
         head.append("")
-        head.append("This run executed nothing.")
+        # Same distinction _run_summary makes one screen up: a run that did
+        # nothing must not read as a run whose report went missing. An empty
+        # list means both, and only the caller knows which - a run pruned at
+        # MAX_REPORTS, or tapped from a list drawn before the prune, would
+        # otherwise claim the agent saw this mail and chose to leave it.
+        head.append("That run is no longer stored."
+                    if missing else "This run executed nothing.")
 
     lines = list(head)
     if window:

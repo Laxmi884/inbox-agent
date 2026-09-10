@@ -301,11 +301,18 @@ class Bot:
 
         The queue outlives runs, so looking at it must not require producing
         more work - and with no run, no run report (see _view's run_report).
+
+        _done_run is cleared here for the same reason _show_runs and
+        _run_triage clear it: leaving a past run selected means _report() keeps
+        returning it, so _category_of and _rule_id_of answer for THAT run and a
+        correction taken from the queue is filed under the wrong category and
+        demotes a rule that never touched the thread.
         """
         self._page = 0
         self._message_id = None
         self._digest_id = self._new_digest_id()
         self._run_report = False
+        self._done_run = None
         self._panel = "digest"
         self._show(edit=False)
 
@@ -334,8 +341,13 @@ class Bot:
                                         now=datetime.now(timezone.utc))
         elif self._panel == "done":
             view.done = self._done_items()
-            text, keyboard = done_panel(view, self._done_page,
-                                        back_to_runs=self._done_run is not None)
+            # `missing` only when a run WAS selected and no longer resolves:
+            # the live digest's own report legitimately has no rows on a run
+            # that executed nothing, and that sentence is the right one there.
+            text, keyboard = done_panel(
+                view, self._done_page,
+                back_to_runs=self._done_run is not None,
+                missing=self._done_run is not None and self._report() is None)
         else:
             text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
@@ -1157,10 +1169,16 @@ class Bot:
             self._show(edit=True)
             return
         if intent.kind == "list":
-            self._panel = "digest"
-            # Back to the digest is back to now: leaving a past run selected
-            # would stamp the live screen with an old run's counts.
-            self._done_run = None
+            # Back to the list the item was opened FROM, which is what
+            # _panel_before_item is for and what every other return path here
+            # already honours. Hard-coding the digest threw away a past run the
+            # owner had open, so each correction made from /done ended on the
+            # live digest and needed another /done to get back.
+            self._panel = self._panel_before_item
+            if self._panel == "digest":
+                # Back to the digest is back to now: leaving a past run
+                # selected would stamp the live screen with an old run's counts.
+                self._done_run = None
             self._show(edit=True)
             return
         if intent.kind == "runs":

@@ -600,6 +600,81 @@ def _done_run(b, thread_id="t0", category="promotion", actions=(("archive", None
     b._report_run_id = run_id
 
 
+def test_the_queue_stops_resolving_against_a_past_run(bot):
+    """_run_triage clears _done_run; _show_queue has to as well.
+
+    /done -> tap a run -> /held used to leave that run selected, so _report()
+    still returned it and _category_of read the OLD run's category for a thread
+    the queue holds under a different one. A verdict taken there is filed under
+    the wrong category and demotes whichever rule that run happened to use - a
+    rule with nothing to do with the thread. Silent, and it teaches.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    # An OLD run that filed t-shared as promotion, then the current run, which
+    # never saw that thread. Two runs is the whole point: with only one, the
+    # _report_run_id fallback resolves to the same report and hides the leak.
+    _done_run(b, thread_id="t-shared", category="promotion")
+    _done_run(b, thread_id="t-other")
+    # Meanwhile the queue holds t-shared, as a recruiter mail.
+    b.held.add(review_item("t-shared", category="recruiter"), run_id="r1",
+               reason="trash")
+    b.handle_update(cb(encode("runs", digest_id=b._digest_id)))
+    # recent() is newest-first, so index 1 is the old run.
+    b.handle_update(cb(encode("run", 1, digest_id=b._digest_id)))
+    assert b._category_of("t-shared") == "promotion", (
+        "the old run should be selected while its own panel is open")
+    b.handle_update(msg("/held"))
+    assert b._category_of("t-shared") == "recruiter", (
+        "the queue is still reporting the run the owner was just looking at")
+
+
+def test_back_from_an_item_stays_in_the_past_run(bot):
+    """↩ Back returns to the list the item was opened from.
+
+    _panel_before_item exists for exactly this, but the `list` branch ignored
+    it and hard-coded the digest, so opening an item inside a past run and
+    tapping Back landed on the live digest - rendered with run_report=False,
+    so no counts at all. Every correction made on a past run ended by throwing
+    that run away and needing another /done.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b, thread_id="t-old")
+    _done_run(b, thread_id="t-new")
+    old_run = b.done.recent()[1].run_id
+    b.handle_update(cb(encode("runs", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("run", 1, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    report = b._report()
+    assert report is not None and report.run_id == old_run, (
+        "Back threw the run away; the owner has to type /done again")
+
+
+def test_a_missing_run_does_not_read_as_a_run_that_did_nothing(bot):
+    """_run_summary is careful about this in the runs list - "a run that did
+    nothing must not read as a run whose report went missing" - and the panel
+    behind it was not. _report() returns None for an index that no longer
+    resolves, and an empty done list printed "This run executed nothing.": a
+    pruned or shifted run claiming, in the owner's own words, that the agent
+    touched their mail and chose to do nothing to it.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _done_run(b)
+    b.handle_update(cb(encode("runs", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("run", 0, digest_id=b._digest_id)))
+    # Pruned out from under the open panel: MAX_REPORTS reached, or a tap on a
+    # runs list drawn before the prune.
+    b._done_run = 9
+    b._show(edit=True)
+    text = t.edited[-1]["text"]
+    assert "executed nothing" not in text, (
+        "a run whose record is gone is claiming it ran and did nothing")
+    assert "no longer stored" in text
+
+
 def test_tapping_a_number_opens_the_item(bot):
     """The button that did nothing for two sessions."""
     b, t, _ = bot
