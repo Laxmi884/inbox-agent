@@ -6,7 +6,7 @@ package, `tests/` the suite, `docs/superpowers/` the specs and plans.
 
 ## Verify
 
-    python -m pytest        # 848 tests, ~5s, no network, no credentials needed
+    python -m pytest        # 973 tests, ~5s, no network, no credentials needed
 
 That is the whole feedback loop. It is fast enough to run after every change,
 so run it — a change is not done until it is green.
