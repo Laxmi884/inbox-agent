@@ -1,5 +1,6 @@
 """Every run leaves a record of what it did, written by the graph."""
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -135,3 +136,37 @@ def test_two_runs_leave_two_reports(wiring):
                           {"configurable": {"thread_id": "run-2"}})
     ids = [r.run_id for r in wiring["done"].recent()]
     assert set(ids) == {first["review"]["run_id"], second["review"]["run_id"]}
+
+
+# --- a report failure must not cost the run ---------------------------------
+
+class ExplodingDoneStore(DoneStore):
+    """A full disk, a row pydantic will not validate - the cause does not
+    matter, only that it raises where the report is written."""
+    def record(self, report):
+        raise RuntimeError("disk full")
+
+
+def test_a_failed_report_does_not_cost_the_triaged_label(wiring, tmp_path):
+    """The report is written between auto_execute and mark_triaged, so an
+    exception escaping it aborted graph.invoke AFTER the actions reached Gmail
+    and BEFORE the label landed - and the next run refetched those threads and
+    executed them a second time against the real mailbox. Losing the report is
+    the acceptable cost; acting twice on the owner's mail is not.
+
+    dry_run=False for the same reason as
+    test_graph.py::test_every_processed_thread_gets_the_triaged_label: the
+    dry-run branch never dispatches to the client, so watching the label
+    actually land takes a live run.
+    """
+    settings = replace(wiring["settings"], dry_run=False)
+    wired = wiring | {"settings": settings,
+                      "done": ExplodingDoneStore(build_store())}
+    graph = build_graph(**wired, checkpointer=InMemorySaver())
+
+    graph.invoke({"limit": 10, "mode": "incremental"},
+                 {"configurable": {"thread_id": "run-1"}})
+
+    for tid in ("t0", "t1"):
+        assert settings.triaged_label in wiring["client"].get_thread(tid).label_ids, (
+            "the run aborted before mark_triaged; the next run will re-execute it")

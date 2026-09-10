@@ -474,8 +474,22 @@ def build_graph(
         # gets its record whether or not Telegram drove it. Backlog runs
         # (review → execute → mark_triaged) skip this node and write no report,
         # which is intentional since /backlog is unwired.
-        done.record(run_report_from_state(
-            state, triaged_label=settings.triaged_label))
+        #
+        # Wrapped because this node sits between auto_execute and mark_triaged:
+        # the actions have already reached Gmail, and an exception here aborts
+        # the run BEFORE the triaged label lands, so the next run reclassifies
+        # and re-executes the whole batch against the real mailbox. A lost
+        # report costs one panel; a re-execution costs the owner twice.
+        #
+        # run_report_from_state documents itself as never raising, but nothing
+        # enforced that - model_validate and the pydantic row construction can -
+        # and done.record()'s sqlite write was never covered by the promise at
+        # all. The guarantee belongs here, where the cost of breaking it is.
+        try:
+            done.record(run_report_from_state(
+                state, triaged_label=settings.triaged_label))
+        except Exception:
+            _log.exception("run report failed; the run itself stands")
         return {}
 
     def mark_triaged(state: TriageState, config: RunnableConfig) -> dict:

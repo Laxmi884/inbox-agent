@@ -94,6 +94,18 @@ class Bot:
         self._message_id: Optional[int] = None
         self._page = 0
         self._digest_id = ""
+        # The digest id a RUN replaced, kept so a tap that queued while the loop
+        # was inside that run can be told what actually happened to it. The loop
+        # is single-threaded on purpose, so a run holds it for its whole
+        # duration - 1013s on 2026-09-09 - and every tap made in that window
+        # arrives only afterwards, against a digest the run has already
+        # superseded. "Out of date" is true but reads as the owner's mistake.
+        self._superseded_by_run = ""
+        # Whether that run was one nobody typed. Naming a scheduled run
+        # explains a delay the owner did not ask for; saying "scheduled" about
+        # the /triage they just typed is simply wrong, and reads as the bot
+        # blaming something else for its own four minutes.
+        self._superseded_was_scheduled = False
         # Whether the CURRENT message reports a run. False for a /held digest,
         # and it has to be state rather than an argument to _show: paging that
         # message re-renders it, and the DONE block must not reappear on page 2
@@ -301,11 +313,18 @@ class Bot:
 
         The queue outlives runs, so looking at it must not require producing
         more work - and with no run, no run report (see _view's run_report).
+
+        _done_run is cleared here for the same reason _show_runs and
+        _run_triage clear it: leaving a past run selected means _report() keeps
+        returning it, so _category_of and _rule_id_of answer for THAT run and a
+        correction taken from the queue is filed under the wrong category and
+        demotes a rule that never touched the thread.
         """
         self._page = 0
         self._message_id = None
         self._digest_id = self._new_digest_id()
         self._run_report = False
+        self._done_run = None
         self._panel = "digest"
         self._show(edit=False)
 
@@ -334,8 +353,13 @@ class Bot:
                                         now=datetime.now(timezone.utc))
         elif self._panel == "done":
             view.done = self._done_items()
-            text, keyboard = done_panel(view, self._done_page,
-                                        back_to_runs=self._done_run is not None)
+            # `missing` only when a run WAS selected and no longer resolves:
+            # the live digest's own report legitimately has no rows on a run
+            # that executed nothing, and that sentence is the right one there.
+            text, keyboard = done_panel(
+                view, self._done_page,
+                back_to_runs=self._done_run is not None,
+                missing=self._done_run is not None and self._report() is None)
         else:
             text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
@@ -949,15 +973,26 @@ class Bot:
             suffix = " Not retrying; the next scheduled run is the next attempt."
         log.info("scheduled triage for slot %s", slot.isoformat())
         return self._run_triage(self.settings.snapshot_size,
-                                failure_suffix=suffix)
+                                failure_suffix=suffix, scheduled=True)
 
-    def _run_triage(self, limit: int, *, failure_suffix: str = "") -> bool:
-        """The run itself, with no announcement and no schedule bookkeeping."""
+    def _run_triage(self, limit: int, *, failure_suffix: str = "",
+                    scheduled: bool = False) -> bool:
+        """The run itself, with no announcement and no schedule bookkeeping.
+
+        `scheduled` only picks the wording of the superseded-tap refusal. It is
+        a parameter rather than something read back off the bot because this is
+        the one place both callers pass through, and the two of them are
+        exactly "a run nobody typed" and a run the owner did.
+        """
         self._run += 1
         self._runs_started += 1
         self._page = 0
         self._intents = {}
         self._message_id = None
+        # Before the new id, not after: taps made while this run holds the loop
+        # arrive against the OLD digest, and _on_callback needs to recognise it.
+        self._superseded_by_run = self._digest_id
+        self._superseded_was_scheduled = scheduled
         self._digest_id = self._new_digest_id()
         self._run_report = True
         self._panel = "digest"
@@ -1133,12 +1168,35 @@ class Bot:
             # different run in its place.
             log.info("re-rendered the queue for a callback from digest %r "
                      "(current %r)", intent.digest_id, self._digest_id)
-            self._ack(answer, "That digest is out of date - here is the "
-                              "current queue.")
+            # A tap that queued during a run is not the same event as a tap on
+            # last night's digest, and it is the common one now that a run holds
+            # the loop for minutes at a time. Naming the run explains the delay
+            # the owner just sat through; "out of date" alone reads as blame.
+            if intent.digest_id and intent.digest_id == self._superseded_by_run:
+                if self._superseded_was_scheduled:
+                    self._ack(answer, "A scheduled run finished while you were "
+                                      "tapping - here is the current queue.")
+                else:
+                    # The owner typed this one and watched it run. Telling them
+                    # a schedule did it denies the thing they just witnessed.
+                    self._ack(answer, "Your triage run finished while you were "
+                                      "tapping - here is the current queue.")
+            else:
+                self._ack(answer, "That digest is out of date - here is the "
+                                  "current queue.")
             self._show_queue()
             return
 
         self._ack(answer)
+        # Every refusal above logs; an accepted tap used to log nothing, so an
+        # empty log meant BOTH "the tap worked" and "the tap never arrived".
+        # On 2026-09-09 telling those apart took byte counters off the socket -
+        # the bot was healthy and idle-polling, and the taps had never reached
+        # Telegram at all. One line here is the difference between that and a
+        # glance at the log.
+        log.info("callback %s%s on digest %r (panel %s)", intent.kind,
+                 "" if intent.index is None else f"[{intent.index}]",
+                 intent.digest_id, self._panel)
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
@@ -1157,10 +1215,16 @@ class Bot:
             self._show(edit=True)
             return
         if intent.kind == "list":
-            self._panel = "digest"
-            # Back to the digest is back to now: leaving a past run selected
-            # would stamp the live screen with an old run's counts.
-            self._done_run = None
+            # Back to the list the item was opened FROM, which is what
+            # _panel_before_item is for and what every other return path here
+            # already honours. Hard-coding the digest threw away a past run the
+            # owner had open, so each correction made from /done ended on the
+            # live digest and needed another /done to get back.
+            self._panel = self._panel_before_item
+            if self._panel == "digest":
+                # Back to the digest is back to now: leaving a past run
+                # selected would stamp the live screen with an old run's counts.
+                self._done_run = None
             self._show(edit=True)
             return
         if intent.kind == "runs":
