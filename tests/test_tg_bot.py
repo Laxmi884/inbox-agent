@@ -23,11 +23,12 @@ from inbox_agent.config import ALWAYS_FORBIDDEN, Settings
 from inbox_agent.gmail import SnapshotGmailClient
 from inbox_agent.graph import build_graph
 from inbox_agent.models import (ActionTemplate, Action, DoneRecord, ReviewItem,
-                                RunReport, Rule)
+                                ReviewRequest, RunReport, Rule)
 from inbox_agent.policy import Policy
 from inbox_agent.store import DoneStore, HeldQueue, PreferenceStore, build_store
 from inbox_agent.telegram.bot import Bot
 from inbox_agent.telegram.callbacks import decode, encode
+from inbox_agent.telegram.render_tg import TG_MAX_TEXT
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
@@ -40,13 +41,30 @@ class FakeLLM:
 
 
 class FakeTransport:
-    """Records what the bot would have sent."""
+    """Records what the bot would have sent, and refuses what Telegram would.
+
+    The 4096-character limit is the one part of the real transport a fake has
+    to model. Without it every screen in this file passed at three items, while
+    the two that grow with the queue - bulk trash and bulk approve - went over
+    the wall at around fifty, where Telegram answers 400 AFTER the mail has
+    been acted on and the queue drained. A fake that accepts anything makes a
+    green suite evidence of nothing on exactly the screens that matter most.
+    """
     def __init__(self):
         self.sent, self.edited, self.answered = [], [], []
+
+    @staticmethod
+    def _within_limit(text):
+        assert len(text or "") <= TG_MAX_TEXT, (
+            f"Telegram would reject this with 400: {len(text or '')} chars "
+            f"against a limit of {TG_MAX_TEXT}. Budget the screen in render_tg.")
+
     def send_message(self, chat_id, text, keyboard=None):
+        self._within_limit(text)
         self.sent.append({"chat_id": chat_id, "text": text, "keyboard": keyboard})
         return {"message_id": 100 + len(self.sent)}
     def edit_message(self, chat_id, message_id, text, keyboard=None):
+        self._within_limit(text)
         self.edited.append({"chat_id": chat_id, "message_id": message_id,
                             "text": text, "keyboard": keyboard})
     def answer_callback(self, callback_id, text=""):
@@ -2275,3 +2293,243 @@ def test_an_unrelated_stale_tap_still_says_out_of_date(bot):
     t.answered.clear()
     b.handle_update(cb(encode("done", digest_id="dead")))
     assert t.answered[-1]["text"].startswith("That digest is out of date")
+
+
+# --- the audit of 2026-09-10 -----------------------------------------------
+#
+# Four defects, all of them at the Telegram edge and all of them the same
+# shape: the graph's discipline stopped at the graph boundary, and the bot's
+# held-item path re-implemented execution, rendering and provenance without
+# the properties the originals were carrying. Each test below is the one that
+# would have caught its defect.
+
+
+def _queue(b, n, reason, kind, subject="Your weekly digest of things nobody asked for"):
+    """A queue big enough to be realistic. Every screen here grows with it."""
+    from inbox_agent.models import Action, ReviewItem
+    for i in range(n):
+        tid = f"q{i}"
+        b.held.add(ReviewItem(thread_id=tid, category=reason,
+                              subject=f"{subject} {i}",
+                              sender=f"{tid}@newsletter.example.com", snippet="s",
+                              proposed=[Action(kind=kind, thread_id=tid)],
+                              reason="r", confidence=0.9, source="model"),
+                   run_id="r1", reason=reason)
+
+
+# 1. A tapped correction must land on the item the tap named.
+#
+# `_pending` survives a "Back" tap, and every method completing a correction
+# resolved the item from self._open_index rather than from the callback. Start
+# a correction on A, back out, open B, let A's scope button arrive: A's actions
+# executed against B, B drained from the queue, and a durable rule written
+# about B's sender - all from a tap whose own data said A.
+
+def test_a_scope_tap_never_teaches_about_a_different_item(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "AAA", kind="label", label="recruiter")
+    _held_of(b, "security_alert", "BBB", kind="draft")
+    d = b._digest_id
+
+    b.handle_update(cb(encode("open", 0, digest_id=d)))     # AAA
+    b.handle_update(cb(encode("keep", 0, digest_id=d)))     # verdict on AAA
+    b.handle_update(cb(encode("list", digest_id=d)))        # back out
+    b.handle_update(cb(encode("open", 1, digest_id=d)))     # BBB now on screen
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=d)))   # says item 0
+
+    assert not any("bbb@x.com" in r.pattern for r in b.prefs.rules()), \
+        "taught a rule about the item the tap did not name"
+    assert {h.thread_id for h in b.held.all()} == {"AAA", "BBB"}, \
+        "drained an item the tap did not name"
+    assert "changed nothing" in t.edited[-1]["text"]
+
+
+def test_a_scope_tap_never_acts_on_a_different_thread(bot):
+    """The other half: the rule is the durable damage, the action is the
+    immediate one. AAA's label must not reach BBB, a security alert."""
+    b, t, log = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "AAA", kind="label", label="recruiter")
+    _held_of(b, "security_alert", "BBB", kind="draft")
+    d = b._digest_id
+    b.handle_update(cb(encode("open", 0, digest_id=d)))
+    b.handle_update(cb(encode("keep", 0, digest_id=d)))
+    b.handle_update(cb(encode("list", digest_id=d)))
+    b.handle_update(cb(encode("open", 1, digest_id=d)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=d)))
+    assert not [r for r in log.records() if r.thread_id == "BBB"], \
+        "acted on a thread the tap did not name"
+
+
+def test_a_filing_tap_never_lands_on_a_different_item(bot):
+    """Same defect, the other completing method. relabel asks the filing
+    question first, so _set_filing is reachable with a stale pending verdict."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "AAA", kind="label", label="recruiter")
+    _held_of(b, "needs_reply", "BBB", kind="draft")
+    d = b._digest_id
+    b.handle_update(cb(encode("open", 0, digest_id=d)))
+    b.handle_update(cb(encode("relabel", 0, 0, digest_id=d)))   # verdict on AAA
+    b.handle_update(cb(encode("list", digest_id=d)))
+    b.handle_update(cb(encode("open", 1, digest_id=d)))
+    b.handle_update(cb(encode("file_away", 0, digest_id=d)))
+    assert "changed nothing" in t.edited[-1]["text"]
+    assert b._pending is None
+
+
+def test_a_correction_completed_without_interruption_still_works(bot):
+    """The guard must refuse the crossed tap and nothing else: the ordinary
+    path - open, verdict, scope - is what the whole screen is for."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "needs_reply", "AAA", kind="label", label="recruiter")
+    d = b._digest_id
+    b.handle_update(cb(encode("open", 0, digest_id=d)))
+    b.handle_update(cb(encode("keep", 0, digest_id=d)))
+    b.handle_update(cb(encode("scope_narrow", 0, digest_id=d)))
+    assert "Learned:" in t.edited[-1]["text"]
+    assert any("aaa@x.com" in r.pattern for r in b.prefs.rules())
+
+
+# 2. A bulk result screen must fit in one Telegram message.
+#
+# confirm_trash_all budgets against TG_MAX_TEXT; its result screen was built
+# inline in the bot, one uncapped line per item, and went over at around fifty
+# - a 400 that arrives after every thread has been trashed and drained.
+
+def test_the_bulk_trash_result_fits_in_one_message(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _queue(b, 60, "trash", "trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all_go", digest_id=b._digest_id)))
+    assert len(t.edited[-1]["text"]) <= TG_MAX_TEXT
+
+
+def test_the_bulk_approve_result_fits_in_one_message(bot):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _queue(b, 60, "needs_reply", "draft")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+    assert len(t.edited[-1]["text"]) <= TG_MAX_TEXT
+
+
+def test_the_bulk_result_counts_what_did_not_fit(bot):
+    """Truncating is honest only if it says so. A screen that quietly showed
+    forty of sixty would read as forty threads acted on."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _queue(b, 60, "trash", "trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all_go", digest_id=b._digest_id)))
+    text = t.edited[-1]["text"]
+    assert "did not fit" in text, text
+    assert "Trashed 60." in text, "lost the count that says how many went"
+    assert "0 left waiting" in text, "lost the count that says what remains"
+
+
+# 3. The record of a bulk approval outlives its screen.
+
+def test_a_bulk_approval_is_recorded_before_its_screen(bot):
+    """The screen was the only account of a batch, and the screen is the part
+    that fails. /done must be able to answer even if nothing was ever drawn."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _queue(b, 12, "trash", "trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    before = len(b.done.recent())
+    b.handle_update(cb(encode("trash_all", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("trash_all_go", digest_id=b._digest_id)))
+    reports = b.done.recent()
+    assert len(reports) == before + 1, "the batch left no durable record"
+    assert len(reports[0].done) == 12
+    assert [a for a in reports[0].done[0].actions] == [("trash", None)]
+
+
+def test_a_single_approval_does_not_evict_the_run_reports(bot):
+    """DoneStore keeps ten and prunes the oldest, so recording one report per
+    tap would cost the owner every triage run they might still correct."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "trash", "one", kind="trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    before = len(b.done.recent())
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    assert len(b.done.recent()) == before
+
+
+# 4. The audit record of a human approval names the policy that proposed it.
+
+def test_a_held_approval_records_the_policy_that_proposed_it(bot):
+    """Every action on this path - the trash tier, the security alerts - landed
+    with no policy, no backend and no model, while the archives the agent did
+    alone carried all three."""
+    b, t, log = bot
+    b.handle_update(msg("/triage 4"))
+    b.policy_version = "local:running"
+    b.held.add(review_item("held-p"), run_id="r1", reason="trash",
+               policy_version="local:proposed")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    rec = [r for r in log.records() if r.thread_id == "held-p"][-1]
+    assert rec.actor == "human"
+    assert rec.policy_version == "local:proposed", \
+        "named the policy loaded now, not the one that made the proposal"
+    assert rec.backend == "offline"
+
+
+def test_a_held_item_queued_before_policies_were_carried_still_records_one(bot):
+    """The field is defaulted for items already in the queue, so those fall
+    back to the running policy rather than to nothing at all."""
+    b, t, log = bot
+    b.handle_update(msg("/triage 4"))
+    b.policy_version = "local:running"
+    b.held.add(review_item("held-old"), run_id="r1", reason="trash")
+    _done_run(b)
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    b.handle_update(cb(encode("approve", 0, digest_id=b._digest_id)))
+    rec = [r for r in log.records() if r.thread_id == "held-old"][-1]
+    assert rec.policy_version == "local:running"
+
+
+def test_the_queue_carries_the_policy_the_run_proposed_under(bot):
+    """The graph half of it: enqueue_held stamps the item on the way in."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    _held_of(b, "trash", "stamped", kind="trash")
+    # Items the run itself held carry the run's policy; this one was injected.
+    b.held.add(review_item("from-run"), run_id="r1", reason="trash",
+               policy_version="local:t")
+    assert b.held.get("from-run").policy_version == "local:t"
+
+
+# 5. _resume refuses a batch it collected no verdicts for.
+
+def test_resume_refuses_to_blanket_approve_a_parked_batch(bot):
+    """The warning above _resume, made executable. to_response defaults every
+    unnamed thread to approve, and _intents has no writers left - so calling it
+    as it stands approves the whole sweep."""
+    b, t, _ = bot
+    request = ReviewRequest(run_id="r1", policy_version="local:t",
+                            items=[review_item("a"), review_item("b")])
+    b._intents = {}
+    with pytest.raises(RuntimeError, match="would approve all 2 threads"):
+        b._resume(request)
+
+
+def test_resume_allows_an_empty_batch(bot):
+    """Nothing to approve is not a blanket approval, and must not raise."""
+    b, t, _ = bot
+    b._intents = {}
+    b._resume(ReviewRequest(run_id="r1", policy_version="local:t", items=[]))

@@ -460,15 +460,21 @@ def build_graph(
         Also writes this run's RunReport: same node, same join, and the
         record outlives the run.
         """
-        run_id = ReviewRequest.model_validate(state["review"]).run_id
+        request = ReviewRequest.model_validate(state["review"])
+        run_id = request.run_id
         for raw in state.get("auto", []):
             thread_id = raw.get("thread_id") if isinstance(raw, dict) else None
             if thread_id:
                 # Absent is not an error, and most of these were never held.
                 held.remove(thread_id)
         for raw in state.get("held", []):
+            # The policy travels with the proposal. An item can wait in the
+            # queue across a policy edit, so the version loaded when the owner
+            # eventually approves it is not the version that proposed it - and
+            # the audit record is about the proposal.
             held.add(ReviewItem.model_validate(raw["item"]),
-                     run_id=run_id, reason=raw["reason"])
+                     run_id=run_id, reason=raw["reason"],
+                     policy_version=request.policy_version)
         # The report goes here rather than in the bot because this node already
         # holds `executed`, the proposals and the run id together - and a run
         # gets its record whether or not Telegram drove it. Backlog runs

@@ -190,6 +190,13 @@ class HeldItem(BaseModel):
     first_held_at: datetime
     hold_reason: str
     item: ReviewItem
+    # The policy the PROPOSAL was made under, so the audit record written when
+    # the owner finally approves it names that policy rather than whichever one
+    # happens to be loaded days later. A held item can wait across a policy
+    # edit - that is what a queue outliving runs means - so the two are
+    # genuinely different answers and only this one is true of the proposal.
+    # Defaulted, so items queued before this field existed still load.
+    policy_version: str = ""
 
 
 class DoneRecord(BaseModel):

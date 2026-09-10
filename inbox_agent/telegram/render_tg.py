@@ -627,6 +627,48 @@ _WHY_CAP = 300
 _SNIPPET_CAP = 110
 
 
+def bulk_result(headline: str, did: Sequence[str], *, verb: str,
+                remaining: int, digest_id: str) -> tuple[str, list]:
+    """What a one-tap bulk action actually did, inside one message.
+
+    This lives here rather than in the bot because it is the SECOND half of a
+    screen this module already draws the first half of, and the two halves were
+    not held to the same standard. `confirm_trash_all` budgets against
+    TG_MAX_TEXT and counts what it could not show; its result screen was built
+    inline in the bot, one uncapped line per item, and went over the wall at
+    around fifty. Telegram answers that with 400, which arrives AFTER every
+    thread has been trashed and drained from the queue - so the one screen that
+    says what happened is the one screen that could not be drawn.
+
+    The headline and the remainder are reserved before any item is charged, so
+    the two things the owner needs most - how many went, and how many are left -
+    are the two that cannot be pushed off the end by a long list.
+    """
+    head = [headline, ""]
+    tail = ["", f"{remaining} left waiting."]
+    keyboard = [[("↩ Back to the digest", encode("list", digest_id=digest_id))]]
+    if not did:
+        return "\n".join(head + ["Nothing to do."] + tail), keyboard
+
+    budget = TG_MAX_TEXT - len("\n".join(head + tail)) - len(_OVERFLOW % 999) - 2
+    used = 0
+    shown: list[str] = []
+    for entry in did:
+        line = f"{verb}: {entry}"
+        if used + len(line) + 1 > budget:
+            break
+        used += len(line) + 1
+        shown.append(line)
+
+    lines = head + shown
+    if len(shown) < len(did):
+        # Counted, never silently dropped: the difference between a line that
+        # did not fit and a thread that was not acted on is the whole of what
+        # this screen is for.
+        lines.append(_OVERFLOW % (len(did) - len(shown)))
+    return "\n".join(lines + tail)[:TG_MAX_TEXT], keyboard
+
+
 def confirm_trash_all(items, *, digest_id: str, dry_run: bool
                       ) -> tuple[str, list]:
     """The screen between "Trash all 6" and six threads in the bin.

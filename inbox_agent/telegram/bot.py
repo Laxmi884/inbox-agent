@@ -17,19 +17,19 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional, Sequence
+from typing import Callable, NamedTuple, Optional, Sequence
 
 from langgraph.types import Command
 
 from ..audit import AuditLog, ExecutionContext, ForbiddenActionError, execute_action
 from ..config import Settings
 from ..doctor import alert_text, health_alerts, oauth_check
-from ..models import (Action, ActionTemplate, ReviewItem, ReviewRequest, Rule,
-                      RunReport, Thread)
+from ..models import (Action, ActionTemplate, DoneRecord, ReviewItem,
+                      ReviewRequest, Rule, RunReport, Thread)
 from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
 from ..store import DoneStore, HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
-from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem,
+from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem, bulk_result,
                         confirm_trash_all, digest, done_panel, item_view,
                         runs_panel)
 
@@ -44,6 +44,22 @@ def _short(text: str, cap: int = 60) -> str:
     """
     flat = " ".join((text or "").split())
     return flat if len(flat) <= cap else flat[:cap - 1].rstrip() + "…"
+
+
+class HeldResult(NamedTuple):
+    """What executing one held item did: the sentence, and the pairs.
+
+    Two shapes because there are two consumers with different needs. The
+    sentence is for the screen. The pairs are for the DoneRecord, which counts
+    and renders (kind, label) rather than re-parsing a string it just
+    formatted - the same reason DoneRecord.actions is pairs in the first place.
+
+    A refusal appears in the sentence and NOT in the pairs: the owner needs to
+    be told the deny-list said no, and a report of what happened must not
+    record it as something that did.
+    """
+    summary: str = ""
+    actions: tuple = ()
 
 
 class Bot:
@@ -370,21 +386,31 @@ class Bot:
 
     # --- dispatch -----------------------------------------------------------
 
-    def _open_item(self) -> Optional[tuple[str, DoneItem]]:
-        """The item the owner tapped, and which list it came from.
+    def _open_item(self, index: Optional[int] = None
+                   ) -> Optional[tuple[str, DoneItem]]:
+        """The item at `index`, and which list it came from.
 
         Resolved against the list that was rendered, never from the callback -
         the callback carries a position precisely so a thread id cannot travel
-        in it.
+        in it. But the POSITION has to come from the callback, and for a while
+        it did not: every caller here read `self._open_index` instead, so a tap
+        that said item 0 was answered with whichever item happened to be open.
+        The index made the whole round trip - encoded, sent, decoded - and was
+        then dropped on the floor. See the guards in _teach and _set_filing for
+        what that cost.
+
+        `index=None` means "whatever is on screen", which is right for the
+        renderer and wrong for anything acting on a verdict.
         """
+        index = self._open_index if index is None else index
         if self._panel_before_item == "done":
             items = self._done_items()
-            if 0 <= self._open_index < len(items):
-                return "done", items[self._open_index]
+            if 0 <= index < len(items):
+                return "done", items[index]
             return None
         queue = sorted(self.held.all(), key=lambda h: h.first_held_at)
-        if 0 <= self._open_index < len(queue):
-            held = queue[self._open_index]
+        if 0 <= index < len(queue):
+            held = queue[index]
             return "held", DoneItem(
                 thread_id=held.thread_id, subject=held.item.subject,
                 sender=held.item.sender,
@@ -419,25 +445,31 @@ class Bot:
                          kind=kind, rule_detail=self._rule_detail(item),
                          categories=self.categories)
 
-    def _ask_scope(self, verdict: str, item: DoneItem, category: str) -> None:
+    def _ask_scope(self, verdict: str, item: DoneItem, category: str,
+                   index: int) -> None:
         """Verdict first, scope second.
 
         "Never archive this sender" and "never archive any valuable newsletter"
         are different instructions behind the same tap, and only the owner knows
         which was meant. Asking costs one tap; guessing costs a rule that
         reaches mail they never meant to include.
+
+        `index` is the position these buttons will come back carrying, and it
+        is the position of the item ON THIS SCREEN - passed in rather than read
+        from `self._open_index`, which can have moved by the time the answer
+        arrives.
         """
         text = (f"{item.subject}\n\nTeach this for…")
         keyboard = [
             [(f"Just {item.sender[:28]}",
-              encode("scope_narrow", self._open_index, digest_id=self._digest_id))],
+              encode("scope_narrow", index, digest_id=self._digest_id))],
             [(f"Every {category}",
-              encode("scope_wide", self._open_index, digest_id=self._digest_id))],
+              encode("scope_wide", index, digest_id=self._digest_id))],
             [("↩ Back", encode("list", digest_id=self._digest_id))],
         ]
         self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
-    def _ask_filing(self, item: DoneItem) -> None:
+    def _ask_filing(self, item: DoneItem, index: int) -> None:
         """Category first, filing second - asked unconditionally on relabel.
 
         A `learning` item stays in the inbox per policy, but the archive the
@@ -446,18 +478,68 @@ class Bot:
         predictable, and needs no reading of the policy to get right; the two
         answers are exact inverses of each other so a reader can predict
         either from the other.
+
+        `index` is passed in for the reason _ask_scope's is: these buttons come
+        back later, and they must come back naming the item that was on screen
+        when they were drawn.
         """
         text = f"{item.subject}\n\nKeep it in the inbox, or file it away?"
         keyboard = [
             [("Keep in inbox",
-              encode("keep_inbox", self._open_index, digest_id=self._digest_id))],
+              encode("keep_inbox", index, digest_id=self._digest_id))],
             [("File it away",
-              encode("file_away", self._open_index, digest_id=self._digest_id))],
+              encode("file_away", index, digest_id=self._digest_id))],
             [("↩ Back", encode("list", digest_id=self._digest_id))],
         ]
         self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
-    def _set_filing(self, *, file_away: bool) -> None:
+    def _pending_item(self, intent) -> Optional[tuple[str, DoneItem]]:
+        """The item this pending verdict is about, or None if it has moved on.
+
+        Three things must agree before a half-finished correction may be
+        completed: a verdict IS pending, the callback's position still resolves
+        to an item, and that item is the one the verdict was started on. The
+        third was missing, and it is the one that matters - `_pending` survives
+        a "↩ Back" tap, and every completing method used to resolve the item
+        from `self._open_index` rather than from the callback. Start a
+        correction on A, back out, open B, and let A's scope button arrive
+        (a double tap, or Telegram redelivering the callback): A's actions
+        executed against B, B drained from the queue, and a durable rule
+        written about B's sender. All three from a tap whose own data said A.
+
+        Compared by thread id rather than by index, because the index is only
+        as stable as the list under it: the queue can be re-sorted by a run
+        that lands in between, and then the same position is a different
+        thread. The id is what the owner was looking at.
+        """
+        pending = self._pending
+        if pending is None:
+            return None
+        opened = self._open_item(intent.index)
+        if opened is None:
+            return None
+        if pending.get("thread_id") != opened[1].thread_id:
+            return None
+        return opened
+
+    def _abandon_pending(self) -> None:
+        """Drop a correction that cannot be tied to its item, and say so.
+
+        Silence here is what made the mis-binding invisible: the wrong rule was
+        written and the screen looked like a success. Refusing has to look like
+        a refusal, and it has to say that nothing happened - which is the one
+        thing the owner needs in order to decide whether to do it again.
+        """
+        self._pending = None
+        self._panel = self._panel_before_item
+        self.transport.edit_message(
+            self.chat_id, self._message_id,
+            "That tap no longer matches the correction on screen, so it "
+            "changed nothing - nothing was taught and no mail was touched.\n\n"
+            "Open the thread again to correct it.",
+            [[("↩ Back to the digest", encode("list", digest_id=self._digest_id))]])
+
+    def _set_filing(self, *, file_away: bool, intent) -> None:
         """Apply the filing answer to the pending actions, then ask scope.
 
         Both branches start by stripping every archive AND trash - not just
@@ -472,20 +554,18 @@ class Bot:
         back exactly one archive. That makes the two genuinely exact
         inverses of the same starting point, not just of each other's name.
         """
-        pending = self._pending
-        if pending is None:
-            return
-        opened = self._open_item()
+        opened = self._pending_item(intent)
         if opened is None:
-            self._panel = self._panel_before_item
-            self._show(edit=True)
+            self._abandon_pending()
             return
+        pending = self._pending
         _kind, item = opened
         actions = [a for a in pending["actions"] if a.kind not in ("archive", "trash")]
         if file_away:
             actions = actions + [ActionTemplate(kind="archive")]
         pending["actions"] = actions
-        self._ask_scope(pending["verdict"], item, pending["category"])
+        self._ask_scope(pending["verdict"], item, pending["category"],
+                        pending["index"])
 
     def _held_verdict(self, intent) -> None:
         """Approve or refuse one held item, and drain it from the queue.
@@ -510,11 +590,16 @@ class Bot:
         item = queue[index]
 
         if intent.kind == "approve":
+            # No run report for a single approval, deliberately: DoneStore keeps
+            # ten reports and prunes the oldest, so ten one-tap approvals would
+            # evict every triage run the owner might still want to correct. The
+            # bulk paths get one because they are one batch, and because their
+            # screen is the only account of a batch - see _record_held_run.
             done = self._execute_held(item)
             # Never the word "done" for something that did not reach Gmail -
             # the same rule the digest's block title follows.
             verb = "Would have run" if self.settings.dry_run else "Ran"
-            summary = f"{verb}: {done}." if done else "Nothing to do."
+            summary = f"{verb}: {done.summary}." if done.summary else "Nothing to do."
         else:
             proposed = item.item.proposed[0].kind if item.item.proposed else "none"
             rule = rule_from_correction(
@@ -572,24 +657,23 @@ class Bot:
             return
 
         did: list[str] = []
+        ran: list[tuple] = []
         for item in attention:
             done = self._execute_held(item)
             self.held.remove(item.thread_id)
-            if done:
-                did.append(f"{_short(item.item.subject)} → {done}")
+            ran.append((item, done))
+            if done.summary:
+                did.append(f"{_short(item.item.subject)} → {done.summary}")
+        self._record_held_run(ran)
 
         # Never the word "done" for something that did not reach Gmail - the
         # same rule the digest's block title follows, and the same reason: the
         # banner saying dry_run is on is on a terminal, and this is on a phone.
         verb = "Would have run" if self.settings.dry_run else "Ran"
-        remaining = len(self.held.all())
-        lines = [f"Approved {len(attention)}.", ""]
-        lines += [f"{verb}: {line}" for line in did] or ["Nothing to do."]
-        lines += ["", f"{remaining} left waiting."]
-        self.transport.edit_message(
-            self.chat_id, self._message_id, "\n".join(lines),
-            [[("↩ Back to the digest",
-               encode("list", digest_id=self._digest_id))]])
+        text, keyboard = bulk_result(
+            f"Approved {len(attention)}.", did, verb=verb,
+            remaining=len(self.held.all()), digest_id=self._digest_id)
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
     def _trash_held(self) -> list:
         """Every held item proposed for trash, oldest first.
@@ -628,22 +712,51 @@ class Bot:
             self._show(edit=True)
             return
         did = []
+        ran: list[tuple] = []
         for item in items:
             done = self._execute_held(item)
             self.held.remove(item.thread_id)
-            if done:
-                did.append(f"{_short(item.item.subject)} → {done}")
+            ran.append((item, done))
+            if done.summary:
+                did.append(f"{_short(item.item.subject)} → {done.summary}")
+        self._record_held_run(ran)
         verb = "Would have run" if self.settings.dry_run else "Ran"
-        remaining = len(self.held.all())
-        lines = [f"Trashed {len(items)}.", ""]
-        lines += [f"{verb}: {line}" for line in did] or ["Nothing to do."]
-        lines += ["", f"{remaining} left waiting."]
-        self.transport.edit_message(
-            self.chat_id, self._message_id, "\n".join(lines),
-            [[("↩ Back to the digest",
-               encode("list", digest_id=self._digest_id))]])
+        text, keyboard = bulk_result(
+            f"Trashed {len(items)}.", did, verb=verb,
+            remaining=len(self.held.all()), digest_id=self._digest_id)
+        self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
-    def _execute_held(self, item, actions: Optional[list] = None) -> str:
+    def _record_held_run(self, done: Sequence[tuple]) -> None:
+        """Record what a bulk approval did, BEFORE its screen is drawn.
+
+        Held approvals happen outside the graph, so `enqueue_held` writes no
+        report for them and /done could not show them at all. That made the
+        confirmation message the single account of a batch - and the message is
+        the part that fails: over about fifty items it exceeded Telegram's
+        4096-character limit, which arrives as a 400 AFTER every thread has been
+        acted on and drained from the queue. The work happened, the queue was
+        empty, and nothing outside the audit JSONL said so.
+
+        Hence the ordering: the durable record first, the screen second. Wrapped
+        in the same terms as the graph's own report write, because putting it
+        first only helps if a store failure cannot itself cost the screen.
+        """
+        rows = [DoneRecord(thread_id=held.thread_id, item=held.item,
+                           actions=[tuple(pair) for pair in result.actions],
+                           rule_id=held.item.rule_id)
+                for held, result in done if result.actions]
+        if not rows:
+            return
+        try:
+            self.done.record(RunReport(
+                run_id=uuid.uuid4().hex[:8],
+                ran_at=datetime.now(timezone.utc),
+                total=len(done), done=rows))
+        except Exception:
+            log.exception("could not record what the bulk approval did; "
+                          "the actions themselves stand")
+
+    def _execute_held(self, item, actions: Optional[list] = None) -> HeldResult:
         """Push one held item's actions through the chokepoint.
 
         Returns what it did, in the digest's vocabulary, for the confirmation.
@@ -658,9 +771,23 @@ class Bot:
         an action that cannot name one.
         """
         if self.client is None or self.log is None:
-            return ""
-        context = ExecutionContext(policy_version=None, model=None, backend=None)
+            return HeldResult()
+        # The policy the PROPOSAL was made under, not whichever one is loaded
+        # now: a held item can wait in the queue across a policy edit, and the
+        # record is about the proposal the owner is answering. Falls back to
+        # the running policy for items queued before HeldItem carried one.
+        #
+        # These were all None, so every action on this path - which is the
+        # trash tier and the security alerts, the whole reason the queue exists
+        # - landed in the audit log with no policy, no backend and no model,
+        # while the archives the agent did alone carried all three. The trail
+        # was strongest exactly where the stakes were lowest.
+        context = ExecutionContext(
+            policy_version=item.policy_version or self.policy_version,
+            model=None,
+            backend=self.settings.backend)
         did = []
+        pairs: list[tuple[str, Optional[str]]] = []
         proposed = item.item.proposed if actions is None else [
             Action(kind=a.kind, thread_id=item.thread_id, params=dict(a.params or {}))
             for a in actions]
@@ -688,7 +815,8 @@ class Bot:
                 continue
             label = (action.params or {}).get("label")
             did.append(f"{action.kind}({label})" if label else action.kind)
-        return ", ".join(did)
+            pairs.append((action.kind, label))
+        return HeldResult(", ".join(did), tuple(pairs))
 
     def _verdict(self, intent) -> None:
         """Turn a tapped verdict into the action sequence it stands for.
@@ -698,7 +826,11 @@ class Bot:
         text. Nothing is written here: the scope question comes first, except
         for trash, which is sender-only by design.
         """
-        opened = self._open_item()
+        # The callback's own position, not whatever is on screen now. Every
+        # screen this verdict goes on to draw carries `index` forward, so the
+        # whole exchange - verdict, filing, scope - stays about one item.
+        index = self._open_index if intent.index is None else intent.index
+        opened = self._open_item(index)
         if opened is None:
             self._panel = self._panel_before_item
             self._show(edit=True)
@@ -710,7 +842,7 @@ class Bot:
             # First tap: which label? Second tap arrives as relabel with one.
             rows, row = [], []
             for i, name in enumerate(self.categories):
-                row.append((name, encode("relabel", self._open_index, i,
+                row.append((name, encode("relabel", index, i,
                                          digest_id=self._digest_id)))
                 if len(row) == 3:
                     rows.append(row); row = []
@@ -747,22 +879,27 @@ class Bot:
         else:
             actions = [ActionTemplate(kind="trash")]
 
+        # `thread_id` is what makes this verdict checkable when its answer
+        # comes back: a scope or filing tap has to prove it belongs to the item
+        # the verdict was started on, and only the id can say so. `index` is
+        # what the next screen's buttons carry.
         self._pending = {"verdict": intent.kind, "actions": actions,
-                         "category": category, "rule_id": self._rule_id_of(item)}
+                         "category": category, "rule_id": self._rule_id_of(item),
+                         "thread_id": item.thread_id, "index": index}
         if intent.kind == "teach_trash":
             # Sender-only, and not asked: a category-wide trash rule would
             # auto-execute trash across a whole class of future mail on one tap
             # (Plan 1's partition decision), which is a blast radius no single
             # correction should be able to reach.
-            self._teach(wide=False)
+            self._teach(wide=False, intent=intent)
             return
         if intent.kind == "relabel":
             # Asked every time, unconditionally: the filing the run chose may
             # have been a consequence of the wrong category, and there is no
             # policy-reading shortcut that is both simple and predictable.
-            self._ask_filing(item)
+            self._ask_filing(item, index)
             return
-        self._ask_scope(intent.kind, item, category)
+        self._ask_scope(intent.kind, item, category, index)
 
     def _category_of(self, thread_id: str) -> str:
         report = self._report()
@@ -806,7 +943,7 @@ class Bot:
         # id on the item instead. _open_item puts it there.
         return item.rule_id or None
 
-    def _teach(self, *, wide: bool) -> None:
+    def _teach(self, *, wide: bool, intent) -> None:
         """Write the rule the pending verdict describes, and say what it says.
 
         The confirmation names the rule in the digest's own vocabulary, because
@@ -824,14 +961,14 @@ class Bot:
         It never mentions undo: nothing here reverses anything, and under
         dry-run there was nothing to reverse in the first place.
         """
-        pending, self._pending = self._pending, None
-        if pending is None:
-            return
-        opened = self._open_item()
+        # Verified BEFORE the pending verdict is consumed: this both writes a
+        # durable rule and, on the held path, acts on a real thread, so it must
+        # refuse rather than fall through to whatever is on screen.
+        opened = self._pending_item(intent)
         if opened is None:
-            self._panel = self._panel_before_item
-            self._show(edit=True)
+            self._abandon_pending()
             return
+        pending, self._pending = self._pending, None
         kind, item = opened
         category = pending["category"]
         actions = pending["actions"]
@@ -875,10 +1012,11 @@ class Bot:
             # DoneItem is a view built for the screen and carries no proposal
             # to execute, and the queue is the thing _execute_held audits by.
             held = self.held.get(item.thread_id)
-            did = self._execute_held(held, actions) if held is not None else ""
+            did = (self._execute_held(held, actions) if held is not None
+                   else HeldResult())
             self.held.remove(item.thread_id)
             verb = "Would have run" if self.settings.dry_run else "Ran"
-            tail = (f"{verb}: {did}." if did else "Nothing to do.") + \
+            tail = (f"{verb}: {did.summary}." if did.summary else "Nothing to do.") + \
                    f"\n{len(self.held.all())} left waiting."
         else:
             tail = "That is for next time; this run is already done."
@@ -1215,6 +1353,11 @@ class Bot:
             self._show(edit=True)
             return
         if intent.kind == "list":
+            # Leaving the item abandons any half-finished correction on it.
+            # `_pending` used to survive this, so a scope answer arriving after
+            # the owner had moved on still had something to apply - the
+            # _pending_item guard refuses that now, and this stops it arising.
+            self._pending = None
             # Back to the list the item was opened FROM, which is what
             # _panel_before_item is for and what every other return path here
             # already honours. Hard-coding the digest threw away a past run the
@@ -1242,6 +1385,9 @@ class Bot:
             return
         if intent.kind == "open":
             # The screen the numbered buttons have always implied.
+            # A pending verdict belongs to the item it was started on, so
+            # opening a different one ends it: see the `list` branch above.
+            self._pending = None
             self._panel_before_item = self._panel
             self._panel = "item"
             self._open_index = intent.index or 0
@@ -1254,10 +1400,10 @@ class Bot:
             self._verdict(intent)
             return
         if intent.kind in ("keep_inbox", "file_away"):
-            self._set_filing(file_away=intent.kind == "file_away")
+            self._set_filing(file_away=intent.kind == "file_away", intent=intent)
             return
         if intent.kind in ("scope_narrow", "scope_wide"):
-            self._teach(wide=intent.kind == "scope_wide")
+            self._teach(wide=intent.kind == "scope_wide", intent=intent)
             return
         if intent.kind in ("approve_attention",):
             self._approve_attention()
@@ -1294,6 +1440,21 @@ class Bot:
     # tests/test_graph.py; nothing covers this method.
 
     def _resume(self, request: ReviewRequest) -> None:
+        # The warning above, made executable. A comment is the right place to
+        # explain why this is unsafe and the wrong place to enforce it: the
+        # edit that wires /backlog is one line, and whoever makes it is exactly
+        # the person who has not read twenty lines of prose first.
+        #
+        # An empty `_intents` over a non-empty batch is the blanket approval,
+        # so that is the condition. It refuses rather than warns, because the
+        # thing on the other side is a 500-thread historical sweep and the
+        # cheap failure is the one that does nothing.
+        if request.items and not self._intents:
+            raise RuntimeError(
+                f"_resume would approve all {len(request.items)} threads: no "
+                "verdicts were collected, and to_response defaults every "
+                "unnamed thread to approve. Rebuild verdict collection (Plan 3) "
+                "before wiring anything to this.")
         response = to_response(request, self._intents, self.categories)
         final = self.graph.invoke(
             Command(resume=response.model_dump(mode="json")), self._config)

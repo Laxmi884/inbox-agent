@@ -515,13 +515,16 @@ class HeldQueue:
         self._store = store
 
     def add(self, item: ReviewItem, *, run_id: str, reason: str,
+            policy_version: str = "",
             now: Optional[datetime] = None) -> HeldItem:
         """Hold `item`, preserving the original wait time if already held.
 
         Idempotent on thread_id: a thread the agent holds twice is one item that
         has been waiting since the first time, not two items. The content and
         the reason ARE refreshed, so a re-classified thread shows its current
-        proposal.
+        proposal - and so is `policy_version`, which belongs to the proposal
+        rather than to the wait: a re-judged thread was judged again, under
+        whatever policy was loaded that time.
         """
         existing = self.get(item.thread_id)
         held = HeldItem(
@@ -531,6 +534,7 @@ class HeldQueue:
             else (now or datetime.now(timezone.utc)),
             hold_reason=reason,
             item=item,
+            policy_version=policy_version,
         )
         self._store.put(HELD_NS, held.thread_id,
                         {"held": held.model_dump(mode="json")})
