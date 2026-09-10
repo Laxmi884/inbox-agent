@@ -10,6 +10,7 @@ are covered where they now live - at the graph level in tests/test_graph.py and
 at the boundary in tests/test_tg_callbacks.py.
 """
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -2210,3 +2211,67 @@ def test_corrections_from_a_past_run_never_touch_gmail(bot):
     b.handle_update(cb(encode("keep", 0, digest_id=b._digest_id)))
     b.handle_update(cb(encode("scope_narrow", 0, digest_id=b._digest_id)))
     assert b.prefs.rules()
+
+
+def test_an_accepted_tap_says_so_in_the_log(bot, caplog):
+    """Refusals logged; accepted taps did not. So an empty log meant both "the
+    tap worked" and "the tap never arrived", and on 2026-09-09 telling those
+    apart needed byte counters off the socket - the bot was idle-polling and the
+    taps had never reached Telegram. The asymmetry is the bug."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    with caplog.at_level(logging.INFO, logger="inbox_agent.telegram"):
+        b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("callback done" in line for line in lines), lines
+
+
+def test_an_accepted_tap_logs_the_position_it_carried(bot, caplog):
+    """The index is the whole payload of a numbered button, and the thing an
+    investigation into "it acted on the wrong thread" would need."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    with caplog.at_level(logging.INFO, logger="inbox_agent.telegram"):
+        b.handle_update(cb(encode("open", 0, digest_id=b._digest_id)))
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("callback open[0]" in line for line in lines), lines
+
+
+def test_a_tap_that_queued_during_a_run_names_the_run(bot):
+    """The loop is single-threaded, so a run holds it - 1013s on 2026-09-09 -
+    and every tap made in that window arrives after it, against the digest the
+    run just superseded. Both refusals are correct; only one of them explains
+    the delay the owner actually sat through."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    tapped = b._digest_id
+    b.run_scheduled(SLOT)                    # the run that supersedes it
+    t.answered.clear()
+    b.handle_update(cb(encode("done", digest_id=tapped)))
+    assert "scheduled run finished" in t.answered[-1]["text"]
+
+
+def test_a_tap_superseded_by_a_typed_run_does_not_blame_the_schedule(bot):
+    """The owner typed this run and sat through it. "A scheduled run finished"
+    denies the thing they just watched happen, and _superseded_by_run is set in
+    _run_triage, which /triage and the scheduler both go through - so the
+    scheduled wording fired for a run nobody scheduled."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    tapped = b._digest_id
+    b.handle_update(msg("/triage 4"))        # typed, not scheduled
+    t.answered.clear()
+    b.handle_update(cb(encode("done", digest_id=tapped)))
+    text = t.answered[-1]["text"]
+    assert "scheduled" not in text, text
+    assert "finished while you were tapping" in text
+
+
+def test_an_unrelated_stale_tap_still_says_out_of_date(bot):
+    """The run-aware wording must not swallow the general case: a tap from a
+    digest no run superseded is a different event and keeps its own message."""
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    t.answered.clear()
+    b.handle_update(cb(encode("done", digest_id="dead")))
+    assert t.answered[-1]["text"].startswith("That digest is out of date")

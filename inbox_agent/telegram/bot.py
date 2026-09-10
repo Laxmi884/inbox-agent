@@ -94,6 +94,18 @@ class Bot:
         self._message_id: Optional[int] = None
         self._page = 0
         self._digest_id = ""
+        # The digest id a RUN replaced, kept so a tap that queued while the loop
+        # was inside that run can be told what actually happened to it. The loop
+        # is single-threaded on purpose, so a run holds it for its whole
+        # duration - 1013s on 2026-09-09 - and every tap made in that window
+        # arrives only afterwards, against a digest the run has already
+        # superseded. "Out of date" is true but reads as the owner's mistake.
+        self._superseded_by_run = ""
+        # Whether that run was one nobody typed. Naming a scheduled run
+        # explains a delay the owner did not ask for; saying "scheduled" about
+        # the /triage they just typed is simply wrong, and reads as the bot
+        # blaming something else for its own four minutes.
+        self._superseded_was_scheduled = False
         # Whether the CURRENT message reports a run. False for a /held digest,
         # and it has to be state rather than an argument to _show: paging that
         # message re-renders it, and the DONE block must not reappear on page 2
@@ -961,15 +973,26 @@ class Bot:
             suffix = " Not retrying; the next scheduled run is the next attempt."
         log.info("scheduled triage for slot %s", slot.isoformat())
         return self._run_triage(self.settings.snapshot_size,
-                                failure_suffix=suffix)
+                                failure_suffix=suffix, scheduled=True)
 
-    def _run_triage(self, limit: int, *, failure_suffix: str = "") -> bool:
-        """The run itself, with no announcement and no schedule bookkeeping."""
+    def _run_triage(self, limit: int, *, failure_suffix: str = "",
+                    scheduled: bool = False) -> bool:
+        """The run itself, with no announcement and no schedule bookkeeping.
+
+        `scheduled` only picks the wording of the superseded-tap refusal. It is
+        a parameter rather than something read back off the bot because this is
+        the one place both callers pass through, and the two of them are
+        exactly "a run nobody typed" and a run the owner did.
+        """
         self._run += 1
         self._runs_started += 1
         self._page = 0
         self._intents = {}
         self._message_id = None
+        # Before the new id, not after: taps made while this run holds the loop
+        # arrive against the OLD digest, and _on_callback needs to recognise it.
+        self._superseded_by_run = self._digest_id
+        self._superseded_was_scheduled = scheduled
         self._digest_id = self._new_digest_id()
         self._run_report = True
         self._panel = "digest"
@@ -1145,12 +1168,35 @@ class Bot:
             # different run in its place.
             log.info("re-rendered the queue for a callback from digest %r "
                      "(current %r)", intent.digest_id, self._digest_id)
-            self._ack(answer, "That digest is out of date - here is the "
-                              "current queue.")
+            # A tap that queued during a run is not the same event as a tap on
+            # last night's digest, and it is the common one now that a run holds
+            # the loop for minutes at a time. Naming the run explains the delay
+            # the owner just sat through; "out of date" alone reads as blame.
+            if intent.digest_id and intent.digest_id == self._superseded_by_run:
+                if self._superseded_was_scheduled:
+                    self._ack(answer, "A scheduled run finished while you were "
+                                      "tapping - here is the current queue.")
+                else:
+                    # The owner typed this one and watched it run. Telling them
+                    # a schedule did it denies the thing they just witnessed.
+                    self._ack(answer, "Your triage run finished while you were "
+                                      "tapping - here is the current queue.")
+            else:
+                self._ack(answer, "That digest is out of date - here is the "
+                                  "current queue.")
             self._show_queue()
             return
 
         self._ack(answer)
+        # Every refusal above logs; an accepted tap used to log nothing, so an
+        # empty log meant BOTH "the tap worked" and "the tap never arrived".
+        # On 2026-09-09 telling those apart took byte counters off the socket -
+        # the bot was healthy and idle-polling, and the taps had never reached
+        # Telegram at all. One line here is the difference between that and a
+        # glance at the log.
+        log.info("callback %s%s on digest %r (panel %s)", intent.kind,
+                 "" if intent.index is None else f"[{intent.index}]",
+                 intent.digest_id, self._panel)
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
