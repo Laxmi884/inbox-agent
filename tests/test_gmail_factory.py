@@ -64,8 +64,11 @@ def test_the_live_client_is_given_a_per_thread_transport(monkeypatch, snapshot_d
     sentinel = object()
     monkeypatch.setattr("inbox_agent.google_auth.get_credentials",
                         lambda **k: sentinel)
+    # `timeout` is accepted, not ignored: the factory passes it, and a stub
+    # that could not would hide the regression this test exists to catch.
+    # What the deadline IS belongs to test_http_timeout.
     monkeypatch.setattr("inbox_agent.google_auth.authorized_http",
-                        lambda creds: ("http-for", creds))
+                        lambda creds, timeout=None: ("http-for", creds))
     monkeypatch.setattr("googleapiclient.discovery.build",
                         lambda *a, **k: object())
 

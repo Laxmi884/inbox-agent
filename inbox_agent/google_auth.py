@@ -219,15 +219,26 @@ def get_credentials(*, client_secrets_path: Path, token_path: Path,
     return creds
 
 
-def authorized_http(credentials):
-    """A FRESH transport bound to `credentials`.
+def authorized_http(credentials, timeout: float = 60.0):
+    """A FRESH transport bound to `credentials`, with a deadline.
 
     Called once per worker thread. httplib2.Http is not thread-safe and
     googleapiclient's service object holds exactly one, so a hydration pool
     sharing it corrupts SSL socket state - see LiveGmailClient._http, and the
     real-mailbox reproduction recorded there.
+
+    `timeout` is the second half of that lesson and was learned the harder way.
+    httplib2.Http() defaults to NO timeout, and a connection that goes
+    half-open then never raises: on 2026-09-11 one held the bot's MainThread in
+    ssl.read for five hours at 0% CPU, so the schedule stopped without a single
+    error line. _with_backoff cannot help - it retries calls that FAIL, and
+    this one simply never returned. The default here duplicates
+    Settings.http_timeout on purpose: this function is reachable from a
+    notebook and a REPL as well as the factory, and the wrong number of the two
+    is still finite, which is the property that matters.
     """
     import google_auth_httplib2
     import httplib2
 
-    return google_auth_httplib2.AuthorizedHttp(credentials, http=httplib2.Http())
+    return google_auth_httplib2.AuthorizedHttp(
+        credentials, http=httplib2.Http(timeout=timeout))

@@ -115,6 +115,10 @@ def run_checks(settings: Optional[Settings] = None) -> list[Check]:
                  note="no LLM backend available; classification cannot run"
                       if s.backend == "offline" else ""),
         _setting("INBOX_BODY_BUDGET", s.body_budget),
+        # The setting whose absence is invisible until it costs an
+        # afternoon: an unbounded socket stops the schedule with no
+        # error anywhere. A row here is the only place it is ever seen.
+        _setting("INBOX_HTTP_TIMEOUT", f"{s.http_timeout:g}s"),
         _setting("INBOX_TRIAGED_LABEL", s.triaged_label),
         _setting("INBOX_STORE_DIR", s.store_dir),
         _setting("INBOX_SCHEDULE",

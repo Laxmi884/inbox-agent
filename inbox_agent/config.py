@@ -108,6 +108,13 @@ class Settings:
     # forfeits a future one. Defaulted so an existing checkout with Ollama
     # running behaves exactly as it always has.
     embeddings: str = "auto"
+    # Seconds before a Gmail socket is given up on. NOT optional and not
+    # unbounded: httplib2.Http() defaults to no timeout, and on 2026-09-11 a
+    # half-open connection held MainThread in ssl.read for five hours, which
+    # silently stopped the schedule - _with_backoff never got a turn, because
+    # a call that cannot return cannot fail. 60s is well clear of a slow
+    # threads.get and far short of a lost afternoon. See test_http_timeout.
+    http_timeout: float = 60.0
     # Empty means log to stderr, which is right interactively and wrong under
     # launchd: nothing rotates a StandardErrorPath. See logging_setup.configure.
     log_file: str = ""
@@ -242,6 +249,32 @@ def _resolve_body_budget() -> int:
     return value
 
 
+def _resolve_http_timeout() -> float:
+    """Seconds a Gmail request may block before it is abandoned.
+
+    Refuses 0 and negatives rather than clamping. 0 is not "no limit" - to a
+    socket it means non-blocking, so every call would fail instantly, and an
+    operator typing it would reasonably expect the opposite. Unbounded is not
+    offered at all: that is precisely the configuration that wedged the bot,
+    and there is no legitimate reason to ask for it.
+    """
+    raw = os.getenv("INBOX_HTTP_TIMEOUT", "").strip()
+    if not raw:
+        return 60.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(
+            f"INBOX_HTTP_TIMEOUT={raw!r} is not a number. Give it seconds, "
+            "such as 60.") from None
+    if value <= 0:
+        raise ValueError(
+            f"INBOX_HTTP_TIMEOUT={raw!r} must be positive. 0 is a "
+            "non-blocking socket, not 'no limit', and unbounded is the "
+            "setting that wedged the bot on 2026-09-11.")
+    return value
+
+
 def _resolve_schedule() -> tuple[time, ...]:
     """Local times of day, sorted and de-duplicated.
 
@@ -301,6 +334,7 @@ def load_settings() -> Settings:
         google_token=Path(os.getenv("INBOX_GOOGLE_TOKEN", "secrets/token.json")),
         body_budget=_resolve_body_budget(),
         embeddings=_resolve_embeddings(),
+        http_timeout=_resolve_http_timeout(),
         tg_token=os.getenv("INBOX_TG_TOKEN", "").strip(),
         tg_chat_id=os.getenv("INBOX_TG_CHAT_ID", "").strip(),
         tg_mode=os.getenv("INBOX_TG_MODE", "digest").strip().lower(),
@@ -680,7 +714,9 @@ def _build_live_gmail_client(settings: Settings):
     # about threads - and every unit test still passes, because a fake has no
     # socket. See LiveGmailClient._http.
     return LiveGmailClient(
-        service, http_factory=lambda: google_auth.authorized_http(creds))
+        service,
+        http_factory=lambda: google_auth.authorized_http(
+            creds, timeout=settings.http_timeout))
 
 
 def build_gmail_client(settings: Settings):

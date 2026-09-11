@@ -157,6 +157,7 @@ def main() -> int:
           + ("   <- THE REAL MAILBOX" if settings.gmail == "live" else ""))
     print(f"dry_run   : {settings.dry_run}   <- nothing reaches Gmail while true")
     print(f"body      : {describe_body_budget(settings.body_budget)}")
+    print(f"http      : {settings.http_timeout:g}s before a Gmail socket is abandoned")
     print(_tracing_banner())
     print(f"policy    : {policy.version}"
           + ("   <- DRIFTED from the committed policies/default.md"
