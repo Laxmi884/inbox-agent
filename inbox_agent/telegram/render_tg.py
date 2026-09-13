@@ -471,7 +471,7 @@ def runs_panel(reports: Sequence[RunReport], *, digest_id: str,
     if not window:
         return ("No runs recorded yet.\n\n"
                 "The next scheduled run will leave one here.",
-                [[("↩ Back to the digest", encode("list", digest_id=digest_id))]])
+                [[("↩ Back to the digest", encode("digest", digest_id=digest_id))]])
 
     lines = [f"Done · last {len(window)} run" + ("" if len(window) == 1 else "s")]
     for number, report in enumerate(window, start=1):
@@ -487,7 +487,7 @@ def runs_panel(reports: Sequence[RunReport], *, digest_id: str,
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([("↩ Back to the digest", encode("list", digest_id=digest_id))])
+    keyboard.append([("↩ Back to the digest", encode("digest", digest_id=digest_id))])
     return "\n".join(lines)[:TG_MAX_TEXT], keyboard
 
 
@@ -617,7 +617,7 @@ def done_panel(view: DigestView, page: int = 0, *,
                           encode("runs", digest_id=view.digest_id))])
     else:
         keyboard.append([("↩ Back to the digest",
-                          encode("list", digest_id=view.digest_id))])
+                          encode("digest", digest_id=view.digest_id))])
     return text, keyboard
 
 
@@ -646,7 +646,7 @@ def bulk_result(headline: str, did: Sequence[str], *, verb: str,
     """
     head = [headline, ""]
     tail = ["", f"{remaining} left waiting."]
-    keyboard = [[("↩ Back to the digest", encode("list", digest_id=digest_id))]]
+    keyboard = [[("↩ Back to the digest", encode("digest", digest_id=digest_id))]]
     if not did:
         return "\n".join(head + ["Nothing to do."] + tail), keyboard
 
@@ -705,7 +705,7 @@ def confirm_trash_all(items, *, digest_id: str, dry_run: bool
     keyboard = [
         [(f"🗑 Yes, trash {len(items)}",
           encode("trash_all_go", digest_id=digest_id))],
-        [("↩ Cancel", encode("list", digest_id=digest_id))],
+        [("↩ Cancel", encode("digest", digest_id=digest_id))],
     ]
     return text, keyboard
 

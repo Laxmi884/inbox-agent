@@ -396,12 +396,53 @@ def test_the_panel_credits_a_rule_that_decided_a_thread(bot):
     assert "rule" in t.edited[-1]["text"].lower()
 
 
+def _tap(b, t, label):
+    """Press the button whose label starts with `label`, on the screen that is
+    actually rendered.
+
+    Hand-built callbacks are how the done panel shipped without its numbered
+    buttons - the flow was checked by calling encode() directly, so a screen
+    that offered no route to the verdicts still passed. Anything about whether
+    a BUTTON works has to come off the keyboard the owner is looking at.
+    """
+    screen = (t.edited or t.sent)[-1]
+    for row in screen.get("keyboard") or []:
+        for text, data in row:
+            if text.startswith(label):
+                b.handle_update(cb(data))
+                return data
+    raise AssertionError(f"no {label!r} button on screen: {screen.get('keyboard')}")
+
+
 def test_back_from_the_panel_returns_to_the_digest(bot):
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
     digest_text = t.sent[-1]["text"]
     b.handle_update(cb(encode("done", digest_id=b._digest_id)))
-    b.handle_update(cb(encode("list", digest_id=b._digest_id)))
+    _tap(b, t, "\u21a9 Back to the digest")
+    assert t.edited[-1]["text"] == digest_text
+
+
+def test_back_to_the_digest_still_works_after_an_item_was_opened(bot):
+    """The panel's Back and an item's Back are different destinations.
+
+    They shared one callback code, so the panel's "Back to the digest"
+    resolved to _panel_before_item - which opening an item from the panel had
+    just set to the panel. The panel re-rendered itself, Telegram refuses an
+    unmodified edit with 400, and on a phone the button was dead. Prev and Next
+    kept working, because they change the text. Reported from a phone
+    2026-09-13, mid-review.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    digest_text = t.sent[-1]["text"]
+    b.handle_update(cb(encode("done", digest_id=b._digest_id)))
+    _tap(b, t, "1")                     # open the first done item
+    assert b._panel == "item"
+    _tap(b, t, "\u21a9 Back")             # back to the panel it came from
+    assert b._panel == "done", "Back left the list the item was opened from"
+    _tap(b, t, "\u21a9 Back to the digest")
+    assert b._panel == "digest", "the panel's back button went nowhere"
     assert t.edited[-1]["text"] == digest_text
 
 

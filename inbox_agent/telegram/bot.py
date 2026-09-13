@@ -653,7 +653,7 @@ class Bot:
                 f"{len(queue)} still waiting, all of them needing a decision "
                 "one at a time.",
                 [[("↩ Back to the digest",
-                   encode("list", digest_id=self._digest_id))]])
+                   encode("digest", digest_id=self._digest_id))]])
             return
 
         did: list[str] = []
@@ -1368,6 +1368,23 @@ class Bot:
                 # Back to the digest is back to now: leaving a past run
                 # selected would stamp the live screen with an old run's counts.
                 self._done_run = None
+            self._show(edit=True)
+            return
+        if intent.kind == "digest":
+            # A panel's own "Back to the digest", which is a different
+            # destination from an item's "Back" and now says so. It used to
+            # share the `list` code, so it resolved to _panel_before_item:
+            # open an item from the done panel, tap Back to reach the panel,
+            # then tap Back to the digest and the panel re-rendered itself.
+            # Telegram answers an unmodified edit with 400, so on a phone the
+            # button was simply dead - while Prev and Next, which change the
+            # text, kept working. Reported 2026-09-13.
+            self._pending = None
+            self._panel = "digest"
+            self._panel_before_item = "digest"
+            # Back to the digest is back to now: leaving a past run selected
+            # would stamp the live screen with an old run's counts.
+            self._done_run = None
             self._show(edit=True)
             return
         if intent.kind == "runs":

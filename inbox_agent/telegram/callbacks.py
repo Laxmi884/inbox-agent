@@ -39,7 +39,7 @@ DIGEST_ID_LEN = 4
 _HEX = set("0123456789abcdef")
 
 Kind = Literal["approve", "reject", "label", "prev", "next", "approve_all",
-               "open", "list", "done", "approve_attention",
+               "open", "list", "digest", "done", "approve_attention",
                "trash_all", "trash_all_go",
                # Corrections on work already done. Each maps to exactly one
                # action sequence, so what gets taught is what the button said.
@@ -71,6 +71,15 @@ _CODE_TO_KIND: dict[str, Kind] = {
     "o": "open",
     # Back to the digest from a single item.
     "L": "list",
+    # Back to the DIGEST, named rather than inferred. Distinct from "list"
+    # because the two are different destinations that used to share a code:
+    # "list" means "the list this item was opened from", which is what an item
+    # screen's Back must honour, and a panel's own "Back to the digest" means
+    # the digest whatever that was. Sharing "L" made the second one resolve to
+    # _panel_before_item - so once an item had been opened from the done panel,
+    # the panel's back button re-rendered the panel, Telegram refused the
+    # unmodified edit, and the button did nothing at all.
+    "d": "digest",
     # Opening the run's audit records, and the attention-tier one-tap approve.
     "D": "done", "T": "approve_attention",
     # Bulk trash, and its confirmation. TWO codes rather than one carrying an
@@ -155,7 +164,7 @@ def decode(data: str) -> Intent:
         digest_id = rest[-1]
         rest = rest[:-1]
 
-    if kind in ("prev", "next", "approve_all", "list", "done",
+    if kind in ("prev", "next", "approve_all", "list", "digest", "done",
                 "approve_attention", "trash_all", "trash_all_go", "runs"):
         return Intent(kind, digest_id=digest_id) if not rest else Intent("noop")
 

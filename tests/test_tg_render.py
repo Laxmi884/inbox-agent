@@ -428,7 +428,9 @@ def test_the_panel_offers_a_way_back_to_the_digest():
     """A screen with no exit is a trap on a phone, where there is no Escape."""
     _, kb = done_panel(done_view([done()]))
     kinds = [decode(data).kind for row in kb for (_, data) in row]
-    assert "list" in kinds
+    # `digest`, not `list`: an item's Back returns to the list it was opened
+    # from, and this one means the digest whatever the owner did in between.
+    assert "digest" in kinds
 
 
 def test_the_panel_pages_rather_than_truncating():
@@ -460,7 +462,7 @@ def test_an_empty_run_says_so_rather_than_rendering_an_empty_screen():
     text, kb = done_panel(done_view([]))
     assert "nothing" in text.lower()
     kinds = [decode(data).kind for row in kb for (_, data) in row]
-    assert "list" in kinds
+    assert "digest" in kinds
 
 
 # --- the run list -------------------------------------------------------
@@ -533,7 +535,7 @@ def test_done_panel_can_go_back_to_the_run_list():
 
 def test_done_panel_still_goes_back_to_the_digest_by_default():
     _text, keyboard = done_panel(done_view([done("t1")]))
-    assert keyboard[-1][0][1].startswith("L:"), "the live panel lost its way back"
+    assert keyboard[-1][0][1].startswith("d:"), "the live panel lost its way back"
 
 
 # --- paged ------------------------------------------------------------------
