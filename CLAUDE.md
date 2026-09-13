@@ -98,9 +98,18 @@ the authoring surface; Context Hub is the publish target. Run
 `load_policy` prints DRIFT and serves the hub's copy. `CONTEXT_HUB_TAG` must
 stay blank — it resolves a commit hash or nothing, and any other value 404s.
 
-**This repo has no remote and must not get one.** A Telegram bot token is in
-history from `df1f2da`. Do not push it anywhere, public or private, until that
-history is rewritten and the token rotated.
+**The history was rewritten on 2026-09-12 and the remote is PRIVATE.** A
+Telegram bot token used to be in history; `git filter-repo` replaced it with a
+placeholder of the same shape across all 208 commits, removed the CAB notebook
+(which carried real Jira data and an email address in its executed outputs),
+and scrubbed absolute home paths. Every commit SHA before that date changed —
+SHAs quoted in older docs and plans no longer resolve. The pre-rewrite history
+is at `~/Projects/inbox-agent-backup-20260912-200500`.
+
+**The bot token is still NOT rotated.** Removing it from history does not
+invalidate it. Rotate it in @BotFather (`/revoke`), update `.env`, restart the
+bot, and only then consider making the repo public. Until that is done, keep
+the GitHub repo private.
 
 ## Conventions
 
