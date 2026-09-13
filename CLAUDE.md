@@ -106,11 +106,6 @@ and scrubbed absolute home paths. Every commit SHA before that date changed —
 SHAs quoted in older docs and plans no longer resolve. The pre-rewrite history
 is at `~/Projects/inbox-agent-backup-20260912-200500`.
 
-**The bot token is still NOT rotated.** Removing it from history does not
-invalidate it. Rotate it in @BotFather (`/revoke`), update `.env`, restart the
-bot, and only then consider making the repo public. Until that is done, keep
-the GitHub repo private.
-
 ## Conventions
 
 - Stdlib-only in `tools/` — those run as git hooks, on a fresh clone, before any
