@@ -35,6 +35,22 @@ from .render_tg import (ATTENTION_REASONS, DONE_PAGE_SIZE, DigestView, DoneItem,
 
 log = logging.getLogger("inbox_agent.telegram")
 
+# What a run tells the owner before it stops answering. One sentence, two
+# callers: a typed run and a scheduled one go deaf in exactly the same way, and
+# a warning that depended on which had started it would be worth less than no
+# warning at all.
+#
+# The deafness itself is the still-open problem (_run_triage holds the single
+# polling loop for the whole run). Until that is fixed the honest thing is to
+# say so BEFORE it happens, because during it the bot cannot say anything.
+def _running_notice(limit: int, *, slot: Optional[datetime] = None) -> str:
+    when = f"Scheduled triage ({slot.strftime('%H:%M')})" if slot else "Triaging"
+    return (f"{when}: up to {limit} threads. Buttons won't answer until it "
+            f"finishes - usually ten to thirty minutes - and taps made in the "
+            f"meantime arrive when it does.")
+
+
+
 
 def _short(text: str, cap: int = 60) -> str:
     """Cap a subject for a confirmation line, saying so when it is cut.
@@ -658,12 +674,18 @@ class Bot:
 
         did: list[str] = []
         ran: list[tuple] = []
+        quiet = 0
         for item in attention:
             done = self._execute_held(item)
             self.held.remove(item.thread_id)
             ran.append((item, done))
             if done.summary:
                 did.append(f"{_short(item.item.subject)} → {done.summary}")
+            else:
+                # An approved `none`: the agent proposed leaving the thread
+                # alone and the owner agreed. Counted rather than dropped -
+                # see bulk_result for what silence here used to read as.
+                quiet += 1
         self._record_held_run(ran)
 
         # Never the word "done" for something that did not reach Gmail - the
@@ -672,7 +694,8 @@ class Bot:
         verb = "Would have run" if self.settings.dry_run else "Ran"
         text, keyboard = bulk_result(
             f"Approved {len(attention)}.", did, verb=verb,
-            remaining=len(self.held.all()), digest_id=self._digest_id)
+            remaining=len(self.held.all()), digest_id=self._digest_id,
+            quiet=quiet)
         self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
 
     def _trash_held(self) -> list:
@@ -1084,9 +1107,7 @@ class Bot:
         # Gmail phases are seconds per action, so a twenty-thread run is minutes
         # long and, until this line, sent nothing at all until the digest. The
         # owner cannot tell that from a bot that has died, and asked.
-        self.transport.send_message(
-            self.chat_id, f"Triaging up to {limit} threads. This takes a few "
-                          f"minutes; the digest arrives when it is done.")
+        self.transport.send_message(self.chat_id, _running_notice(limit))
         self._run_triage(limit)
         # A typed run swept the same untriaged backlog a slot would have, so it
         # covers one. Marked even when the run raised: recording the attempt is
@@ -1101,8 +1122,15 @@ class Bot:
                       retry_in: Optional[timedelta] = None) -> bool:
         """A run nobody typed. Returns whether it finished.
 
-        No pre-notice: that line is owed to someone watching a wait they asked
-        for. The caller records the attempt - it holds the retry budget.
+        It announces itself, which reverses the rule this used to carry: "no
+        pre-notice - that line is owed to someone watching a wait they asked
+        for." That was written for an owner sitting at a terminal. On a phone
+        it is backwards. The typed run is the one whose wait is expected; a
+        slot firing at 19:00 while the owner is tapping last night's digest is
+        the one that looks like a dead bot, and it was the silent one.
+
+        Reported twice from a phone as buttons that stop working. The caller
+        records the attempt - it holds the retry budget.
         """
         if retry_in is not None:
             suffix = (f" Retrying in {int(retry_in.total_seconds() // 60)} "
@@ -1110,6 +1138,16 @@ class Bot:
         else:
             suffix = " Not retrying; the next scheduled run is the next attempt."
         log.info("scheduled triage for slot %s", slot.isoformat())
+        # Before the run, never after: after it, the digest has already arrived
+        # and the notice would be explaining a silence that is over.
+        try:
+            self.transport.send_message(
+                self.chat_id,
+                _running_notice(self.settings.snapshot_size, slot=slot))
+        except Exception:
+            # A notice that cannot be sent must not cost the run. The digest is
+            # the thing the owner actually needs; this only makes the wait legible.
+            log.warning("could not announce the scheduled run", exc_info=True)
         return self._run_triage(self.settings.snapshot_size,
                                 failure_suffix=suffix, scheduled=True)
 

@@ -647,7 +647,7 @@ _SNIPPET_CAP = 110
 
 
 def bulk_result(headline: str, did: Sequence[str], *, verb: str,
-                remaining: int, digest_id: str) -> tuple[str, list]:
+                remaining: int, digest_id: str, quiet: int = 0) -> tuple[str, list]:
     """What a one-tap bulk action actually did, inside one message.
 
     This lives here rather than in the bot because it is the SECOND half of a
@@ -666,7 +666,20 @@ def bulk_result(headline: str, did: Sequence[str], *, verb: str,
     head = [headline, ""]
     tail = ["", f"{remaining} left waiting."]
     keyboard = [[("↩ Back to the digest", encode("digest", digest_id=digest_id))]]
+    # `quiet` is the items whose approved proposal was to leave the thread
+    # alone. They are real decisions - audited, actor `human` - and they change
+    # nothing in Gmail, so they belong in neither `did` nor silence.
+    #
+    # Saying "Approved 3." and "Nothing to do." in one screen is what the owner
+    # read as a dead button on 2026-09-13: three security alerts approved, the
+    # audit log showing three human/none records, and a mailbox that looked
+    # untouched because it WAS untouched, correctly. The contradiction was the
+    # bug; the behaviour underneath it was right.
     if not did:
+        if quiet:
+            leave = (f"All {quiet} were proposals to leave the thread alone, "
+                     f"so nothing reached Gmail. The decision is recorded.")
+            return "\n".join(head + [leave] + tail), keyboard
         return "\n".join(head + ["Nothing to do."] + tail), keyboard
 
     budget = TG_MAX_TEXT - len("\n".join(head + tail)) - len(_OVERFLOW % 999) - 2
@@ -679,6 +692,10 @@ def bulk_result(headline: str, did: Sequence[str], *, verb: str,
         used += len(line) + 1
         shown.append(line)
 
+    if quiet:
+        # Named, not folded into the list: "3 of 5 were left alone" is the
+        # difference between a short list and a list that lost items.
+        shown.append(f"Left alone, as proposed: {quiet}.")
     lines = head + shown
     if len(shown) < len(did):
         # Counted, never silently dropped: the difference between a line that

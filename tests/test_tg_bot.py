@@ -1798,9 +1798,12 @@ def test_a_scheduled_run_still_sends_the_digest(bot):
 
 
 def test_a_typed_triage_still_announces_itself(bot):
+    """The notice, not its wording. It used to promise "a few minutes", which
+    the live log contradicts - runs measured 671s to 1963s - and the sentence
+    now names the real range and the deafness that comes with it."""
     b, t, _ = bot
     b.handle_update(msg("/triage 4"))
-    assert any("takes a few minutes" in m["text"] for m in t.sent)
+    assert any("up to 4 threads" in m["text"] for m in t.sent)
 
 
 def test_a_failed_scheduled_run_returns_false_and_names_the_retry(
@@ -2635,3 +2638,78 @@ def test_a_single_page_digest_never_counts_past_page_one(bot):
     assert b._page == 0, (
         f"the bot counted to page {b._page} of a one-page digest; the renderer "
         "clamps it back to 0, so every later prev tap redraws the same screen")
+
+
+# --- saying a run is happening ----------------------------------------------
+# The loop is single-threaded, so a run holds it for 12-33 minutes and every
+# tap in that window queues unanswered. Nothing said so: the owner tapped a
+# live digest, got silence, and reported a dead bot. The bot cannot answer
+# DURING the run, so it says what it is about to do BEFORE it goes deaf, in
+# the message that then becomes the digest - one message per run either way.
+
+def test_a_scheduled_run_announces_itself_like_a_typed_one(bot):
+    """The run nobody asked for is the one that needs announcing most.
+
+    run_scheduled used to carry "No pre-notice: that line is owed to someone
+    watching a wait they asked for." The owner of a live mailbox is not
+    watching - they are tapping last night's digest at 19:00 when a slot fires,
+    and the loop stops answering for the next ten to thirty minutes.
+    """
+    b, t, _ = bot
+    b.run_scheduled(datetime(2026, 9, 13, 19, 0))
+    assert t.sent, "a scheduled run sent nothing at all"
+    first = t.sent[0]["text"]
+    assert "riaging" in first or "riage" in first, (
+        f"the scheduled run never said it was starting: {first!r}")
+
+
+@pytest.mark.parametrize("start", ["typed", "scheduled"])
+def test_a_run_notice_warns_that_taps_go_unanswered(bot, start):
+    """Both notices, because the deafness is the same on both paths."""
+    b, t, _ = bot
+    if start == "typed":
+        b.handle_update(msg("/triage 4"))
+    else:
+        b.run_scheduled(datetime(2026, 9, 13, 19, 0))
+    first = t.sent[0]["text"].lower()
+    assert any(w in first for w in ("won't", "will not", "unanswered", "not answer")), (
+        "the notice never warns that buttons stop answering while the run "
+        f"holds the loop, which is the whole reason it exists: {first!r}")
+
+
+# --- approving proposals that are "leave this alone" ------------------------
+# Every item in the attention tier can propose `none` - the agent recommending
+# the thread be left where it is, which is the common answer for a security
+# alert. Approving those is a real decision and is audited, but it moves
+# nothing in Gmail. The screen said "Approved 3." and then "Nothing to do.",
+# which is a contradiction the owner read as a broken button. Observed live
+# 2026-09-13: three `human`/`none` audit records at 02:00:37 and a mailbox
+# that did not change.
+
+def _hold_leave_alone(b, n):
+    for i in range(n):
+        b.held.add(
+            ReviewItem(thread_id=f"a{i}", category="security_alert",
+                       subject=f"Alert {i}", sender="a@b.com", snippet="s",
+                       proposed=[Action(kind="none", thread_id=f"a{i}")],
+                       reason="r", confidence=0.9, source="model"),
+            run_id="r1", reason="security_alert",
+            now=datetime(2026, 9, 1, 8, i, tzinfo=timezone.utc))
+
+
+def test_approving_leave_alone_items_does_not_claim_there_was_nothing_to_do(bot):
+    b, t, _ = bot
+    _hold_leave_alone(b, 3)
+    b.handle_update(msg("/held"))
+    b.handle_update(cb(encode("approve_attention", digest_id=b._digest_id)))
+
+    text = t.edited[-1]["text"]
+    assert "Approved 3" in text, f"the approval was not reported: {text!r}"
+    assert "Nothing to do." not in text, (
+        "'Approved 3.' and 'Nothing to do.' in one screen is the contradiction "
+        f"that reads as a dead button: {text!r}")
+    low = text.lower()
+    assert "alone" in low and "gmail" in low, (
+        f"the screen never says what approving them actually meant - that the "
+        f"proposal was to leave the threads alone and nothing reached the "
+        f"mailbox: {text!r}")
