@@ -39,8 +39,9 @@ def test_policy_lists_all_categories(tmp_path):
     """A future edit must not silently drop a category from the prompt."""
     text = load_policy(make_settings(tmp_path), allow_remote=False).text
     categories = [
-        "needs_reply", "important_fyi", "newsletter_valuable", "newsletter_noise",
-        "promotion", "receipt", "recruiter", "security_alert", "automated", "other",
+        "needs_reply", "important_fyi", "newsletter_valuable", "learning",
+        "newsletter_noise", "promotion", "receipt", "recruiter", "security_alert",
+        "automated", "other",
     ]
     for category in categories:
         assert f"`{category}`" in text
@@ -172,3 +173,70 @@ def test_a_local_only_policy_is_never_marked_drifted(tmp_path):
     p = load_policy(make_settings(tmp_path), allow_remote=False)
     assert p.source == "local"
     assert p.drifted is False
+
+
+# --- recruiter vs needs_reply -----------------------------------------------
+# A live defect, not a hypothetical. `recruiter` read "job alerts and outreach",
+# which claimed the human case, while Judgment said anything from a real person
+# is `needs_reply`. Nothing said which won, so the model followed the more
+# specific-sounding word. That matters because `recruiter` is not in
+# partition.ATTENTION_CATEGORIES: the losing side auto-executes label+archive at
+# confidence >= 0.5, and audit.jsonl has the pattern under actor "agent" with
+# dry_run false. A real person approaching the owner about a job left the inbox
+# without ever reaching Telegram.
+#
+# The classification itself needs a model and is not testable here. What is
+# testable is that the policy text still resolves the collision, which is the
+# part a future edit would quietly undo.
+
+
+def _category_bullet(text: str, category: str) -> str:
+    """One bullet from the Categories list, continuation lines folded in."""
+    collected: list[str] = []
+    for line in text.splitlines():
+        if collected:
+            if line.startswith("- ") or not line.strip():
+                break
+            collected.append(line.strip())
+        elif line.startswith(f"- `{category}`"):
+            collected.append(line.strip())
+    assert collected, f"no `{category}` bullet in the Categories list"
+    return " ".join(collected)
+
+
+def test_recruiter_does_not_claim_the_mail_a_person_is_waiting_on(tmp_path):
+    """`recruiter` is filed and archived unseen; `needs_reply` is held for the
+    owner. So the recruiter definition must hand the human case away explicitly
+    rather than leave it to be inferred."""
+    bullet = _category_bullet(load_policy(make_settings(tmp_path), allow_remote=False).text,
+                              "recruiter")
+    assert "`needs_reply`" in bullet, (
+        "the recruiter bullet must name needs_reply as the home for a person "
+        "writing to the owner, or the human case gets archived"
+    )
+    assert "bulk" in bullet.lower(), "recruiter must be scoped to bulk mail"
+
+
+def test_judgment_resolves_recruiter_against_needs_reply(tmp_path):
+    """The tie-breaker has to exist somewhere the model reads as judgement, and
+    has to name both sides - a rule that mentions only one of them is not a
+    tie-breaker."""
+    text = load_policy(make_settings(tmp_path), allow_remote=False).text
+    judgment = text.split("## Judgment", 1)
+    assert len(judgment) == 2, "policy lost its Judgment section"
+    resolving = [b for b in judgment[1].split("\n- ")
+                 if "`recruiter`" in b and "`needs_reply`" in b]
+    assert resolving, (
+        "Judgment must contain a bullet resolving recruiter against needs_reply; "
+        "without one the two rules contradict each other silently"
+    )
+
+
+def test_the_ambiguous_middle_is_sent_to_low_confidence_not_guessed(tmp_path):
+    """A templated follow-up from a human address reads both ways and no rule
+    separates it cleanly. Low confidence holds it for the owner, which is the
+    safe direction; guessing confidently archives a real approach."""
+    bullet, = [b for b in load_policy(make_settings(tmp_path), allow_remote=False)
+               .text.split("## Judgment", 1)[1].split("\n- ")
+               if "`recruiter`" in b and "`needs_reply`" in b]
+    assert "confidence" in bullet and "0.5" in bullet
