@@ -395,10 +395,14 @@ class Bot:
         else:
             text, keyboard = digest(view, self._page)
         if edit and self._message_id is not None:
+            log.info("drawing %s (%d chars) into message %s",
+                     self._panel, len(text or ""), self._message_id)
             self.transport.edit_message(self.chat_id, self._message_id, text, keyboard)
         else:
             sent = self.transport.send_message(self.chat_id, text, keyboard)
             self._message_id = (sent or {}).get("message_id")
+            log.info("sent %s (%d chars) as new message %s",
+                     self._panel, len(text or ""), self._message_id)
 
     # --- dispatch -----------------------------------------------------------
 
@@ -1373,6 +1377,17 @@ class Bot:
         log.info("callback %s%s on digest %r (panel %s)", intent.kind,
                  "" if intent.index is None else f"[{intent.index}]",
                  intent.digest_id, self._panel)
+        # The bot edits the message it last drew, never the one the tap came
+        # from. When those differ the edit lands on a message the owner is not
+        # looking at: the tap "does nothing", with no error anywhere, because
+        # it worked - somewhere else. Digest ids cannot catch this; they are
+        # per-run, and both messages here can belong to the same run.
+        tapped = (query.get("message") or {}).get("message_id")
+        if tapped is not None and self._message_id is not None \
+                and tapped != self._message_id:
+            log.warning("tap came from message %s but the bot owns message %s; "
+                        "the edit will land somewhere the owner is not looking",
+                        tapped, self._message_id)
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
@@ -1650,6 +1665,15 @@ class HttpTransport:
             # identically. Letting the 400 out took the whole callback down in
             # _tick, and the owner saw a button that did nothing at all.
             if exc.status == 400 and _NOT_MODIFIED in exc.description:
+                # Logged, not just swallowed. This branch hid a live bug for
+                # weeks: an unclamped page counter asked for a screen the
+                # renderer would not draw, the edit came back identical, and
+                # the tap did nothing AND left no trace. Swallowing the 400 is
+                # still right - the screen genuinely already says this - but
+                # silence about it is what made the button look dead with
+                # nothing in the log to show for it.
+                log.info("edit was a no-op: message %s already shows this "
+                         "exact text and keyboard", message_id)
                 return {}
             raise
 

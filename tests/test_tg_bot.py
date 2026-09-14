@@ -2713,3 +2713,54 @@ def test_approving_leave_alone_items_does_not_claim_there_was_nothing_to_do(bot)
         f"the screen never says what approving them actually meant - that the "
         f"proposal was to leave the threads alone and nothing reached the "
         f"mailbox: {text!r}")
+
+
+# --- the blind spot ---------------------------------------------------------
+# edit_message swallows Telegram's 400 "not modified" because the screen really
+# does already say this. Swallowing it silently is what let an unclamped page
+# counter look like a dead button for weeks with nothing in the log. Both of
+# these exist so the next one is one grep away.
+
+def test_a_no_op_edit_is_swallowed_but_logged(caplog, monkeypatch):
+    """Telegram's 400 stays swallowed - the screen really does already say this
+    - but it stops being invisible."""
+    from inbox_agent.telegram.bot import HttpTransport, TelegramError
+    tr = HttpTransport.__new__(HttpTransport)
+    tr._token = "t"
+    tr._base = "https://example.invalid/bot"
+
+    def refuse(method, **payload):
+        raise TelegramError(method, 400, "Bad Request: message is not modified:"
+                                         " specified new message content and"
+                                         " reply markup are exactly the same")
+    monkeypatch.setattr(tr, "_post", refuse)
+    with caplog.at_level(logging.INFO, logger="inbox_agent.telegram"):
+        assert tr.edit_message(42, 7, "same", None) == {}
+    assert any("no-op" in r.message and "7" in r.message
+               for r in caplog.records), (
+        "a redraw of the identical screen left no trace; that silence is the "
+        "blind spot this logging exists to close")
+
+
+def test_a_tap_on_the_message_the_bot_owns_does_not_warn(bot, caplog):
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    with caplog.at_level(logging.WARNING, logger="inbox_agent.telegram"):
+        b.handle_update(cb(encode("done", digest_id=b._digest_id),
+                           message_id=b._message_id))
+    assert not any("the bot owns message" in r.message
+                   for r in caplog.records), "warned about the normal case"
+
+
+def test_a_tap_from_a_message_the_bot_does_not_own_is_logged(bot, caplog):
+    """The edit goes to _message_id, never to the message that was tapped.
+
+    When those differ the edit succeeds against a message the owner is not
+    looking at, so nothing errors anywhere and the button looks dead.
+    """
+    b, t, _ = bot
+    b.handle_update(msg("/triage 4"))
+    with caplog.at_level(logging.WARNING, logger="inbox_agent.telegram"):
+        b.handle_update(cb(encode("done", digest_id=b._digest_id),
+                           message_id=(b._message_id or 0) + 99))
+    assert any("the bot owns message" in r.message for r in caplog.records)
