@@ -2574,3 +2574,64 @@ def test_resume_allows_an_empty_batch(bot):
     b, t, _ = bot
     b._intents = {}
     b._resume(ReviewRequest(run_id="r1", policy_version="local:t", items=[]))
+
+
+# --- paging past the end ----------------------------------------------------
+# The renderer clamps the page to the last one that exists; the bot did not,
+# and kept whatever it had counted to. The two then disagreed: the bot asked
+# for page 6 of 2, the renderer drew page 2, and the edit was byte-identical to
+# what was already on screen. Telegram answers that with 400 "not modified",
+# which edit_message swallows - so the button did nothing AND logged nothing.
+#
+# The compounding half is the one that was reported: every extra tap pushed the
+# count further out, so the owner then needed that many `prev` taps before the
+# screen moved at all. Observed in the live log on 2026-09-13 as `next` x5 in
+# 21.8s followed by `prev` x3 in 2.3s - a finger on a button that looked dead.
+#
+# Nothing reset the count but a new run or a new digest, which is why the owner
+# reported it always came back to life "after the run completed".
+
+def _fill_held(b, n):
+    """n held items, enough to make the digest page."""
+    for i in range(n):
+        b.held.add(
+            ReviewItem(thread_id=f"h{i:02d}", category="promotion",
+                       subject=f"Held {i:02d}", sender="a@b.com", snippet="s",
+                       proposed=[Action(kind="trash", thread_id=f"h{i:02d}")],
+                       reason="r", confidence=0.5, source="model"),
+            run_id="r1", reason="trash",
+            now=datetime(2026, 9, 1, 8, i, tzinfo=timezone.utc))
+
+
+def test_next_past_the_last_page_does_not_strand_prev(bot):
+    """One `prev` after tapping off the end must move the screen back.
+
+    The owner's finger, not the counter, is the thing that has to stay in sync.
+    """
+    b, t, _ = bot
+    _fill_held(b, 12)                       # 8 per page -> exactly two pages
+    b.handle_update(msg("/held"))
+    b.handle_update(cb(encode("next", digest_id=b._digest_id)))
+    on_last = t.edited[-1]["text"]
+    assert "page 2/2" in on_last, "the fixture did not reach the last page"
+
+    for _ in range(3):                      # taps off the end: no page to go to
+        b.handle_update(cb(encode("next", digest_id=b._digest_id)))
+
+    b.handle_update(cb(encode("prev", digest_id=b._digest_id)))
+    assert t.edited[-1]["text"] != on_last, (
+        "prev did not leave the last page: the bot counted past the end, so it "
+        "took as many prev taps to come back as next taps had been wasted")
+    assert "page 1/2" in t.edited[-1]["text"]
+
+
+def test_a_single_page_digest_never_counts_past_page_one(bot):
+    """With one page there is nowhere to go, and the count must say so."""
+    b, t, _ = bot
+    _fill_held(b, 3)                        # one page
+    b.handle_update(msg("/held"))
+    for _ in range(3):
+        b.handle_update(cb(encode("next", digest_id=b._digest_id)))
+    assert b._page == 0, (
+        f"the bot counted to page {b._page} of a one-page digest; the renderer "
+        "clamps it back to 0, so every later prev tap redraws the same screen")

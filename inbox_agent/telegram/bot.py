@@ -29,9 +29,9 @@ from ..models import (Action, ActionTemplate, DoneRecord, ReviewItem,
 from ..schedule import ScheduleStore, Trigger, manual_attempt, scheduled_attempt
 from ..store import DoneStore, HeldQueue, PreferenceStore, rule_from_correction
 from .callbacks import DIGEST_ID_LEN, Intent, decode, encode, to_response
-from .render_tg import (ATTENTION_REASONS, DigestView, DoneItem, bulk_result,
-                        confirm_trash_all, digest, done_panel, item_view,
-                        runs_panel)
+from .render_tg import (ATTENTION_REASONS, DONE_PAGE_SIZE, DigestView, DoneItem,
+                        bulk_result, clamp_page, confirm_trash_all, digest,
+                        done_panel, item_view, runs_panel)
 
 log = logging.getLogger("inbox_agent.telegram")
 
@@ -1338,10 +1338,25 @@ class Bot:
 
         if intent.kind in ("next", "prev"):
             step = 1 if intent.kind == "next" else -1
+            # Clamped against the list the renderer is about to draw, by the
+            # renderer's own arithmetic. A floor alone was half the rule: the
+            # renderer clamps the top too, so a count that ran past the last
+            # page drew the page already on screen, and Telegram answers an
+            # identical edit with 400 "not modified" - swallowed in
+            # edit_message, so the tap did nothing and logged nothing.
+            #
+            # The cost was compounding rather than cosmetic. Every tap off the
+            # end pushed the count further out, and coming back then took that
+            # many `prev` taps before the screen moved at all. Nothing reset it
+            # but a new run or a new digest, which is why it was reported as a
+            # dead button that "starts working again after the run".
             if self._panel == "done":
-                self._done_page = max(0, self._done_page + step)
+                self._done_page = clamp_page(self._done_page + step,
+                                             len(self._done_items()),
+                                             DONE_PAGE_SIZE)
             else:
-                self._page = max(0, self._page + step)
+                self._page = clamp_page(self._page + step,
+                                        len(self.held.all()))
             self._show(edit=True)
             return
         if intent.kind == "done":

@@ -36,6 +36,25 @@ HELD_PAGE_SIZE = 8
 # learn.
 DONE_PAGE_SIZE = HELD_PAGE_SIZE
 
+
+def pages_for(count: int, size: int = HELD_PAGE_SIZE) -> int:
+    """How many pages `count` items fill. Never zero: an empty queue is page 1
+    of 1, which is the screen that says the queue is empty."""
+    return max(1, (count + size - 1) // size)
+
+
+def clamp_page(page: int, count: int, size: int = HELD_PAGE_SIZE) -> int:
+    """The page that actually exists.
+
+    One definition, shared with the bot, because the two used to hold half of
+    it each: the renderer clamped what it drew and the bot kept an unbounded
+    count. They disagreed the moment the queue shrank under a tap, and a
+    disagreement here is invisible - the renderer draws the same screen, and
+    Telegram rejects an identical edit as 400 "not modified", which
+    edit_message swallows. The button did nothing and logged nothing.
+    """
+    return max(0, min(page, pages_for(count, size) - 1))
+
 # Section order is hold-reason precedence order, so the most consequential
 # things are nearest the top of the message where they are read first.
 SECTIONS: tuple[tuple[str, str], ...] = (
@@ -254,8 +273,8 @@ def digest(view: DigestView, page: int = 0) -> tuple[str, list]:
     # Carried-over items first within each section: an ignored queue should read
     # as one. all() is already oldest-first, so this is stable.
     ordered = sorted(view.held, key=lambda h: h.first_held_at)
-    pages = max(1, (len(ordered) + HELD_PAGE_SIZE - 1) // HELD_PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
+    pages = pages_for(len(ordered))
+    page = clamp_page(page, len(ordered))
     start = page * HELD_PAGE_SIZE
     window = ordered[start:start + HELD_PAGE_SIZE]
 
@@ -506,8 +525,8 @@ def done_panel(view: DigestView, page: int = 0, *,
     useful today; a row of buttons that all refuse would not be.
     """
     items = view.done
-    pages = max(1, (len(items) + DONE_PAGE_SIZE - 1) // DONE_PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
+    pages = pages_for(len(items), DONE_PAGE_SIZE)
+    page = clamp_page(page, len(items), DONE_PAGE_SIZE)
     window = items[page * DONE_PAGE_SIZE:(page + 1) * DONE_PAGE_SIZE]
 
     # Never the word "done" for something that did not reach Gmail. Same rule as
